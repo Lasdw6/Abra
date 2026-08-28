@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod cas;
 pub mod error;
 pub mod identity;
 mod util;

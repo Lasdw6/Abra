@@ -246,7 +246,8 @@ byte-for-byte; no ignore files, no secret scanning (settled decision).
 
 `materialize` writes a tree to a folder: files 0644, executables 0755, symlinks
 with stored targets, creating parents as needed and never following a stored
-symlink out of the destination. Round-trip preserves contents, structure, exec
+symlink out of the destination. In v0.1 the destination MUST be nonexistent or
+an empty directory and MUST NOT itself be a symlink. Round-trip preserves contents, structure, exec
 bits, and symlink targets exactly.
 
 Local layout of a materialized capsule (folder = the local sandbox):
@@ -318,7 +319,7 @@ Two vocabularies, deliberately distinct:
 Label-op (CJSON, signed domain `label`):
 
 ```json
-{"spec":"abra/0.1","type":"label-op","capsule_id":"<hex>","seq":<int>,
+{"spec":"abra/0.1","type":"label-op","capsule_id":"<hex>","seq":<int>,"by":"<peer id>",
  "op":"set","name":"main","snapshot_id":"<hex>","lease_epoch":<int>,
  "at":"<time>","sig":"<hex>"}
 ```
@@ -811,3 +812,12 @@ turn.
 3. Durable control delivery (v0.1 control is live-only).
 4. Revocation freshness guarantees beyond re-validate-on-lease.
 5. A packed multi-object stream for snapshots with very many tiny files.
+
+---
+
+### Errata applied
+
+- Stage-1 review erratum: label-op records require a signed `by` peer id so they
+  remain independently verifiable after persistence, gossip, or relay.
+- Stage-1 review clarification: v0.1 materialization requires a nonexistent or
+  empty, non-symlink destination.

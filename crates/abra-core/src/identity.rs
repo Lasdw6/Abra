@@ -191,6 +191,7 @@ fn save_private(p: &Path, b: &[u8]) -> Result<()> {
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(p)
             .map_err(|e| Error::io(p, e))?;
         f.write_all(b).map_err(|e| Error::io(p, e))?;

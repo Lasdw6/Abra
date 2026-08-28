@@ -3,7 +3,7 @@ use crate::{
     canonical,
     cas::Hash,
     identity::{Identity, PeerId, Signature},
-    manifest::{RawManifest, Scope},
+    manifest::{self, RawManifest, Scope},
     Error, Result,
 };
 use rand::{rngs::OsRng, RngCore};
@@ -62,6 +62,11 @@ impl Genesis {
     pub fn verify(&self) -> Result<()> {
         if self.spec != crate::SPEC || self.record_type != "capsule-genesis" {
             return Err(Error::invalid("invalid genesis schema"));
+        }
+        manifest::validate_time(&self.created_at)?;
+        manifest::validate_text(&self.title, 1, 512, true, "genesis title")?;
+        if self.kind.len() > 128 || !manifest::reverse_dns(&self.kind) {
+            return Err(Error::invalid("invalid genesis kind"));
         }
         self.created_by
             .verify("genesis", &unsigned(self, "sig")?, &self.sig)
@@ -125,6 +130,11 @@ impl LeaseRecord {
         Ok(Hash::of(&self.bytes()?))
     }
     pub fn verify_with(&self, p: &PeerId) -> Result<()> {
+        if self.spec != crate::SPEC || self.record_type != "lease" || self.epoch == 0 {
+            return Err(Error::invalid("invalid lease schema"));
+        }
+        manifest::validate_time(&self.acquired_at)?;
+        manifest::validate_time(&self.expires_at)?;
         p.verify("lease", &unsigned(self, "sig")?, &self.sig)
     }
 }
@@ -142,6 +152,7 @@ pub struct LabelOp {
     pub snapshot_id: Hash,
     pub lease_epoch: u64,
     pub at: String,
+    pub by: PeerId,
     pub sig: Signature,
 }
 impl LabelOp {
@@ -164,13 +175,21 @@ impl LabelOp {
             snapshot_id,
             lease_epoch,
             at,
+            by: signer.peer_id(),
             sig: Signature::from_bytes([0; 64]),
         };
         x.sig = signer.sign("label", &unsigned(&x, "sig")?);
         Ok(x)
     }
-    pub fn verify_with(&self, p: &PeerId) -> Result<()> {
-        p.verify("label", &unsigned(self, "sig")?, &self.sig)
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        canonical::to_vec(self)
+    }
+    pub fn verify(&self) -> Result<()> {
+        if self.spec != crate::SPEC || self.record_type != "label-op" || self.op != "set" {
+            return Err(Error::invalid("invalid label-op schema"));
+        }
+        manifest::validate_time(&self.at)?;
+        self.by.verify("label", &unsigned(self, "sig")?, &self.sig)
     }
 }
 
@@ -186,7 +205,7 @@ pub struct WriteResult {
     pub forked: bool,
     pub fork_label: Option<String>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Capsule {
     pub genesis: Genesis,
     snapshots: BTreeMap<Hash, SnapshotRecord>,
@@ -197,9 +216,9 @@ pub struct Capsule {
     evidence: Vec<LeaseRecord>,
 }
 impl Capsule {
-    pub fn new(genesis: Genesis) -> Result<Self> {
+    pub fn new(genesis: Genesis, grant: LeaseRecord) -> Result<Self> {
         genesis.verify()?;
-        Ok(Self {
+        let mut capsule = Self {
             genesis,
             snapshots: BTreeMap::new(),
             leases: vec![],
@@ -207,7 +226,9 @@ impl Capsule {
             labels: BTreeMap::new(),
             fork_counts: BTreeMap::new(),
             evidence: vec![],
-        })
+        };
+        capsule.accept_lease(grant, &|_, _| true)?;
+        Ok(capsule)
     }
     pub fn winning_lease(&self) -> Option<&LeaseRecord> {
         self.winner.map(|i| &self.leases[i])
@@ -215,10 +236,31 @@ impl Capsule {
     pub fn snapshot(&self, id: &Hash) -> Option<&SnapshotRecord> {
         self.snapshots.get(id)
     }
+    pub fn snapshots(&self) -> &BTreeMap<Hash, SnapshotRecord> {
+        &self.snapshots
+    }
+    pub fn leases(&self) -> &[LeaseRecord] {
+        &self.leases
+    }
+    pub fn labels(&self) -> &BTreeMap<String, LabelOp> {
+        &self.labels
+    }
+    pub fn evidence(&self) -> &[LeaseRecord] {
+        &self.evidence
+    }
+    pub fn active_lease(&self, now_ms: u64) -> Option<&LeaseRecord> {
+        let now = i64::try_from(now_ms).ok()?;
+        self.winning_lease()
+            .filter(|lease| timestamp_ms(&lease.expires_at).is_ok_and(|end| end >= now))
+    }
     pub fn label(&self, n: &str) -> Option<&LabelOp> {
         self.labels.get(n)
     }
-    pub fn accept_lease(&mut self, r: LeaseRecord) -> Result<bool> {
+    pub fn accept_lease(
+        &mut self,
+        r: LeaseRecord,
+        authorize: &dyn Fn(PeerId, LeaseMode) -> bool,
+    ) -> Result<bool> {
         if r.spec != crate::SPEC
             || r.record_type != "lease"
             || r.capsule_id != self.genesis.capsule_id
@@ -252,15 +294,24 @@ impl Capsule {
                 Some(w) => (w.hash()?, w.epoch, w.holder),
             }
         };
-        if r.prev_hash != prev || r.epoch != prev_epoch + 1 {
-            self.evidence.push(r);
-            return Ok(false);
-        }
         let signer = if r.mode == LeaseMode::Takeover {
             r.holder
         } else {
             old_holder
         };
+        r.verify_with(&signer)?;
+        if matches!(r.mode, LeaseMode::Takeover | LeaseMode::Transfer)
+            && !authorize(r.holder, r.mode)
+        {
+            return Err(Error::invalid("lease holder is not authorized"));
+        }
+        if r.prev_hash != prev || r.epoch != prev_epoch + 1 {
+            if self.evidence.len() == 64 {
+                self.evidence.remove(0);
+            }
+            self.evidence.push(r);
+            return Ok(false);
+        }
         if r.epoch == 1 && r.mode != LeaseMode::Grant {
             return Err(Error::invalid("epoch 1 must be a grant"));
         }
@@ -271,7 +322,6 @@ impl Capsule {
         } else if r.mode == LeaseMode::Refresh && r.holder != old_holder {
             return Err(Error::invalid("refresh changes holder"));
         }
-        r.verify_with(&signer)?;
         if race {
             let w = self.winning_lease().unwrap();
             if r.sig.to_bytes() <= w.sig.to_bytes() {
@@ -287,13 +337,31 @@ impl Capsule {
         &mut self,
         raw: RawManifest,
         received_at: String,
-        writer: PeerId,
+        now_ms: u64,
     ) -> Result<WriteResult> {
         let m = raw.manifest();
         if m.scope != Scope::Full || m.capsule_id != Some(self.genesis.capsule_id) {
             return Err(Error::invalid("snapshot is not in capsule"));
         }
         let parents = m.parents.as_ref().unwrap();
+        let id = raw.snapshot_id();
+        if let Some(existing) = self.snapshots.get(&id) {
+            if existing.raw.bytes() != raw.bytes() {
+                return Err(Error::corrupt(
+                    "snapshot",
+                    "id collision with different bytes",
+                ));
+            }
+            let writer = m.origin.peer_id;
+            let forked = !self
+                .active_lease(now_ms)
+                .is_some_and(|l| l.holder == writer);
+            return Ok(WriteResult {
+                snapshot_id: id,
+                forked,
+                fork_label: forked.then(|| format!("fork/{}", &id.to_hex()[..8])),
+            });
+        }
         if parents.is_empty()
             && self
                 .snapshots
@@ -303,7 +371,7 @@ impl Capsule {
             return Err(Error::invalid("capsule already has a root snapshot"));
         }
         let orphan = parents.iter().any(|p| !self.snapshots.contains_key(p));
-        let id = raw.snapshot_id();
+        let writer = m.origin.peer_id;
         self.snapshots.insert(
             id,
             SnapshotRecord {
@@ -313,8 +381,10 @@ impl Capsule {
             },
         );
         self.resolve_orphans();
-        let lease_ok = self.winning_lease().is_some_and(|l| l.holder == writer);
-        let forked = !lease_ok || orphan;
+        let lease_ok = self
+            .active_lease(now_ms)
+            .is_some_and(|l| l.holder == writer);
+        let forked = !lease_ok;
         let fork_label = if forked {
             Some(format!("fork/{}", &id.to_hex()[..8]))
         } else {
@@ -349,16 +419,19 @@ impl Capsule {
             }
         }
     }
-    pub fn apply_label(&mut self, op: LabelOp, signer: PeerId) -> Result<bool> {
+    pub fn apply_label(&mut self, op: LabelOp, caller: PeerId, now_ms: u64) -> Result<bool> {
         if op.capsule_id != self.genesis.capsule_id || op.op != "set" {
             return Err(Error::invalid("invalid label op"));
         }
-        op.verify_with(&signer)?;
+        if op.by != caller {
+            return Err(Error::invalid("label signer differs from caller identity"));
+        }
+        op.verify()?;
         if op.name == "main" {
             let w = self
-                .winning_lease()
+                .active_lease(now_ms)
                 .ok_or_else(|| Error::invalid("main requires lease"))?;
-            if signer != w.holder || op.lease_epoch != w.epoch {
+            if op.by != w.holder || op.lease_epoch != w.epoch {
                 return Err(Error::invalid("unauthorized main move"));
             }
             if !self
@@ -393,7 +466,7 @@ impl Capsule {
         });
         if wins {
             if op.name.starts_with("fork/") && !self.labels.contains_key(&op.name) {
-                let count = self.fork_counts.entry(signer).or_default();
+                let count = self.fork_counts.entry(op.by).or_default();
                 if *count >= 32 {
                     return Err(Error::invalid("fork label limit exceeded"));
                 }
@@ -413,6 +486,7 @@ fn unsigned<T: Serialize>(v: &T, field: &str) -> Result<Vec<u8>> {
 }
 
 fn timestamp_ms(s: &str) -> Result<i64> {
+    manifest::validate_time(s)?;
     if s.len() != 24
         || &s[4..5] != "-"
         || &s[7..8] != "-"

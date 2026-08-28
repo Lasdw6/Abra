@@ -1,17 +1,21 @@
-//! Filesystem shelves tying keys, CAS, capsules, and inbox together (SPEC §4).
+//! Durable filesystem shelves tying keys, CAS, capsules, and inbox together.
 use crate::{
-    capsule::{Capsule, Genesis, WriteResult},
+    canonical,
+    capsule::{Capsule, Genesis, LabelOp, LeaseMode, LeaseRecord, WriteResult},
     cas::{BlobStore, Hash},
-    identity::DeviceKeys,
-    manifest::RawManifest,
+    identity::{DeviceKeys, Identity, PeerId},
+    manifest::{RawManifest, Scope},
     Error, Result,
 };
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
-#[derive(Clone, Debug)]
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxEntry {
     pub snapshot_id: Hash,
     pub manifest: Vec<u8>,
@@ -19,12 +23,28 @@ pub struct InboxEntry {
     pub received_at: String,
     pub read: bool,
 }
-/// Persisted pending delivery root (SPEC §4; protocol fields arrive in stage 2).
 #[derive(Clone, Debug)]
 pub struct OutboxEntry {
     pub snapshot_id: Hash,
     pub manifest: Vec<u8>,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxDisk {
+    spec: String,
+    snapshot_id: Hash,
+    manifest: String,
+    from: String,
+    received_at: String,
+    read: bool,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotMeta {
+    spec: String,
+    received_at: String,
+}
+
 pub struct AbraStore {
     root: PathBuf,
     pub cas: BlobStore,
@@ -37,54 +57,95 @@ impl AbraStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         for d in ["capsules", "inbox", "outbox", "keys"] {
-            fs::create_dir_all(root.join(d)).map_err(|e| Error::io(root.join(d), e))?
+            fs::create_dir_all(root.join(d)).map_err(|e| Error::io(root.join(d), e))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("keys"), fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::io(root.join("keys"), e))?;
         }
         let cas = BlobStore::open(&root)?;
         let keys = DeviceKeys::load_or_generate(root.join("keys/device.json"))?;
-        Ok(Self {
+        let mut store = Self {
             root,
             cas,
             keys,
             capsules: BTreeMap::new(),
             inbox: BTreeMap::new(),
             outbox: BTreeMap::new(),
-        })
+        };
+        store.reload();
+        Ok(store)
     }
     pub fn root(&self) -> &Path {
         &self.root
     }
-    pub fn add_capsule(&mut self, g: Genesis) -> Result<()> {
+    pub fn add_capsule(&mut self, g: Genesis, grant: LeaseRecord) -> Result<()> {
+        let capsule = Capsule::new(g.clone(), grant.clone())?;
         let id = g.capsule_id;
-        let bytes = g.bytes()?;
-        fs::create_dir_all(self.root.join("capsules").join(id.to_hex()))
-            .map_err(|e| Error::io(&self.root, e))?;
-        fs::write(
-            self.root
-                .join("capsules")
-                .join(id.to_hex())
-                .join("genesis.cjson"),
-            bytes,
-        )
-        .map_err(|e| Error::io(&self.root, e))?;
-        self.capsules.insert(id, Capsule::new(g)?);
+        let dir = self.capsule_dir(id);
+        fs::create_dir_all(dir.join("leases")).map_err(|e| Error::io(&dir, e))?;
+        fs::create_dir_all(dir.join("labels")).map_err(|e| Error::io(&dir, e))?;
+        fs::create_dir_all(dir.join("snapshots")).map_err(|e| Error::io(&dir, e))?;
+        atomic_write(&dir.join("genesis.cjson"), &g.bytes()?)?;
+        atomic_write(&lease_path(&dir, &grant)?, &grant.bytes()?)?;
+        self.capsules.insert(id, capsule);
         Ok(())
     }
+    pub fn accept_lease(
+        &mut self,
+        capsule_id: Hash,
+        record: LeaseRecord,
+        authorize: &dyn Fn(PeerId, LeaseMode) -> bool,
+    ) -> Result<bool> {
+        let dir = self.capsule_dir(capsule_id);
+        let mut staged = self
+            .capsules
+            .get(&capsule_id)
+            .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?
+            .clone();
+        let won = staged.accept_lease(record.clone(), authorize)?;
+        atomic_write(&lease_path(&dir, &record)?, &record.bytes()?)?;
+        self.capsules.insert(capsule_id, staged);
+        Ok(won)
+    }
+    pub fn apply_label(&mut self, op: LabelOp, caller: PeerId, now_ms: u64) -> Result<bool> {
+        let id = op.capsule_id;
+        let dir = self.capsule_dir(id);
+        let mut staged = self
+            .capsules
+            .get(&id)
+            .ok_or_else(|| Error::not_found("capsule", id.to_hex()))?
+            .clone();
+        let won = staged.apply_label(op.clone(), caller, now_ms)?;
+        atomic_write(&label_path(&dir, &op), &op.bytes()?)?;
+        self.capsules.insert(id, staged);
+        Ok(won)
+    }
     pub fn receive_partial(&mut self, raw: RawManifest, from: String, at: String) -> Result<Hash> {
-        if raw.manifest().scope != crate::manifest::Scope::Partial {
+        if raw.manifest().scope != Scope::Partial {
             return Err(Error::invalid("inbox accepts partial snapshots only"));
         }
         let id = raw.snapshot_id();
-        let bytes = raw.bytes().to_vec();
-        fs::write(
-            self.root.join("inbox").join(format!("{}.cjson", id)),
-            &bytes,
-        )
-        .map_err(|e| Error::io(&self.root, e))?;
+        let disk = InboxDisk {
+            spec: crate::SPEC.into(),
+            snapshot_id: id,
+            manifest: String::from_utf8(raw.bytes().to_vec())
+                .map_err(|_| Error::invalid("manifest is not utf-8"))?,
+            from: from.clone(),
+            received_at: at.clone(),
+            read: false,
+        };
+        atomic_write(
+            &self.root.join("inbox").join(format!("{id}.cjson")),
+            &canonical::to_vec(&disk)?,
+        )?;
         self.inbox.insert(
             id,
             InboxEntry {
                 snapshot_id: id,
-                manifest: bytes,
+                manifest: raw.bytes().to_vec(),
                 from,
                 received_at: at,
                 read: false,
@@ -92,28 +153,239 @@ impl AbraStore {
         );
         Ok(id)
     }
-
-    /// Persist exact full-manifest bytes and update orphan/fork state (SPEC §§2, 5).
-    pub fn receive_full(&mut self, raw: RawManifest, at: String) -> Result<WriteResult> {
+    pub fn receive_full(
+        &mut self,
+        raw: RawManifest,
+        at: String,
+        now_ms: u64,
+        fork_signer: Option<&Identity>,
+    ) -> Result<WriteResult> {
         let capsule_id = raw
             .manifest()
             .capsule_id
             .ok_or_else(|| Error::invalid("full manifest lacks capsule id"))?;
+        raw.manifest().validate_kind_with_store(&self.cas)?;
         let writer = raw.manifest().origin.peer_id;
+        if let Some(signer) = fork_signer {
+            if signer.peer_id() != writer {
+                return Err(Error::invalid("fork signer differs from manifest origin"));
+            }
+        }
         let id = raw.snapshot_id();
         let bytes = raw.bytes().to_vec();
-        let capsule = self
+        let dir = self.capsule_dir(capsule_id);
+        let snapshot_dir = dir.join("snapshots");
+        let mut staged = self
             .capsules
-            .get_mut(&capsule_id)
-            .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?;
-        let result = capsule.insert_snapshot(raw, at, writer)?;
-        let dir = self
-            .root
-            .join("capsules")
-            .join(capsule_id.to_hex())
-            .join("snapshots");
-        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
-        fs::write(dir.join(format!("{}.cjson", id)), bytes).map_err(|e| Error::io(&dir, e))?;
+            .get(&capsule_id)
+            .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?
+            .clone();
+        let result = staged.insert_snapshot(raw, at.clone(), now_ms)?;
+        let mut fork_op = None;
+        if result.forked {
+            let signer = fork_signer.ok_or_else(|| {
+                Error::invalid("forked write requires the writer identity to create its label-op")
+            })?;
+            let name = result.fork_label.clone().expect("fork label");
+            let seq = staged.label(&name).map_or(1, |old| old.seq + 1);
+            let epoch = staged.winning_lease().map_or(0, |lease| lease.epoch);
+            let op = LabelOp::new(capsule_id, seq, name, id, epoch, at.clone(), signer)?;
+            staged.apply_label(op.clone(), writer, now_ms)?;
+            fork_op = Some(op);
+        }
+        fs::create_dir_all(&snapshot_dir).map_err(|e| Error::io(&snapshot_dir, e))?;
+        atomic_write(&snapshot_dir.join(format!("{id}.cjson")), &bytes)?;
+        atomic_write(
+            &snapshot_dir.join(format!("{id}.meta.cjson")),
+            &canonical::to_vec(&SnapshotMeta {
+                spec: crate::SPEC.into(),
+                received_at: at.clone(),
+            })?,
+        )?;
+        if let Some(op) = fork_op {
+            atomic_write(&label_path(&dir, &op), &op.bytes()?)?;
+        }
+        self.capsules.insert(capsule_id, staged);
         Ok(result)
     }
+
+    fn capsule_dir(&self, id: Hash) -> PathBuf {
+        self.root.join("capsules").join(id.to_hex())
+    }
+    fn reload(&mut self) {
+        let Ok(entries) = fs::read_dir(self.root.join("capsules")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Err(error) = self.reload_capsule(&entry.path()) {
+                eprintln!(
+                    "abra-core: skipping corrupt capsule {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
+        let Ok(entries) = fs::read_dir(self.root.join("inbox")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|x| x.to_str()) != Some("cjson") {
+                continue;
+            }
+            match read_canonical::<InboxDisk>(&entry.path()).and_then(|disk| {
+                if disk.spec != crate::SPEC {
+                    return Err(Error::invalid("invalid inbox spec"));
+                }
+                let raw = RawManifest::parse(disk.manifest.as_bytes().to_vec())?;
+                if raw.manifest().scope != Scope::Partial || raw.snapshot_id() != disk.snapshot_id {
+                    return Err(Error::invalid("invalid inbox record"));
+                }
+                Ok((disk, raw))
+            }) {
+                Ok((disk, raw)) => {
+                    self.inbox.insert(
+                        disk.snapshot_id,
+                        InboxEntry {
+                            snapshot_id: disk.snapshot_id,
+                            manifest: raw.bytes().to_vec(),
+                            from: disk.from,
+                            received_at: disk.received_at,
+                            read: disk.read,
+                        },
+                    );
+                }
+                Err(error) => eprintln!(
+                    "abra-core: skipping corrupt inbox record {}: {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+    }
+    fn reload_capsule(&mut self, dir: &Path) -> Result<()> {
+        let genesis = read_canonical::<Genesis>(&dir.join("genesis.cjson"))?;
+        genesis.verify()?;
+        let mut leases = read_records::<LeaseRecord>(&dir.join("leases"))?;
+        leases.sort_by_key(|r| (r.epoch, r.sig.to_bytes()));
+        let grant_pos = leases
+            .iter()
+            .position(|r| r.epoch == 1 && r.mode == LeaseMode::Grant)
+            .ok_or_else(|| Error::invalid("genesis lacks epoch-1 grant"))?;
+        let grant = leases.remove(grant_pos);
+        let mut capsule = Capsule::new(genesis.clone(), grant)?;
+        for lease in leases {
+            if let Err(error) = capsule.accept_lease(lease, &|_, _| true) {
+                eprintln!(
+                    "abra-core: skipping invalid lease in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+        let mut snapshots = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir.join("snapshots")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x.ends_with(".meta.cjson"))
+                {
+                    continue;
+                }
+                if path.extension().and_then(|x| x.to_str()) != Some("cjson") {
+                    continue;
+                }
+                let loaded = (|| {
+                    let raw =
+                        RawManifest::parse(fs::read(&path).map_err(|e| Error::io(&path, e))?)?;
+                    let meta_path =
+                        path.with_file_name(format!("{}.meta.cjson", raw.snapshot_id()));
+                    let meta = read_canonical::<SnapshotMeta>(&meta_path)?;
+                    Ok::<_, Error>((raw, meta.received_at))
+                })();
+                match loaded {
+                    Ok(snapshot) => snapshots.push(snapshot),
+                    Err(error) => eprintln!(
+                        "abra-core: skipping corrupt snapshot {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        while !snapshots.is_empty() {
+            let (raw, at) = snapshots.remove(0);
+            if let Err(error) = capsule.insert_snapshot(raw, at, u64::MAX) {
+                eprintln!(
+                    "abra-core: skipping invalid snapshot in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+        for op in read_records::<LabelOp>(&dir.join("labels"))? {
+            if let Err(error) = capsule.apply_label(op.clone(), op.by, 0) {
+                eprintln!(
+                    "abra-core: skipping invalid label-op in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+        self.capsules.insert(genesis.capsule_id, capsule);
+        Ok(())
+    }
+}
+
+fn read_canonical<T: DeserializeOwned + Serialize>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    canonical::validate_canonical(&bytes)?;
+    let value: T = serde_json::from_slice(&bytes)?;
+    if canonical::to_vec(&value)? != bytes {
+        return Err(Error::invalid("record does not round-trip exactly"));
+    }
+    Ok(value)
+}
+fn read_records<T: DeserializeOwned + Serialize>(dir: &Path) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|x| x.to_str()) == Some("cjson") {
+            match read_canonical(&entry.path()) {
+                Ok(record) => out.push(record),
+                Err(error) => eprintln!(
+                    "abra-core: skipping corrupt record {}: {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+    }
+    Ok(out)
+}
+fn lease_path(dir: &Path, lease: &LeaseRecord) -> Result<PathBuf> {
+    Ok(dir
+        .join("leases")
+        .join(format!("{:020}-{}.cjson", lease.epoch, lease.hash()?)))
+}
+fn label_path(dir: &Path, op: &LabelOp) -> PathBuf {
+    dir.join("labels").join(format!(
+        "{:020}-{}.cjson",
+        op.seq,
+        Hash::of(&op.sig.to_bytes())
+    ))
+}
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::invalid("record path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    let tmp = parent.join(format!(".tmp-{}", rand::random::<u64>()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| Error::io(&tmp, e))?;
+    file.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
+    file.sync_all().map_err(|e| Error::io(&tmp, e))?;
+    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| Error::io(parent, e))
 }

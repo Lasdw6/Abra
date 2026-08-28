@@ -1,6 +1,6 @@
 //! Abra-CJSON serialization and byte validation (SPEC §2).
 use crate::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX: i64 = 9_007_199_254_740_991;
@@ -40,10 +40,10 @@ pub fn validate_canonical(bytes: &[u8]) -> Result<Value> {
 
 /// Validate the integer profile of an envelope-shaped JSON value.
 pub fn validate_value(value: &Value) -> Result<()> {
-    validate_at(value, false)
+    validate_at(value, false, 0)
 }
 
-fn validate_at(v: &Value, negatives: bool) -> Result<()> {
+fn validate_at(v: &Value, negatives: bool, depth: usize) -> Result<()> {
     match v {
         Value::Number(n) => {
             let i = n
@@ -55,12 +55,13 @@ fn validate_at(v: &Value, negatives: bool) -> Result<()> {
         }
         Value::Array(a) => {
             for x in a {
-                validate_at(x, negatives)?;
+                validate_at(x, negatives, depth + 1)?;
             }
         }
         Value::Object(m) => {
             for (k, x) in m {
-                validate_at(x, negatives || k == "payload" || k == "extensions")?;
+                let slot = depth == 0 && (k == "payload" || k == "extensions");
+                validate_at(x, negatives || slot, depth + 1)?;
             }
         }
         _ => {}
@@ -129,5 +130,3 @@ fn string(s: &str, out: &mut Vec<u8>) {
     }
     out.push(b'"')
 }
-
-use serde::Deserialize;

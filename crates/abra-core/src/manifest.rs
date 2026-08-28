@@ -155,6 +155,12 @@ impl Manifest {
         canonical::to_vec(self)
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_schema()?;
+        self.origin
+            .peer_id
+            .verify("snapshot", &self.unsigned_bytes()?, &self.signature)
+    }
+    fn validate_schema(&self) -> Result<()> {
         if self.spec != crate::SPEC {
             return Err(Error::UnsupportedSpec {
                 found: self.spec.clone(),
@@ -164,10 +170,10 @@ impl Manifest {
         if !reverse_dns(&self.kind) || self.kind.len() > 128 {
             return Err(Error::invalid("invalid manifest kind"));
         }
-        text(&self.title, 1, 512, true, "title")?;
-        time(&self.created_at)?;
+        validate_text(&self.title, 1, 512, true, "title")?;
+        validate_time(&self.created_at)?;
         if let Some(x) = &self.origin.name {
-            text(x, 0, 80, false, "origin.name")?
+            validate_text(x, 0, 80, false, "origin.name")?
         }
         if let Some(x) = &self.origin.adapter {
             if !adapter(x) {
@@ -175,7 +181,7 @@ impl Manifest {
             }
         }
         if let Some(x) = &self.summary {
-            text(x, 0, 4096, false, "summary")?
+            validate_text(x, 0, 4096, false, "summary")?
         }
         if let Some(x) = &self.link {
             if x.len() > 4096 || !absolute_uri(x) {
@@ -228,7 +234,7 @@ impl Manifest {
                     return Err(Error::invalid("invalid label name"));
                 }
                 if let Some(v) = &l.value {
-                    text(v, 0, 512, false, "label value")?
+                    validate_text(v, 0, 512, false, "label value")?
                 }
                 if prev.as_ref().is_some_and(|p: &Label| p >= l) {
                     return Err(Error::invalid("labels not strictly sorted"));
@@ -238,7 +244,7 @@ impl Manifest {
         }
         if let Some(p) = &self.provenance {
             if let Some(t) = &p.turn {
-                text(t, 0, 64, false, "turn")?
+                validate_text(t, 0, 64, false, "turn")?
             }
         }
         if let Some(rs) = &self.recipes {
@@ -253,7 +259,7 @@ impl Manifest {
                     return Err(Error::invalid("invalid recipe ports"));
                 }
                 if let Some(t) = &r.started_at {
-                    time(t)?
+                    validate_time(t)?
                 }
             }
         }
@@ -272,10 +278,86 @@ impl Manifest {
                 return Err(Error::invalid("invalid extension key"));
             }
         }
+        if self.kind == "dev.abra.handoff.v1" {
+            if self.scope != Scope::Partial {
+                return Err(Error::invalid("handoff must be partial"));
+            }
+            if let Some(link) = self.link.as_deref() {
+                let url = self
+                    .payload
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::invalid("handoff link requires payload.url"))?;
+                if !absolute_uri(url) || link != url {
+                    return Err(Error::invalid("handoff link must equal payload.url"));
+                }
+            }
+            if let Some(note) = self.payload.get("note") {
+                validate_text(
+                    note.as_str()
+                        .ok_or_else(|| Error::invalid("handoff note must be a string"))?,
+                    0,
+                    16_384,
+                    false,
+                    "handoff note",
+                )?;
+            }
+        }
+        if self.kind == "dev.abra.workspace" {
+            if self.scope != Scope::Full {
+                return Err(Error::invalid("workspace must be full"));
+            }
+            if let Some(name) = self.payload.get("name") {
+                validate_text(
+                    name.as_str()
+                        .ok_or_else(|| Error::invalid("workspace name must be a string"))?,
+                    1,
+                    255,
+                    false,
+                    "workspace name",
+                )?;
+            }
+            if let Some(cwd) = self.payload.get("default_cwd") {
+                if !relative(
+                    cwd.as_str()
+                        .ok_or_else(|| Error::invalid("workspace default_cwd must be a string"))?,
+                ) {
+                    return Err(Error::invalid("invalid workspace default_cwd"));
+                }
+            }
+        }
         canonical::validate_value(&serde_json::to_value(self)?)?;
-        self.origin
-            .peer_id
-            .verify("snapshot", &self.unsigned_bytes()?, &self.signature)
+        Ok(())
+    }
+}
+
+impl Manifest {
+    /// Validate kind rules that require walking the referenced CAS tree.
+    pub fn validate_kind_with_store(&self, store: &crate::cas::BlobStore) -> Result<()> {
+        if self.kind != "dev.abra.workspace" {
+            return Ok(());
+        }
+        let mut tree = store.get_tree(
+            &self
+                .files
+                .ok_or_else(|| Error::invalid("workspace lacks files"))?,
+        )?;
+        let Some(cwd) = self.payload.get("default_cwd").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if cwd == "." {
+            return Ok(());
+        }
+        for part in cwd.split('/') {
+            let entry = tree
+                .get(part)
+                .ok_or_else(|| Error::invalid("workspace default_cwd is missing from tree"))?;
+            if entry.mode != crate::cas::EntryMode::Tree {
+                return Err(Error::invalid("workspace default_cwd is not a directory"));
+            }
+            tree = store.get_tree(&entry.hash)?;
+        }
+        Ok(())
     }
 }
 
@@ -288,10 +370,26 @@ pub struct RawManifest {
 }
 impl RawManifest {
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
-        canonical::validate_canonical(&bytes)?;
+        let mut value = canonical::validate_canonical(&bytes)?;
         let m: Manifest = serde_json::from_slice(&bytes)?;
-        m.verify()?;
-        let id = m.snapshot_id()?;
+        m.validate_schema()?;
+        if canonical::to_vec(&m)? != bytes {
+            return Err(Error::invalid(
+                "manifest bytes are not the canonical encoding of this manifest",
+            ));
+        }
+        value
+            .as_object_mut()
+            .ok_or_else(|| Error::invalid("manifest is not an object"))?
+            .remove("signature")
+            .ok_or_else(|| Error::invalid("manifest lacks signature"))?;
+        let unsigned = canonical::to_vec(&value)?;
+        m.origin
+            .peer_id
+            .verify("snapshot", &unsigned, &m.signature)?;
+        let mut preimage = b"abra-snap-v1\0".to_vec();
+        preimage.extend_from_slice(&unsigned);
+        let id = Hash::of(&preimage);
         Ok(Self {
             bytes,
             manifest: m,
@@ -309,14 +407,20 @@ impl RawManifest {
     }
 }
 
-fn text(s: &str, min: usize, max: usize, controls: bool, n: &str) -> Result<()> {
+pub(crate) fn validate_text(
+    s: &str,
+    min: usize,
+    max: usize,
+    controls: bool,
+    n: &str,
+) -> Result<()> {
     let l = s.chars().count();
     if l < min || l > max || (controls && s.chars().any(|c| (c as u32) <= 31)) {
         return Err(Error::invalid(format!("invalid {n}")));
     }
     Ok(())
 }
-fn reverse_dns(s: &str) -> bool {
+pub(crate) fn reverse_dns(s: &str) -> bool {
     let p: Vec<_> = s.split('.').collect();
     p.len() >= 2
         && p.iter().all(|x| {
@@ -340,7 +444,11 @@ fn label_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 fn relative(s: &str) -> bool {
-    !s.is_empty() && !s.starts_with('/') && !s.contains('\0') && !s.split('/').any(|x| x == "..")
+    s == "."
+        || (!s.is_empty()
+            && !s.starts_with('/')
+            && !s.contains('\0')
+            && s.split('/').all(|x| !x.is_empty() && x != "." && x != ".."))
 }
 fn absolute_uri(s: &str) -> bool {
     s.split_once(':').is_some_and(|(a, b)| {
@@ -355,7 +463,7 @@ fn absolute_uri(s: &str) -> bool {
             })
     })
 }
-fn time(s: &str) -> Result<()> {
+pub(crate) fn validate_time(s: &str) -> Result<()> {
     let b = s.as_bytes();
     if b.len() != 24
         || b[4] != b'-'

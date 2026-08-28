@@ -206,7 +206,7 @@ fn check_name(name: &str) -> Result<()> {
     if name == "." || name == ".." {
         return Err(Error::invalid(format!("illegal tree entry name {name:?}")));
     }
-    if name.contains('/') || name.contains('\0') {
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
         return Err(Error::invalid(format!(
             "tree entry name {name:?} contains a separator"
         )));
@@ -256,7 +256,14 @@ impl BlobStore {
     }
 
     pub fn has(&self, hash: &Hash) -> bool {
-        self.path_for(hash).is_file()
+        match self.get(hash) {
+            Ok(_) => true,
+            Err(Error::Corrupt { .. }) => {
+                let _ = fs::remove_file(self.path_for(hash));
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     /// Store bytes, returning their hash. Storing the same bytes twice is a
@@ -265,7 +272,10 @@ impl BlobStore {
         let hash = Hash::of(bytes);
         let dest = self.path_for(&hash);
         if dest.is_file() {
-            return Ok(hash);
+            if self.get(&hash).is_ok() {
+                return Ok(hash);
+            }
+            fs::remove_file(&dest).map_err(|e| Error::io(&dest, e))?;
         }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
@@ -280,14 +290,18 @@ impl BlobStore {
             f.sync_all().map_err(|e| Error::io(&tmp, e))?;
         }
         fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
+        let shard = dest.parent().expect("CAS object has shard directory");
+        fs::File::open(shard)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(shard, e))?;
         Ok(hash)
     }
 
     /// Store the contents of a file.
-    pub fn put_file(&self, path: impl AsRef<Path>) -> Result<Hash> {
+    pub fn put_file(&self, path: impl AsRef<Path>) -> Result<(Hash, u64)> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-        self.put(&bytes)
+        Ok((self.put(&bytes)?, bytes.len() as u64))
     }
 
     /// Read a blob back.
@@ -358,7 +372,7 @@ fn walk(store: &BlobStore, dir: &Path, root: bool, depth: usize, path_len: usize
         }
         let meta = fs::symlink_metadata(&path).map_err(|e| Error::io(&path, e))?;
         let ty = meta.file_type();
-        if root && name == ABRA_DIR && ty.is_dir() {
+        if root && name == ABRA_DIR {
             continue;
         }
 
@@ -376,7 +390,8 @@ fn walk(store: &BlobStore, dir: &Path, root: bool, depth: usize, path_len: usize
             } else {
                 EntryMode::File
             };
-            (mode, store.put_file(&path)?, meta.len())
+            let (hash, size) = store.put_file(&path)?;
+            (mode, hash, size)
         } else {
             return Err(Error::invalid(format!(
                 "{} is neither a file, directory nor symlink",
@@ -401,7 +416,26 @@ fn walk(store: &BlobStore, dir: &Path, root: bool, depth: usize, path_len: usize
 /// ownership and non-execute permission bits are not preserved: the tree object
 /// does not carry them.
 pub fn materialize(store: &BlobStore, root: &Hash, dest: impl AsRef<Path>) -> Result<()> {
-    materialize_inner(store, root, dest.as_ref(), 0, 0)
+    let dest = dest.as_ref();
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::invalid("materialization destination is a symlink"));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::invalid(
+                "materialization destination is not a directory",
+            ));
+        }
+        Ok(_) => {
+            let mut entries = fs::read_dir(dest).map_err(|e| Error::io(dest, e))?;
+            if entries.next().is_some() {
+                return Err(Error::invalid("materialization destination must be empty"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io(dest, e)),
+    }
+    materialize_inner(store, root, dest, 0, 0)
 }
 
 fn materialize_inner(
@@ -632,6 +666,16 @@ mod tests {
     }
 
     #[test]
+    fn has_rejects_and_put_repairs_corruption() {
+        let (_d, store) = store();
+        let h = store.put(b"hello").unwrap();
+        fs::write(store.path_for(&h), b"bad").unwrap();
+        assert!(!store.has(&h));
+        assert_eq!(store.put(b"hello").unwrap(), h);
+        assert_eq!(store.get(&h).unwrap(), b"hello");
+    }
+
+    #[test]
     fn tree_encode_decode_roundtrip() {
         let tree = Tree::new(vec![
             TreeEntry {
@@ -690,7 +734,7 @@ mod tests {
 
     #[test]
     fn tree_rejects_bad_names() {
-        for name in ["", ".", "..", "a/b", "a\0b"] {
+        for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
             let r = Tree::new(vec![TreeEntry {
                 name: name.into(),
                 mode: EntryMode::File,
@@ -796,6 +840,18 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_dir_skips_root_abra_file() {
+        let (_d, store) = store();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("w");
+        write(&root.join(ABRA_DIR), "metadata");
+        let tree = store
+            .get_tree(&snapshot_dir(&store, &root).unwrap())
+            .unwrap();
+        assert!(tree.get(ABRA_DIR).is_none());
+    }
+
+    #[test]
     fn snapshot_dir_rejects_a_file_argument() {
         let (_d, store) = store();
         let tmp = tempfile::tempdir().unwrap();
@@ -838,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_overwrites_existing_paths() {
+    fn materialize_rejects_nonempty_destination() {
         let (_d, store) = store();
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
@@ -847,8 +903,50 @@ mod tests {
 
         let out = tmp.path().join("out");
         write(&out.join("readme.md"), "stale\n");
-        materialize(&store, &root, &out).unwrap();
-        assert_eq!(fs::read(out.join("readme.md")).unwrap(), b"hello\n");
+        assert!(materialize(&store, &root, &out).is_err());
+        assert_eq!(fs::read(out.join("readme.md")).unwrap(), b"stale\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_symlink_tree_cannot_write_outside_destination() {
+        let (_d, store) = store();
+        let tmp = tempfile::tempdir().unwrap();
+        let link = store.put(b"..").unwrap();
+        let file = store.put(b"inside").unwrap();
+        let tree = Tree::new(vec![
+            TreeEntry {
+                name: "s".into(),
+                mode: EntryMode::Link,
+                hash: link,
+                size: 2,
+            },
+            TreeEntry {
+                name: "outside.txt".into(),
+                mode: EntryMode::File,
+                hash: file,
+                size: 6,
+            },
+        ])
+        .unwrap();
+        let root = store.put_tree(&tree).unwrap();
+        let dest = tmp.path().join("dest");
+        materialize(&store, &root, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("outside.txt")).unwrap(), b"inside");
+        assert!(!tmp.path().join("outside.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_symlink_destination() {
+        let (_d, store) = store();
+        let root = store.put_tree(&Tree::default()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let dest = tmp.path().join("dest");
+        std::os::unix::fs::symlink(&real, &dest).unwrap();
+        assert!(materialize(&store, &root, &dest).is_err());
     }
 
     #[test]

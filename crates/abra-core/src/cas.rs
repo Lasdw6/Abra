@@ -84,6 +84,8 @@ pub struct TreeEntry {
     pub name: String,
     pub mode: EntryMode,
     pub hash: Hash,
+    /// Blob length, or zero for a child tree (SPEC §3.2).
+    pub size: u64,
 }
 
 /// A directory state. Entries are always sorted by name, so a directory state
@@ -132,6 +134,7 @@ impl Tree {
             out.extend_from_slice(e.name.as_bytes());
             out.push(0);
             out.extend_from_slice(e.hash.as_bytes());
+            out.extend_from_slice(&e.size.to_be_bytes());
         }
         out
     }
@@ -160,17 +163,22 @@ impl Tree {
                 .to_string();
             rest = &rest[nul + 1..];
 
-            if rest.len() < 32 {
+            if rest.len() < 40 {
                 return Err(Error::corrupt("tree", "truncated entry hash"));
             }
             let mut raw = [0u8; 32];
             raw.copy_from_slice(&rest[..32]);
-            rest = &rest[32..];
+            let size = u64::from_be_bytes(rest[32..40].try_into().unwrap());
+            rest = &rest[40..];
+            if mode == EntryMode::Tree && size != 0 {
+                return Err(Error::corrupt("tree", "tree entry size is nonzero"));
+            }
 
             entries.push(TreeEntry {
                 name,
                 mode,
                 hash: Hash::from_bytes(raw),
+                size,
             });
         }
 
@@ -202,6 +210,9 @@ fn check_name(name: &str) -> Result<()> {
         return Err(Error::invalid(format!(
             "tree entry name {name:?} contains a separator"
         )));
+    }
+    if name.len() > 255 {
+        return Err(Error::invalid("tree entry name exceeds 255 bytes"));
     }
     Ok(())
 }
@@ -323,11 +334,14 @@ pub fn snapshot_dir(store: &BlobStore, dir: impl AsRef<Path>) -> Result<Hash> {
             dir.display()
         )));
     }
-    let tree = walk(store, dir)?;
+    let tree = walk(store, dir, true, 0, 0)?;
     store.put_tree(&tree)
 }
 
-fn walk(store: &BlobStore, dir: &Path) -> Result<Tree> {
+fn walk(store: &BlobStore, dir: &Path, root: bool, depth: usize, path_len: usize) -> Result<Tree> {
+    if depth > 512 {
+        return Err(Error::invalid("tree depth exceeds 512"));
+    }
     let mut entries = Vec::new();
     let read = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
 
@@ -337,28 +351,32 @@ fn walk(store: &BlobStore, dir: &Path) -> Result<Tree> {
             .file_name()
             .into_string()
             .map_err(|raw| Error::invalid(format!("non-utf-8 file name {raw:?}")))?;
-        if name == ABRA_DIR {
+        let path = entry.path();
+        let child_len = path_len + usize::from(path_len > 0) + name.len();
+        if child_len > 4096 {
+            return Err(Error::invalid("reconstructed path exceeds 4096 bytes"));
+        }
+        let meta = fs::symlink_metadata(&path).map_err(|e| Error::io(&path, e))?;
+        let ty = meta.file_type();
+        if root && name == ABRA_DIR && ty.is_dir() {
             continue;
         }
 
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|e| Error::io(&path, e))?;
-        let ty = meta.file_type();
-
-        let (mode, hash) = if ty.is_symlink() {
+        let (mode, hash, size) = if ty.is_symlink() {
             let target = fs::read_link(&path).map_err(|e| Error::io(&path, e))?;
             let bytes = path_to_bytes(&target)?;
-            (EntryMode::Link, store.put(&bytes)?)
+            let size = bytes.len() as u64;
+            (EntryMode::Link, store.put(&bytes)?, size)
         } else if ty.is_dir() {
-            let sub = walk(store, &path)?;
-            (EntryMode::Tree, store.put_tree(&sub)?)
+            let sub = walk(store, &path, false, depth + 1, child_len)?;
+            (EntryMode::Tree, store.put_tree(&sub)?, 0)
         } else if ty.is_file() {
             let mode = if is_executable(&meta) {
                 EntryMode::Exec
             } else {
                 EntryMode::File
             };
-            (mode, store.put_file(&path)?)
+            (mode, store.put_file(&path)?, meta.len())
         } else {
             return Err(Error::invalid(format!(
                 "{} is neither a file, directory nor symlink",
@@ -366,7 +384,12 @@ fn walk(store: &BlobStore, dir: &Path) -> Result<Tree> {
             )));
         };
 
-        entries.push(TreeEntry { name, mode, hash });
+        entries.push(TreeEntry {
+            name,
+            mode,
+            hash,
+            size,
+        });
     }
 
     Tree::new(entries)
@@ -378,21 +401,51 @@ fn walk(store: &BlobStore, dir: &Path) -> Result<Tree> {
 /// ownership and non-execute permission bits are not preserved: the tree object
 /// does not carry them.
 pub fn materialize(store: &BlobStore, root: &Hash, dest: impl AsRef<Path>) -> Result<()> {
-    let dest = dest.as_ref();
+    materialize_inner(store, root, dest.as_ref(), 0, 0)
+}
+
+fn materialize_inner(
+    store: &BlobStore,
+    root: &Hash,
+    dest: &Path,
+    depth: usize,
+    path_len: usize,
+) -> Result<()> {
+    if depth > 512 {
+        return Err(Error::invalid("tree depth exceeds 512"));
+    }
     fs::create_dir_all(dest).map_err(|e| Error::io(dest, e))?;
     let tree = store.get_tree(root)?;
 
     for entry in tree.entries() {
+        let child_len = path_len + usize::from(path_len > 0) + entry.name.len();
+        if child_len > 4096 {
+            return Err(Error::invalid("reconstructed path exceeds 4096 bytes"));
+        }
         let path = dest.join(&entry.name);
         match entry.mode {
-            EntryMode::Tree => materialize(store, &entry.hash, &path)?,
+            EntryMode::Tree => {
+                if fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.file_type().is_symlink() || !m.is_dir())
+                {
+                    remove_existing(&path)?;
+                }
+                materialize_inner(store, &entry.hash, &path, depth + 1, child_len)?
+            }
             EntryMode::Link => {
-                let target = bytes_to_path(&store.get(&entry.hash)?)?;
+                let bytes = store.get(&entry.hash)?;
+                if bytes.len() as u64 != entry.size {
+                    return Err(Error::corrupt("blob", "tree size mismatch"));
+                }
+                let target = bytes_to_path(&bytes)?;
                 remove_existing(&path)?;
                 symlink(&target, &path)?;
             }
             EntryMode::File | EntryMode::Exec => {
                 let bytes = store.get(&entry.hash)?;
+                if bytes.len() as u64 != entry.size {
+                    return Err(Error::corrupt("blob", "tree size mismatch"));
+                }
                 remove_existing(&path)?;
                 fs::write(&path, &bytes).map_err(|e| Error::io(&path, e))?;
                 set_mode(&path, entry.mode == EntryMode::Exec)?;
@@ -585,21 +638,25 @@ mod tests {
                 name: "z.txt".into(),
                 mode: EntryMode::File,
                 hash: Hash::of(b"z"),
+                size: 1,
             },
             TreeEntry {
                 name: "a.sh".into(),
                 mode: EntryMode::Exec,
                 hash: Hash::of(b"a"),
+                size: 1,
             },
             TreeEntry {
                 name: "sub".into(),
                 mode: EntryMode::Tree,
                 hash: Hash::of(b"sub"),
+                size: 0,
             },
             TreeEntry {
                 name: "l".into(),
                 mode: EntryMode::Link,
                 hash: Hash::of(b"target"),
+                size: 6,
             },
         ])
         .unwrap();
@@ -617,11 +674,13 @@ mod tests {
             name: "a".into(),
             mode: EntryMode::File,
             hash: Hash::of(b"a"),
+            size: 1,
         };
         let b = TreeEntry {
             name: "b".into(),
             mode: EntryMode::File,
             hash: Hash::of(b"b"),
+            size: 1,
         };
         let one = Tree::new(vec![a.clone(), b.clone()]).unwrap();
         let two = Tree::new(vec![b, a]).unwrap();
@@ -636,6 +695,7 @@ mod tests {
                 name: name.into(),
                 mode: EntryMode::File,
                 hash: Hash::of(b"x"),
+                size: 1,
             }]);
             assert!(r.is_err(), "accepted {name:?}");
         }
@@ -647,6 +707,7 @@ mod tests {
             name: "dup".into(),
             mode: EntryMode::File,
             hash: Hash::of(b"x"),
+            size: 1,
         };
         assert!(Tree::new(vec![e.clone(), e]).is_err());
     }
@@ -669,6 +730,7 @@ mod tests {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(0);
             bytes.extend_from_slice(Hash::of(name.as_bytes()).as_bytes());
+            bytes.extend_from_slice(&1u64.to_be_bytes());
         }
         assert!(matches!(Tree::decode(&bytes), Err(Error::Corrupt { .. })));
     }

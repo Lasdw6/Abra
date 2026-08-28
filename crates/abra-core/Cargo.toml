@@ -14,7 +14,8 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-data-encoding.workspace = true
+hex.workspace = true
+x25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

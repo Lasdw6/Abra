@@ -17,9 +17,12 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod capsule;
 pub mod cas;
 pub mod error;
 pub mod identity;
+pub mod manifest;
+pub mod store;
 mod util;
 
 pub use error::{Error, Result};
@@ -30,4 +33,4 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The envelope format version this build implements, as it appears in a
 /// manifest's `spec` field. See `SPEC.md`.
-pub const SPEC: &str = "0.1";
+pub const SPEC: &str = "abra/0.1";

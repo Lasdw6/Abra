@@ -3,13 +3,14 @@
 use crate::error::{Error, Result};
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    data_encoding::HEXLOWER.encode(bytes)
+    hex::encode(bytes)
 }
 
 pub(crate) fn hex_decode_fixed<const N: usize>(s: &str, kind: &'static str) -> Result<[u8; N]> {
-    let raw = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(s.as_bytes())
-        .map_err(|e| Error::encoding(kind, format!("not hex: {e}")))?;
+    if s.bytes().any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::encoding(kind, "expected lowercase hex"));
+    }
+    let raw = hex::decode(s).map_err(|e| Error::encoding(kind, format!("not hex: {e}")))?;
     if raw.len() != N {
         return Err(Error::encoding(
             kind,

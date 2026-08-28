@@ -66,8 +66,7 @@ consumer parses one thing.
 Every manifest must carry enough that **any** device can render a card without
 understanding the payload:
 
-- `kind` — payload type string, e.g. `abra.workspace`, `abra.handoff.v1`,
-  `abra.file`
+- `kind` — payload type string, e.g. `dev.abra.workspace`, `dev.abra.handoff.v1`
 - `title` — human string
 - `origin` — sending peer id
 - `created_at` — timestamp
@@ -76,8 +75,8 @@ And optionally, in the same flat namespace: `summary`, `link` (a URL),
 `thumbnail` (blob hash), `files` (tree root hash), `recipes`, native blob refs.
 
 An unknown `kind` degrades gracefully: title + summary + origin + timestamp is
-still a card, and `link` is still clickable. Namespacing `kind` (`abra.*`,
-`vendor.*`) lets third parties define payload types without a registry.
+still a card, and `link` is still clickable. Namespacing `kind` (`dev.abra.*`,
+`com.vendor.*`) lets third parties define payload types without a registry.
 
 ## 5. Recipes
 
@@ -118,9 +117,10 @@ can't use them deletes them and loses nothing but time.
 
 ## 7. Identity and authorization
 
-A peer is an Ed25519 keypair. The peer id is the hex of the first 8 bytes of
-`blake3(pubkey)`; the full public key is always stored alongside, so the short
-id is a display and indexing convenience and never the thing verified against.
+A peer is an Ed25519 keypair. The peer id is the full 32-byte public key (64
+hex chars) — the same bytes as the iroh NodeId, so transport identity and Abra
+identity never diverge. A short id (first 8 hex of `blake3(pubkey)`) exists for
+display only and is never verified against or used for authorization.
 
 **Single-user mesh is an authorization policy, not a protocol constraint.** The
 protocol is peer-to-peer between keypairs. "Only my devices" is a rule about

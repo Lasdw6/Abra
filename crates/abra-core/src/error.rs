@@ -37,18 +37,12 @@ pub enum Error {
     #[error("invalid: {0}")]
     Invalid(String),
 
-    /// An unsupported `abra_spec` version was encountered.
-    #[error("unsupported abra_spec {found}, this build implements {expected}")]
-    UnsupportedSpec { found: u32, expected: u32 },
+    /// An unsupported `spec` version was encountered.
+    #[error("unsupported spec {found:?}, this build implements {expected:?}")]
+    UnsupportedSpec { found: String, expected: String },
 
     #[error("signature verification failed: {0}")]
     BadSignature(String),
-
-    #[error("decryption failed: the key is wrong or the ciphertext was tampered with")]
-    Decrypt,
-
-    #[error("malformed capability link: {0}")]
-    BadLink(String),
 }
 
 impl Error {

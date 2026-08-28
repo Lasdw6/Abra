@@ -6,9 +6,9 @@
 
 fn main() {
     println!(
-        "abra {} (abra-core {}, abra_spec {})",
+        "abra {} (abra-core {}, spec {})",
         env!("CARGO_PKG_VERSION"),
         abra_core::VERSION,
-        abra_core::ABRA_SPEC,
+        abra_core::SPEC,
     );
 }

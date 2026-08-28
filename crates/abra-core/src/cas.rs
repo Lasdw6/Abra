@@ -1,7 +1,7 @@
 //! Content-addressed storage: blake3 blobs, git-like tree objects, and the
 //! walk/write pair that turns a directory into a hash and back.
 //!
-//! See `docs/SPEC.md` §2 and §3.
+//! See `SPEC.md` §2 and §3.
 //!
 //! Dedup is by content, so an unchanged file across a hundred snapshots is
 //! stored once and an incremental teleport only needs the hashes the receiver
@@ -206,7 +206,7 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A blake3-addressed blob store, sharded `blobs/ab/cdef...`.
+/// A blake3-addressed object store, sharded `objects/ab/cdef...`.
 ///
 /// Writes are atomic: content lands in a temp file inside the store and is
 /// renamed into place, so a blob path either does not exist or holds complete,
@@ -221,7 +221,7 @@ impl BlobStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let store = BlobStore { root };
-        fs::create_dir_all(store.blobs_dir()).map_err(|e| Error::io(store.blobs_dir(), e))?;
+        fs::create_dir_all(store.objects_dir()).map_err(|e| Error::io(store.objects_dir(), e))?;
         fs::create_dir_all(store.tmp_dir()).map_err(|e| Error::io(store.tmp_dir(), e))?;
         Ok(store)
     }
@@ -230,8 +230,8 @@ impl BlobStore {
         &self.root
     }
 
-    fn blobs_dir(&self) -> PathBuf {
-        self.root.join("blobs")
+    fn objects_dir(&self) -> PathBuf {
+        self.root.join("objects")
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -241,7 +241,7 @@ impl BlobStore {
     /// Where a blob lives, whether or not it exists.
     pub fn path_for(&self, hash: &Hash) -> PathBuf {
         let hex = hash.to_hex();
-        self.blobs_dir().join(&hex[..2]).join(&hex[2..])
+        self.objects_dir().join(&hex[..2]).join(&hex[2..])
     }
 
     pub fn has(&self, hash: &Hash) -> bool {

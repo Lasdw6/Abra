@@ -2,8 +2,8 @@
 //!
 //! Abra moves files, workspaces, and app state between one user's devices and
 //! their cloud agents. This crate is the local half: identity, content-addressed
-//! storage, the snapshot envelope, the capsule store, enrollment certificates,
-//! and capability links. There is no network code here.
+//! storage, the snapshot envelope, and the capsule/snapshot DAG. There is no
+//! network code here.
 //!
 //! Two rules shape everything below:
 //!
@@ -12,7 +12,7 @@
 //! - **Execute nothing.** Recipes and native blobs are stored and moved as
 //!   data. This crate never runs a process.
 //!
-//! See `docs/DESIGN.md` and `docs/SPEC.md`.
+//! See `DESIGN.md` and `SPEC.md` at the repository root.
 
 #![forbid(unsafe_code)]
 
@@ -28,5 +28,6 @@ pub use util::now_ms;
 /// This crate's version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The wire format version this build implements. See `docs/SPEC.md`.
-pub const ABRA_SPEC: u32 = 1;
+/// The envelope format version this build implements, as it appears in a
+/// manifest's `spec` field. See `SPEC.md`.
+pub const SPEC: &str = "0.1";

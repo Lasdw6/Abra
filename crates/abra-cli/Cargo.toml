@@ -1,5 +1,5 @@
 [package]
-name = "abra"
+name = "abra-cli"
 description = "Abra CLI: teleport snapshots between your own devices and agents."
 version.workspace = true
 edition.workspace = true

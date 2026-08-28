@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/abra-core", "crates/abra", "crates/cadabra"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/abra-p2p/abra"
+rust-version = "1.75"
+
+[workspace.dependencies]
+abra-core = { path = "crates/abra-core", version = "0.1.0" }
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+chacha20poly1305 = "0.10"
+data-encoding = "2"
+tempfile = "3"

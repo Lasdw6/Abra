@@ -1,0 +1,15 @@
+[package]
+name = "cadabra"
+description = "Abra daemon: holds the device identity, capsule store, outbox and inbox."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cadabra"
+path = "src/main.rs"
+
+[dependencies]
+abra-core.workspace = true

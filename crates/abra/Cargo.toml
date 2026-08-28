@@ -1,0 +1,15 @@
+[package]
+name = "abra"
+description = "Abra CLI: teleport snapshots between your own devices and agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "abra"
+path = "src/main.rs"
+
+[dependencies]
+abra-core.workspace = true

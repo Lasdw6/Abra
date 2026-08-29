@@ -778,6 +778,11 @@ impl Daemon {
                 materialize(&node.store.cas, &files, destination)?;
             }
             materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
+            if let Some(capsule_id) = raw.manifest().capsule_id {
+                let metadata = destination.join(".abra");
+                fs::create_dir_all(&metadata)?;
+                fs::write(metadata.join("capsule_id"), capsule_id.to_hex())?;
+            }
         }
         Ok(json!({"accepted":id,"to":destination}))
     }

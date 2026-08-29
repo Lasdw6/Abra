@@ -425,6 +425,9 @@ impl Capsule {
             return Err(Error::invalid("label signer differs from caller identity"));
         }
         op.verify()?;
+        let wins = !self.labels.get(&op.name).is_some_and(|old| {
+            op.seq < old.seq || (op.seq == old.seq && op.sig.to_bytes() <= old.sig.to_bytes())
+        });
         if op.name == "main" {
             let w = self
                 .active_lease(now_ms)
@@ -434,6 +437,16 @@ impl Capsule {
             }
             if self.snapshots.get(&op.snapshot_id).is_none_or(|r| r.orphan) {
                 return Err(Error::invalid("main target missing or orphan"));
+            }
+            if wins
+                && self
+                    .labels
+                    .get("main")
+                    .is_some_and(|old| !self.descends_from(op.snapshot_id, old.snapshot_id))
+            {
+                return Err(Error::invalid(
+                    "main move does not descend from current head",
+                ));
             }
         } else if op.name.starts_with("fork/") {
             if op.name.len() != 13
@@ -455,9 +468,6 @@ impl Capsule {
         if !self.labels.contains_key(&op.name) && self.labels.len() >= 128 {
             return Err(Error::invalid("capsule label limit exceeded"));
         }
-        let wins = !self.labels.get(&op.name).is_some_and(|old| {
-            op.seq < old.seq || (op.seq == old.seq && op.sig.to_bytes() <= old.sig.to_bytes())
-        });
         if wins {
             if op.name.starts_with("fork/") && !self.labels.contains_key(&op.name) {
                 let count = self.fork_counts.entry(op.by).or_default();
@@ -469,6 +479,27 @@ impl Capsule {
             self.labels.insert(op.name.clone(), op);
         }
         Ok(wins)
+    }
+
+    fn descends_from(&self, candidate: Hash, ancestor: Hash) -> bool {
+        let mut pending = vec![candidate];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if id == ancestor {
+                return true;
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(parents) = self
+                .snapshots
+                .get(&id)
+                .and_then(|record| record.raw.manifest().parents.as_ref())
+            {
+                pending.extend(parents.iter().copied());
+            }
+        }
+        false
     }
 }
 fn unsigned<T: Serialize>(v: &T, field: &str) -> Result<Vec<u8>> {

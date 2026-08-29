@@ -7,7 +7,7 @@ use crate::{
     read_frame, write_frame, Connection, Error, Outbox, OutboxState, Result,
 };
 use abra_core::{
-    capsule::{Genesis, LeaseRecord},
+    capsule::{Genesis, LabelOp, LeaseMode, LeaseRecord},
     cas::{Hash, Tree},
     identity::{Identity, PeerId, Signature},
     manifest::{closure, RawManifest, Scope},
@@ -47,6 +47,10 @@ pub struct Offer {
     pub genesis: Option<Genesis>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub genesis_grant: Option<LeaseRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_chain: Vec<LeaseRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_label: Option<LabelOp>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -631,6 +635,8 @@ impl DeliveryNode {
             manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
             genesis: capsule.map(|x| x.genesis.clone()),
             genesis_grant: capsule.and_then(|x| x.leases().first().cloned()),
+            lease_chain: capsule.map(winning_lease_chain).unwrap_or_default(),
+            main_label: capsule.and_then(|x| x.label("main").cloned()),
         };
         {
             let (send, _) = connection.control_mut();
@@ -908,9 +914,11 @@ impl DeliveryNode {
                         if !self.store.capsules.contains_key(&capsule_id) {
                             let genesis = offer
                                 .genesis
+                                .clone()
                                 .ok_or_else(|| Error::protocol("missing genesis"))?;
                             let grant = offer
                                 .genesis_grant
+                                .clone()
                                 .ok_or_else(|| Error::protocol("missing genesis grant"))?;
                             if genesis.capsule_id != capsule_id {
                                 return Err(Error::protocol("genesis capsule mismatch"));
@@ -924,6 +932,9 @@ impl DeliveryNode {
                         return Err(Error::authz("inbox quota exceeded"));
                     }
                     let shelf = self.commit_manifest(raw, connection.peer_id(), now)?;
+                    if shelf == "capsule" {
+                        let _ = self.adopt_offer_capsule_state(&offer, now);
+                    }
                     let ack = Ack::sign(
                         offer.offer_id,
                         offer.snapshot_id,
@@ -1059,6 +1070,52 @@ impl DeliveryNode {
             }
         }
     }
+
+    fn adopt_offer_capsule_state(&mut self, offer: &Offer, now: u64) -> Result<()> {
+        let capsule_id = offer
+            .capsule_id
+            .ok_or_else(|| Error::protocol("full offer lacks capsule id"))?;
+        for lease in &offer.lease_chain {
+            let already_known = self.store.capsules[&capsule_id]
+                .leases()
+                .iter()
+                .any(|known| known.hash().ok() == lease.hash().ok());
+            if already_known {
+                continue;
+            }
+            self.store
+                .accept_lease(capsule_id, lease.clone(), &|holder, mode| {
+                    self.trust
+                        .authorize_lease(holder, mode == LeaseMode::Takeover, now)
+                        .is_ok()
+                })?;
+        }
+        if let Some(op) = &offer.main_label {
+            self.store.apply_label(op.clone(), op.by, now)?;
+        }
+        Ok(())
+    }
+}
+
+fn winning_lease_chain(capsule: &abra_core::capsule::Capsule) -> Vec<LeaseRecord> {
+    let Some(mut current) = capsule.winning_lease() else {
+        return Vec::new();
+    };
+    let mut reverse = Vec::new();
+    while current.epoch > 1 {
+        reverse.push(current.clone());
+        let prev = current.prev_hash;
+        let Some(parent) = capsule
+            .leases()
+            .iter()
+            .find(|lease| lease.hash().ok() == Some(prev))
+        else {
+            return Vec::new();
+        };
+        current = parent;
+    }
+    reverse.reverse();
+    reverse
 }
 
 async fn read_value(connection: &mut Connection) -> Result<serde_json::Value> {

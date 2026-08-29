@@ -436,7 +436,10 @@ leaves outbox entries queued with backoff.
  "capsule_id":"<hex, full only>","fork":false,
  "bytes_hint":123456,"object_count":42,
  "manifest_raw":"<base64url of exact bytes M>",
- "genesis":{...optional, first send of a capsule to this peer...}}
+ "genesis":{...optional, full only...},
+ "genesis_grant":{...optional, signed epoch-1 grant, full only...},
+ "lease_chain":[...signed winning lease ancestry after epoch 1, full only...],
+ "main_label":{...optional, current signed main label-op, full only...}}
 ```
 
 `manifest_raw` is the **only** representation of the manifest on the wire.
@@ -448,6 +451,16 @@ notification may show before blobs arrive) and reply `offer-accept {offer_id}` o
 `offer-reject {offer_id, reason: "quota"|"scope"|"duplicate"|"invalid"|"busy"}`.
 If the receiver already holds the full closure it MAY skip transfer and ack
 directly.
+
+For a full offer, `lease_chain` is ordered from epoch 2 through the sender's
+winning lease and contains the exact predecessor records needed to validate that
+winner from `genesis_grant`. After committing the snapshot without changing any
+label, the receiver passes each unknown lease record through normal lease
+acceptance (§5.4), then passes `main_label` through normal label-op acceptance
+(§5.3). The receiver adopts `main` only if the complete applicable chain and
+label-op validate, including signer, epoch, predecessor hash, target ancestry,
+and lease-holder authorization. Failure leaves the snapshot stored as a fork;
+there is no implicit merge or unsigned head inference.
 
 ### 6.5 Delta negotiation
 
@@ -825,3 +838,7 @@ turn.
   genesis and its signed epoch-1 grant, since capsule installation verifies both.
 - Stage-4 clarification: enrollment intro records include the peer's X25519 key
   and transport dialing addresses, avoiding a parallel discovery or identity channel.
+- Stage-5 erratum: every full offer carries the sender's signed `main` label-op
+  plus the signed winning lease ancestry needed to verify it. Raw snapshot
+  receipt remains label-free; receivers adopt the pointer only through the
+  existing lease and label verification paths.

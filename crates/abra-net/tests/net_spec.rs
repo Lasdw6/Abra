@@ -645,6 +645,8 @@ fn receiver_rejects_noncanonical_mismatched_and_untrusted_origin_manifest_bytes(
         manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
         genesis: None,
         genesis_grant: None,
+        lease_chain: Vec::new(),
+        main_label: None,
     };
     assert_eq!(
         receiver

@@ -62,7 +62,12 @@ There is exactly one envelope format. A single `scope` field splits behaviour:
 workspace: file tree, process recipes, optional native memory blobs. Always
 carries `capsule_id` and `parents` (the parent snapshot hashes, forming the
 history DAG) and participates in lease semantics. Receiving a `full` snapshot
-means: sync it into the capsule store.
+means: sync it into the capsule store. Its offer also carries the sender's
+signed `main` pointer and the signed winning lease ancestry that authorizes that
+pointer. Receivers commit the immutable snapshot first, validate the lease chain
+with the ordinary lease rules, and apply the pointer with the ordinary label-op
+rules. An invalid or sideways pointer leaves the object available as a fork;
+receipt never infers a head or silently merges histories.
 
 **`scope: "partial"`** — a delivery. A browser session, a file, a folder, a
 handoff link. No lineage, no capsule, no lease. Receiving a `partial` means: it

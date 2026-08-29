@@ -26,6 +26,134 @@ where
 }
 
 #[tokio::test]
+async fn capsule_round_trip_advances_one_linear_main_for_three_hops() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+
+    let ticket = b.handle(json!({"op":"pair-ticket"})).await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handle(json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let peers = b.handle(json!({"op":"peers"})).await?;
+        (!peers.as_array().unwrap().is_empty())
+            .then_some(peers)
+            .ok_or_else(|| "not paired".into())
+    })
+    .await;
+
+    let a_workspace = a_root.path().join("workspace");
+    fs::create_dir(&a_workspace).unwrap();
+    fs::write(a_workspace.join("turn"), "a1").unwrap();
+    let created = a
+        .handle(json!({"op":"capsule-create","path":a_workspace}))
+        .await
+        .unwrap();
+    let capsule = created["capsule_id"].clone();
+    let first = a
+        .handle(json!({"op":"snapshot","path":a_workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":first["snapshot_id"]}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = b.handle(json!({"op":"log","capsule":capsule})).await?;
+        (log.as_array().unwrap().len() == 1)
+            .then_some(log)
+            .ok_or_else(|| "first hop pending".into())
+    })
+    .await;
+
+    let b_workspace = b_root.path().join("workspace");
+    b.handle(json!({"op":"accept","id":first["snapshot_id"],"to":b_workspace}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(b_workspace.join(".abra/capsule_id")).unwrap(),
+        capsule.as_str().unwrap()
+    );
+    b.handle(json!({"op":"lease-take","capsule":capsule}))
+        .await
+        .unwrap();
+    fs::write(b_workspace.join("turn"), "b2").unwrap();
+    let second = b
+        .handle(json!({"op":"snapshot","path":b_workspace}))
+        .await
+        .unwrap();
+    b.handle(json!({"op":"send","peer":a.peer_id().await,"snapshot_id":second["snapshot_id"]}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = a.handle(json!({"op":"log","capsule":capsule})).await?;
+        (log.as_array().unwrap().len() == 2)
+            .then_some(log)
+            .ok_or_else(|| "second hop pending".into())
+    })
+    .await;
+
+    a.handle(json!({"op":"lease-take","capsule":capsule}))
+        .await
+        .unwrap();
+    fs::write(a_workspace.join("turn"), "a3").unwrap();
+    let third = a
+        .handle(json!({"op":"snapshot","path":a_workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":third["snapshot_id"]}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = b.handle(json!({"op":"log","capsule":capsule})).await?;
+        (log.as_array().unwrap().len() == 3)
+            .then_some(log)
+            .ok_or_else(|| "third hop pending".into())
+    })
+    .await;
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+    for root in [a_root.path(), b_root.path()] {
+        let node = abra_net::DeliveryNode::open(root).unwrap();
+        let id = capsule.as_str().unwrap().parse().unwrap();
+        let cap = &node.store.capsules[&id];
+        assert_eq!(cap.snapshots().len(), 3);
+        assert_eq!(
+            cap.label("main").unwrap().snapshot_id.to_hex(),
+            third["snapshot_id"]
+        );
+        assert!(cap.labels().keys().all(|name| !name.starts_with("fork/")));
+        let first_id = first["snapshot_id"].as_str().unwrap().parse().unwrap();
+        let second_id = second["snapshot_id"].as_str().unwrap().parse().unwrap();
+        let third_id = third["snapshot_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            cap.snapshot(&first_id).unwrap().raw.manifest().parents,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            cap.snapshot(&second_id).unwrap().raw.manifest().parents,
+            Some(vec![first_id])
+        );
+        assert_eq!(
+            cap.snapshot(&third_id).unwrap().raw.manifest().parents,
+            Some(vec![second_id])
+        );
+    }
+    assert!(a_workspace.join(".abra/capsule_id").is_file());
+    assert!(b_workspace.join(".abra/capsule_id").is_file());
+    assert_eq!(second["forked"], false);
+    assert_eq!(third["forked"], false);
+}
+
+#[tokio::test]
 async fn auto_confirm_pairing_persists_both_trust_stores() {
     let network = LoopbackNetwork::default();
     let a_root = tempfile::tempdir().unwrap();

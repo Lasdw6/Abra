@@ -58,6 +58,76 @@ fn signed_manifest(scope: Scope) -> (Identity, Manifest) {
 }
 
 #[test]
+fn signed_main_move_to_non_descendant_is_rejected() {
+    let creator = Identity::from_secret_bytes(&[44; 32]);
+    let capsule_id = Hash::from_bytes([45; 32]);
+    let genesis = Genesis::new(
+        capsule_id,
+        "2026-08-28T00:00:00.000Z".into(),
+        "dev.abra.test".into(),
+        "linear main".into(),
+        &creator,
+    )
+    .unwrap();
+    let grant = LeaseRecord::new(
+        capsule_id,
+        creator.peer_id(),
+        1,
+        LeaseMode::Grant,
+        "2026-08-28T00:00:00.000Z".into(),
+        "2026-08-29T00:00:00.000Z".into(),
+        genesis.hash().unwrap(),
+        &creator,
+    )
+    .unwrap();
+    let mut capsule = Capsule::new(genesis, grant).unwrap();
+    let (_root, main_child, sibling) = {
+        let mut insert = |parents: Vec<Hash>, marker: &str| {
+            let (_, mut manifest) = signed_manifest(Scope::Full);
+            manifest.origin.peer_id = creator.peer_id();
+            manifest.capsule_id = Some(capsule_id);
+            manifest.parents = Some(parents);
+            manifest.payload.insert("marker".into(), json!(marker));
+            manifest.sign(&creator).unwrap();
+            let raw = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+            capsule
+                .insert_snapshot(raw, "2026-08-28T00:01:00.000Z".into(), 0)
+                .unwrap()
+                .snapshot_id
+        };
+        let root = insert(Vec::new(), "root");
+        (
+            root,
+            insert(vec![root], "main"),
+            insert(vec![root], "sibling"),
+        )
+    };
+    let first = LabelOp::new(
+        capsule_id,
+        1,
+        "main".into(),
+        main_child,
+        1,
+        "2026-08-28T00:02:00.000Z".into(),
+        &creator,
+    )
+    .unwrap();
+    capsule.apply_label(first, creator.peer_id(), 0).unwrap();
+    let sideways = LabelOp::new(
+        capsule_id,
+        2,
+        "main".into(),
+        sibling,
+        1,
+        "2026-08-28T00:03:00.000Z".into(),
+        &creator,
+    )
+    .unwrap();
+    assert!(capsule.apply_label(sideways, creator.peer_id(), 0).is_err());
+    assert_eq!(capsule.label("main").unwrap().snapshot_id, main_child);
+}
+
+#[test]
 fn manifest_validation_matrix_and_id_excludes_signature() {
     let (id, mut m) = signed_manifest(Scope::Full);
     m.validate().unwrap();

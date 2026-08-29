@@ -13,8 +13,10 @@ sync a workspace, resume a sandbox. The sender authors nothing extra.
 
 - **Snapshot** is the noun: a typed, self-describing, content-addressed bundle.
   Its manifest is always JSON — a snapshot is never an opaque blob.
-- **Teleport** is the verb: moving a snapshot end-to-end encrypted within one
-  user's device mesh.
+- **Teleport** is the verb: moving a snapshot within one user's device mesh over
+  an authenticated transport. (v0.1 caveat: the default TCP transport is
+  authenticated but not yet encrypted — on-wire confidentiality currently
+  requires the optional iroh transport or a private link. See DESIGN.md.)
 - **Capsule** is a continuing thing (a workspace, a sandbox) with a history DAG
   of snapshots. A **lease** says which device is currently driving it.
 - **Scope** splits the one envelope format two ways. `full` is a new version of

@@ -12,9 +12,20 @@ deterministic in-process loopback used by protocol tests, an authenticated TCP
 transport used by both shipped binaries, and an optional iroh 1.1 adapter. TCP
 connections perform an Ed25519 nonce challenge before any Abra frame; the
 resulting peer id must also match the signed pairing ticket and protocol hello.
-Signed pairing tickets carry the concrete loopback socket address. This v0.1
+Signed pairing tickets carry the concrete socket address. This v0.1
 choice avoids iroh's higher MSRV and platform network-monitor requirements;
 iroh remains available behind `abra-net/iroh` for integrators.
+
+**Transport confidentiality — known v0.1 limitation.** The default TCP
+transport is *authenticated* (mutual Ed25519, peer id bound to the pairing
+ticket) but **not encrypted**: after the handshake it carries Abra frames in
+cleartext. Only the optional iroh adapter (`abra-net/iroh`, QUIC/TLS 1.3)
+provides on-wire confidentiality today. So the "end-to-end encrypted" property
+the design assumes below holds for the iroh path and for anything tunnelled over
+a private link (LAN, WireGuard, SSH), but **not** for the default TCP transport
+over an untrusted network. Adding a Noise/`snow` handshake to the TCP transport,
+or making iroh the default once its MSRV is acceptable, is the tracked
+follow-up before this can be called a shippable v0.1.
 
 ## 1. What Abra is
 
@@ -156,9 +167,10 @@ transport._
 
 v1 syncs **byte for byte**. No exclusion logic, no ignore files, no `.env`
 filtering. A workspace that doesn't run without its secrets isn't a workspace
-that teleported. Since the mesh is one user's own devices and transport is E2E
-encrypted, the security argument for stripping is weak and the correctness
-argument for not stripping is strong.
+that teleported. Since the mesh is one user's own devices and transport is meant
+to be E2E encrypted (see the confidentiality limitation in the Stage 2 note —
+the default TCP transport is not yet encrypted), the security argument for
+stripping is weak and the correctness argument for not stripping is strong.
 
 Deliberately not implemented: ignore files. Adding them later is additive;
 having shipped a half-working ignore semantics would not be.

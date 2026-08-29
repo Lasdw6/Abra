@@ -5,6 +5,16 @@ including the parts later phases build. Phase 1 implements the local primitives
 (identity, CAS, snapshot, store, enroll, link); everything marked _later_ is
 described here so it is designed for, not designed around.
 
+### Stage 2 transport implementation
+
+`abra-net` exposes one transport contract and ships two implementations: a
+deterministic in-process loopback used by protocol tests, and an optional
+`iroh` 1.1 adapter (`--features iroh`) using ALPN `abra/1`. The adapter derives
+the authenticated Abra peer id directly from iroh's authenticated endpoint id;
+there is no second transport identity. Iroh remains optional because its current
+MSRV is newer than Abra's core crate MSRV, while the wire protocol and loopback
+implementation continue to build on the workspace baseline.
+
 ## 1. What Abra is
 
 Abra is infrastructure for teleportation. It moves files, workspaces, and app

@@ -146,7 +146,9 @@ impl AbraStore {
             .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?
             .clone();
         let won = staged.accept_lease(record.clone(), authorize)?;
-        atomic_write(&lease_path(&dir, &record)?, &record.bytes()?)?;
+        if won {
+            atomic_write(&lease_path(&dir, &record)?, &record.bytes()?)?;
+        }
         self.capsules.insert(capsule_id, staged);
         Ok(won)
     }
@@ -159,9 +161,76 @@ impl AbraStore {
             .ok_or_else(|| Error::not_found("capsule", id.to_hex()))?
             .clone();
         let won = staged.apply_label(op.clone(), caller, now_ms)?;
-        atomic_write(&label_path(&dir, &op), &op.bytes()?)?;
+        if won {
+            atomic_write(&label_path(&dir, &op), &op.bytes()?)?;
+        }
         self.capsules.insert(id, staged);
         Ok(won)
+    }
+
+    /// Atomically validate and adopt a contiguous lease suffix and optional label.
+    /// The snapshot itself may already be durable; no capsule state is persisted
+    /// unless every supplied record applies to the same staged capsule.
+    pub fn adopt_capsule_state(
+        &mut self,
+        capsule_id: Hash,
+        leases: &[LeaseRecord],
+        label: Option<&LabelOp>,
+        authorize: &dyn Fn(PeerId, LeaseMode) -> bool,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let dir = self.capsule_dir(capsule_id);
+        let mut staged = self
+            .capsules
+            .get(&capsule_id)
+            .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?
+            .clone();
+        for lease in leases {
+            if !staged.accept_lease(lease.clone(), authorize)? {
+                return Err(Error::invalid("lease chain does not extend winner"));
+            }
+        }
+        let label_won = match label {
+            Some(op) => staged.apply_label(op.clone(), op.by, now_ms)?,
+            None => false,
+        };
+        for lease in leases {
+            atomic_write(&lease_path(&dir, lease)?, &lease.bytes()?)?;
+        }
+        if let Some(op) = label.filter(|_| label_won) {
+            atomic_write(&label_path(&dir, op), &op.bytes()?)?;
+        }
+        self.capsules.insert(capsule_id, staged);
+        Ok(label.is_some_and(|op| {
+            self.capsules
+                .get(&capsule_id)
+                .and_then(|capsule| capsule.label(&op.name))
+                .is_some_and(|current| current.snapshot_id == op.snapshot_id)
+        }))
+    }
+
+    pub fn record_fork_label(
+        &mut self,
+        capsule_id: Hash,
+        snapshot_id: Hash,
+        at: String,
+        signer: &Identity,
+        now_ms: u64,
+    ) -> Result<()> {
+        let dir = self.capsule_dir(capsule_id);
+        let mut staged = self
+            .capsules
+            .get(&capsule_id)
+            .ok_or_else(|| Error::not_found("capsule", capsule_id.to_hex()))?
+            .clone();
+        let name = format!("fork/{}", &snapshot_id.to_hex()[..8]);
+        let seq = staged.label(&name).map_or(1, |old| old.seq + 1);
+        let epoch = staged.winning_lease().map_or(0, |lease| lease.epoch);
+        let op = LabelOp::new(capsule_id, seq, name, snapshot_id, epoch, at, signer)?;
+        staged.apply_label(op.clone(), signer.peer_id(), now_ms)?;
+        atomic_write(&label_path(&dir, &op), &op.bytes()?)?;
+        self.capsules.insert(capsule_id, staged);
+        Ok(())
     }
     pub fn receive_partial(&mut self, raw: RawManifest, from: String, at: String) -> Result<Hash> {
         if raw.manifest().scope != Scope::Partial {
@@ -205,12 +274,6 @@ impl AbraStore {
             .capsule_id
             .ok_or_else(|| Error::invalid("full manifest lacks capsule id"))?;
         raw.manifest().validate_kind_with_store(&self.cas)?;
-        let writer = raw.manifest().origin.peer_id;
-        if let Some(signer) = fork_signer {
-            if signer.peer_id() != writer {
-                return Err(Error::invalid("fork signer differs from manifest origin"));
-            }
-        }
         let id = raw.snapshot_id();
         let bytes = raw.bytes().to_vec();
         let dir = self.capsule_dir(capsule_id);
@@ -227,7 +290,7 @@ impl AbraStore {
             let seq = staged.label(&name).map_or(1, |old| old.seq + 1);
             let epoch = staged.winning_lease().map_or(0, |lease| lease.epoch);
             let op = LabelOp::new(capsule_id, seq, name, id, epoch, at.clone(), signer)?;
-            staged.apply_label(op.clone(), writer, now_ms)?;
+            staged.apply_label(op.clone(), signer.peer_id(), now_ms)?;
             fork_op = Some(op);
         }
         fs::create_dir_all(&snapshot_dir).map_err(|e| Error::io(&snapshot_dir, e))?;

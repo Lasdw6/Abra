@@ -326,8 +326,11 @@ Label-op (CJSON, signed domain `label`):
 
 **Authorization:** an op that sets `main` MUST be signed by the holder of the
 winning lease and carry that lease's `epoch`; receivers MUST reject a `main` move
-whose signer/epoch don't match their winning lease. `fork/*` ops may be signed by
-the forking writer. Per-`(capsule, name)` the highest `seq` wins; equal `seq` ties
+whose signer/epoch don't match their winning lease. A winning `main` move MUST
+also target the current head or one of its descendants; rollback creates a new
+descendant snapshot and never rewinds the pointer to an ancestor. `fork/*` ops
+may be signed by the forking writer or by the receiving device that records the
+fork. Per-`(capsule, name)` the highest `seq` wins; equal `seq` ties
 break on lexicographically greater `sig` bytes (deterministic, not claimable).
 Other user labels: `[a-z0-9._:-]{1,64}`, not starting with `fork/`; ≤ 128 labels
 per capsule; `fork/*` creation is limited to 32 per peer per capsule.
@@ -452,15 +455,21 @@ notification may show before blobs arrive) and reply `offer-accept {offer_id}` o
 If the receiver already holds the full closure it MAY skip transfer and ack
 directly.
 
-For a full offer, `lease_chain` is ordered from epoch 2 through the sender's
-winning lease and contains the exact predecessor records needed to validate that
-winner from `genesis_grant`. After committing the snapshot without changing any
-label, the receiver passes each unknown lease record through normal lease
-acceptance (§5.4), then passes `main_label` through normal label-op acceptance
-(§5.3). The receiver adopts `main` only if the complete applicable chain and
-label-op validate, including signer, epoch, predecessor hash, target ancestry,
-and lease-holder authorization. Failure leaves the snapshot stored as a fork;
-there is no implicit merge or unsigned head inference.
+For a full offer, `lease_chain` is strictly epoch-ordered and capped at 256
+records. It carries a suffix of the signed winning ancestry after epoch 1; a
+receiver whose local winner does not directly precede that suffix fails closed.
+Every capsule id in the offer, manifest, genesis, genesis grant, lease records,
+and `main_label` MUST be identical. After committing the snapshot without
+changing any label, the receiver stages every unknown lease record and
+`main_label` against one cloned capsule. The suffix must link directly from the
+local winner, and every record passes the ordinary lease rules (§5.4); the label
+passes the ordinary label-op rules (§5.3). Only if the complete bundle validates
+does the receiver persist the winner-extending leases and label and replace its
+capsule state. Otherwise it persists neither, retains the immutable snapshot as
+a fork, and acknowledges `capsule-fork` rather than `capsule-head`. Re-offered
+label ops that failed only because an ancestor was missing are retried after a
+later offer resolves the ancestry. There is no implicit merge or unsigned head
+inference. Evidence-only and losing lease records are not persisted.
 
 ### 6.5 Delta negotiation
 

@@ -7,7 +7,7 @@ use abra_core::{
 use abra_net::{
     bootstrap_allowed, check_hello, Ack, DeliveryNode, DeliveryOutcome, EnrollmentToken, Hello,
     LoopbackNetwork, LoopbackTransport, Offer, OutboxState, Ping, Role, Scopes, Transport,
-    TrustedPeer, WIRE_VERSION,
+    TrustedPeer, MAX_LEASE_CHAIN_LEN, WIRE_VERSION,
 };
 use serde_json::Map;
 use std::{fs, path::Path, time::Duration};
@@ -677,4 +677,69 @@ fn receiver_rejects_noncanonical_mismatched_and_untrusted_origin_manifest_bytes(
     assert!(receiver
         .validate_incoming_offer(&relayed, sender.peer_id(), NOW)
         .is_err());
+}
+
+#[test]
+fn receiver_rejects_cross_capsule_and_oversized_state_bundles() {
+    let sender_root = tempfile::tempdir().unwrap();
+    let receiver_root = tempfile::tempdir().unwrap();
+    let input = tempfile::tempdir().unwrap();
+    fs::write(input.path().join("x"), b"x").unwrap();
+    let mut sender = DeliveryNode::open(sender_root.path()).unwrap();
+    let mut receiver = DeliveryNode::open(receiver_root.path()).unwrap();
+    trust_each_other(&mut sender, &mut receiver);
+    let capsule_id = Hash::from_bytes([81; 32]);
+    let raw = full(&mut sender, input.path(), capsule_id, "bound");
+    let genesis = Genesis::new(
+        capsule_id,
+        abra_net::format_time(NOW),
+        "dev.abra.workspace".into(),
+        "bound".into(),
+        &sender.store.keys.identity,
+    )
+    .unwrap();
+    let grant = LeaseRecord::new(
+        capsule_id,
+        sender.peer_id(),
+        1,
+        LeaseMode::Grant,
+        abra_net::format_time(NOW),
+        abra_net::format_time(NOW + 86_400_000),
+        genesis.hash().unwrap(),
+        &sender.store.keys.identity,
+    )
+    .unwrap();
+    let base = Offer {
+        message_type: "offer".into(),
+        offer_id: "22".repeat(16),
+        snapshot_id: raw.snapshot_id(),
+        scope: Scope::Full,
+        kind: raw.manifest().kind.clone(),
+        title: raw.manifest().title.clone(),
+        capsule_id: Some(capsule_id),
+        fork: false,
+        bytes_hint: 0,
+        object_count: 0,
+        manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
+        genesis: Some(genesis),
+        genesis_grant: Some(grant.clone()),
+        lease_chain: Vec::new(),
+        main_label: None,
+    };
+    assert!(receiver
+        .validate_incoming_offer(&base, sender.peer_id(), NOW)
+        .is_ok());
+    let mut cross_capsule = base.clone();
+    cross_capsule.capsule_id = Some(Hash::from_bytes([82; 32]));
+    assert!(receiver
+        .validate_incoming_offer(&cross_capsule, sender.peer_id(), NOW)
+        .is_err());
+    assert!(receiver.store.capsules.is_empty());
+
+    let mut oversized = base;
+    oversized.lease_chain = vec![grant; MAX_LEASE_CHAIN_LEN + 1];
+    assert!(receiver
+        .validate_incoming_offer(&oversized, sender.peer_id(), NOW)
+        .is_err());
+    assert!(receiver.store.capsules.is_empty());
 }

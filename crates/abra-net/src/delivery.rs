@@ -26,6 +26,7 @@ pub const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_INBOX_ENTRIES: usize = 10_000;
 const MAX_PENDING_PAIRS: usize = 128;
 const MAX_EVENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_LEASE_CHAIN_LEN: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +133,7 @@ fn ack_payload(
     snapshot_id: Hash,
     sender: PeerId,
     receiver: PeerId,
+    shelf: &str,
 ) -> Result<Vec<u8>> {
     let offer = hex::decode(offer_id).map_err(|_| Error::protocol("bad offer id"))?;
     if offer.len() != 16 {
@@ -141,6 +143,7 @@ fn ack_payload(
     p.extend_from_slice(snapshot_id.as_bytes());
     p.extend_from_slice(sender.as_bytes());
     p.extend_from_slice(receiver.as_bytes());
+    p.extend_from_slice(shelf.as_bytes());
     Ok(p)
 }
 impl Ack {
@@ -162,14 +165,26 @@ impl Ack {
         };
         x.sig = receiver.sign(
             "ack",
-            &ack_payload(&x.offer_id, snapshot_id, sender, receiver.peer_id())?,
+            &ack_payload(
+                &x.offer_id,
+                snapshot_id,
+                sender,
+                receiver.peer_id(),
+                &x.shelf,
+            )?,
         );
         Ok(x)
     }
     pub fn verify(&self, sender: PeerId, intended_receiver: PeerId) -> Result<()> {
         intended_receiver.verify(
             "ack",
-            &ack_payload(&self.offer_id, self.snapshot_id, sender, intended_receiver)?,
+            &ack_payload(
+                &self.offer_id,
+                self.snapshot_id,
+                sender,
+                intended_receiver,
+                &self.shelf,
+            )?,
             &self.sig,
         )?;
         Ok(())
@@ -203,6 +218,7 @@ pub struct DeliveryNode {
     /// tickets remain the durable, bounded authorization.
     pub pending_pair_requests: BTreeMap<PeerId, crate::PairRequest>,
     pub approved_pair_requests: BTreeSet<PeerId>,
+    pending_main_labels: BTreeMap<Hash, Vec<LabelOp>>,
     partial_dir: PathBuf,
     pending_ack_dir: PathBuf,
     pending_pair_dir: PathBuf,
@@ -220,6 +236,7 @@ impl DeliveryNode {
             auto_confirm_pairs: false,
             pending_pair_requests: BTreeMap::new(),
             approved_pair_requests: BTreeSet::new(),
+            pending_main_labels: BTreeMap::new(),
             partial_dir: root.join("net/partials"),
             pending_ack_dir: root.join("net/pending-acks"),
             pending_pair_dir: root.join("net/pending-pairs"),
@@ -241,6 +258,7 @@ impl DeliveryNode {
             auto_confirm_pairs: self.auto_confirm_pairs,
             pending_pair_requests: self.pending_pair_requests.clone(),
             approved_pair_requests: self.approved_pair_requests.clone(),
+            pending_main_labels: self.pending_main_labels.clone(),
             partial_dir: self.partial_dir.clone(),
             pending_ack_dir: self.pending_ack_dir.clone(),
             pending_pair_dir: self.pending_pair_dir.clone(),
@@ -438,6 +456,44 @@ impl DeliveryNode {
             return Err(Error::protocol("offer snapshot id mismatch"));
         }
         let manifest = raw.manifest();
+        if offer.lease_chain.len() > MAX_LEASE_CHAIN_LEN {
+            return Err(Error::protocol("lease chain exceeds 256 records"));
+        }
+        for pair in offer.lease_chain.windows(2) {
+            if pair[1].epoch != pair[0].epoch + 1 || pair[1].prev_hash != pair[0].hash()? {
+                return Err(Error::protocol("lease chain is not strictly contiguous"));
+            }
+        }
+        if offer.capsule_id != manifest.capsule_id {
+            return Err(Error::protocol("offer capsule differs from manifest"));
+        }
+        if let Some(capsule_id) = manifest.capsule_id {
+            if offer
+                .genesis
+                .as_ref()
+                .is_some_and(|genesis| genesis.capsule_id != capsule_id)
+                || offer
+                    .genesis_grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.capsule_id != capsule_id)
+                || offer
+                    .lease_chain
+                    .iter()
+                    .any(|lease| lease.capsule_id != capsule_id)
+                || offer
+                    .main_label
+                    .as_ref()
+                    .is_some_and(|op| op.capsule_id != capsule_id)
+            {
+                return Err(Error::protocol("offer capsule-state bundle mismatch"));
+            }
+        } else if offer.genesis.is_some()
+            || offer.genesis_grant.is_some()
+            || !offer.lease_chain.is_empty()
+            || offer.main_label.is_some()
+        {
+            return Err(Error::protocol("partial offer carries capsule state"));
+        }
         let origin = manifest.origin.peer_id;
         if self.trust.get(&origin).is_none() {
             return Err(Error::authz("untrusted manifest origin"));
@@ -621,6 +677,11 @@ impl DeliveryNode {
             .manifest()
             .capsule_id
             .and_then(|c| self.store.capsules.get(&c));
+        let fork = capsule.is_some_and(|capsule| {
+            capsule
+                .active_lease(now)
+                .is_none_or(|lease| lease.holder != raw.manifest().origin.peer_id)
+        });
         let offer = Offer {
             message_type: "offer".into(),
             offer_id: entry.offer_id.clone(),
@@ -629,12 +690,17 @@ impl DeliveryNode {
             kind: raw.manifest().kind.clone(),
             title: raw.manifest().title.clone(),
             capsule_id: raw.manifest().capsule_id,
-            fork: false,
+            fork,
             bytes_hint,
             object_count: objects.len() as u64,
             manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
             genesis: capsule.map(|x| x.genesis.clone()),
-            genesis_grant: capsule.and_then(|x| x.leases().first().cloned()),
+            genesis_grant: capsule.and_then(|x| {
+                x.leases()
+                    .iter()
+                    .find(|lease| lease.epoch == 1 && lease.mode == LeaseMode::Grant)
+                    .cloned()
+            }),
             lease_chain: capsule.map(winning_lease_chain).unwrap_or_default(),
             main_label: capsule.and_then(|x| x.label("main").cloned()),
         };
@@ -931,9 +997,42 @@ impl DeliveryNode {
                     {
                         return Err(Error::authz("inbox quota exceeded"));
                     }
-                    let shelf = self.commit_manifest(raw, connection.peer_id(), now)?;
+                    let mut shelf = self.commit_manifest(raw, connection.peer_id(), now)?;
                     if shelf == "capsule" {
-                        let _ = self.adopt_offer_capsule_state(&offer, now);
+                        shelf = match self.adopt_offer_capsule_state(&offer, now) {
+                            Ok(true) => {
+                                if let Some(capsule_id) = offer.capsule_id {
+                                    self.retry_pending_main_labels(capsule_id, now);
+                                }
+                                "capsule-head".into()
+                            }
+                            Ok(false) | Err(_) => {
+                                if let (Some(capsule_id), Some(op)) =
+                                    (offer.capsule_id, offer.main_label.clone())
+                                {
+                                    let pending =
+                                        self.pending_main_labels.entry(capsule_id).or_default();
+                                    if pending.len() < MAX_LEASE_CHAIN_LEN
+                                        && !pending.iter().any(|old| old.sig == op.sig)
+                                    {
+                                        pending.push(op);
+                                    }
+                                }
+                                if let Some(capsule_id) = offer.capsule_id {
+                                    let signer = Identity::from_secret_bytes(
+                                        &self.store.keys.identity.secret_bytes(),
+                                    );
+                                    self.store.record_fork_label(
+                                        capsule_id,
+                                        offer.snapshot_id,
+                                        format_time(now),
+                                        &signer,
+                                        now,
+                                    )?;
+                                }
+                                "capsule-fork".into()
+                            }
+                        };
                     }
                     let ack = Ack::sign(
                         offer.offer_id,
@@ -1071,29 +1170,62 @@ impl DeliveryNode {
         }
     }
 
-    fn adopt_offer_capsule_state(&mut self, offer: &Offer, now: u64) -> Result<()> {
+    fn adopt_offer_capsule_state(&mut self, offer: &Offer, now: u64) -> Result<bool> {
         let capsule_id = offer
             .capsule_id
             .ok_or_else(|| Error::protocol("full offer lacks capsule id"))?;
+        let capsule = self
+            .store
+            .capsules
+            .get(&capsule_id)
+            .ok_or_else(|| Error::protocol("receiver lacks offered capsule"))?;
+        let mut expected = capsule
+            .winning_lease()
+            .ok_or_else(|| Error::protocol("capsule lacks winning lease"))?
+            .clone();
+        let known = capsule
+            .leases()
+            .iter()
+            .map(LeaseRecord::hash)
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        let mut applicable = Vec::new();
         for lease in &offer.lease_chain {
-            let already_known = self.store.capsules[&capsule_id]
-                .leases()
-                .iter()
-                .any(|known| known.hash().ok() == lease.hash().ok());
-            if already_known {
+            let hash = lease.hash()?;
+            if known.contains(&hash) {
                 continue;
             }
-            self.store
-                .accept_lease(capsule_id, lease.clone(), &|holder, mode| {
-                    self.trust
-                        .authorize_lease(holder, mode == LeaseMode::Takeover, now)
-                        .is_ok()
-                })?;
+            if lease.epoch != expected.epoch + 1 || lease.prev_hash != expected.hash()? {
+                return Err(Error::protocol("lease chain is not contiguous with winner"));
+            }
+            expected = lease.clone();
+            applicable.push(lease.clone());
         }
-        if let Some(op) = &offer.main_label {
-            self.store.apply_label(op.clone(), op.by, now)?;
+        Ok(self.store.adopt_capsule_state(
+            capsule_id,
+            &applicable,
+            offer.main_label.as_ref(),
+            &|holder, mode| {
+                self.trust
+                    .authorize_lease(holder, mode == LeaseMode::Takeover, now)
+                    .is_ok()
+            },
+            now,
+        )?)
+    }
+
+    fn retry_pending_main_labels(&mut self, capsule_id: Hash, now: u64) {
+        let Some(pending) = self.pending_main_labels.remove(&capsule_id) else {
+            return;
+        };
+        let mut still_pending = Vec::new();
+        for op in pending {
+            if self.store.apply_label(op.clone(), op.by, now).is_err() {
+                still_pending.push(op);
+            }
         }
-        Ok(())
+        if !still_pending.is_empty() {
+            self.pending_main_labels.insert(capsule_id, still_pending);
+        }
     }
 }
 
@@ -1115,6 +1247,9 @@ fn winning_lease_chain(capsule: &abra_core::capsule::Capsule) -> Vec<LeaseRecord
         current = parent;
     }
     reverse.reverse();
+    if reverse.len() > MAX_LEASE_CHAIN_LEN {
+        reverse.drain(..reverse.len() - MAX_LEASE_CHAIN_LEN);
+    }
     reverse
 }
 

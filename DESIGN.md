@@ -66,8 +66,13 @@ means: sync it into the capsule store. Its offer also carries the sender's
 signed `main` pointer and the signed winning lease ancestry that authorizes that
 pointer. Receivers commit the immutable snapshot first, validate the lease chain
 with the ordinary lease rules, and apply the pointer with the ordinary label-op
-rules. An invalid or sideways pointer leaves the object available as a fork;
-receipt never infers a head or silently merges histories.
+rules. The bounded lease suffix and pointer are bound to the manifest's single
+capsule id and staged transactionally against a clone: both persist, or neither
+does. The acknowledgment distinguishes a stored-and-adopted head from a stored
+fork. Missing-ancestor pointer ops are retained in a bounded retry set so a
+later offer can resolve them. An invalid or sideways pointer leaves the object
+available under a locally signed fork label; receipt never infers a head or
+silently merges histories.
 
 **`scope: "partial"`** — a delivery. A browser session, a file, a folder, a
 handoff link. No lineage, no capsule, no lease. Receiving a `partial` means: it

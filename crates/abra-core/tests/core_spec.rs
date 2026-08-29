@@ -81,7 +81,7 @@ fn signed_main_move_to_non_descendant_is_rejected() {
     )
     .unwrap();
     let mut capsule = Capsule::new(genesis, grant).unwrap();
-    let (_root, main_child, sibling) = {
+    let (root, main_child, sibling) = {
         let mut insert = |parents: Vec<Hash>, marker: &str| {
             let (_, mut manifest) = signed_manifest(Scope::Full);
             manifest.origin.peer_id = creator.peer_id();
@@ -125,6 +125,87 @@ fn signed_main_move_to_non_descendant_is_rejected() {
     .unwrap();
     assert!(capsule.apply_label(sideways, creator.peer_id(), 0).is_err());
     assert_eq!(capsule.label("main").unwrap().snapshot_id, main_child);
+    let backward = LabelOp::new(
+        capsule_id,
+        3,
+        "main".into(),
+        root,
+        1,
+        "2026-08-28T00:04:00.000Z".into(),
+        &creator,
+    )
+    .unwrap();
+    assert!(capsule.apply_label(backward, creator.peer_id(), 0).is_err());
+    assert_eq!(capsule.label("main").unwrap().snapshot_id, main_child);
+}
+
+#[test]
+fn transactional_adopt_rejects_gapped_chain_without_partial_winner_or_disk_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = abra_core::store::AbraStore::open(root.path()).unwrap();
+    let creator = Identity::from_secret_bytes(&[70; 32]);
+    let next = Identity::from_secret_bytes(&[71; 32]);
+    let capsule_id = Hash::from_bytes([72; 32]);
+    let genesis = Genesis::new(
+        capsule_id,
+        "2026-08-28T00:00:00.000Z".into(),
+        "dev.abra.workspace".into(),
+        "atomic".into(),
+        &creator,
+    )
+    .unwrap();
+    let grant = LeaseRecord::new(
+        capsule_id,
+        creator.peer_id(),
+        1,
+        LeaseMode::Grant,
+        "2026-08-28T00:00:00.000Z".into(),
+        "2026-08-29T00:00:00.000Z".into(),
+        genesis.hash().unwrap(),
+        &creator,
+    )
+    .unwrap();
+    store.add_capsule(genesis, grant.clone()).unwrap();
+    let epoch2 = LeaseRecord::new(
+        capsule_id,
+        next.peer_id(),
+        2,
+        LeaseMode::Takeover,
+        "2026-08-28T01:00:00.000Z".into(),
+        "2026-08-29T01:00:00.000Z".into(),
+        grant.hash().unwrap(),
+        &next,
+    )
+    .unwrap();
+    let epoch4 = LeaseRecord::new(
+        capsule_id,
+        next.peer_id(),
+        4,
+        LeaseMode::Takeover,
+        "2026-08-28T02:00:00.000Z".into(),
+        "2026-08-29T02:00:00.000Z".into(),
+        epoch2.hash().unwrap(),
+        &next,
+    )
+    .unwrap();
+    assert!(store
+        .adopt_capsule_state(capsule_id, &[epoch2, epoch4], None, &|_, _| true, 0,)
+        .is_err());
+    assert_eq!(
+        store.capsules[&capsule_id].winning_lease().unwrap().epoch,
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(
+            root.path()
+                .join("capsules")
+                .join(capsule_id.to_hex())
+                .join("leases")
+        )
+        .unwrap()
+        .count(),
+        1
+    );
 }
 
 #[test]

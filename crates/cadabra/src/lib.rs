@@ -774,6 +774,12 @@ impl Daemon {
             node.store.mark_inbox_read(id)?;
         } else {
             let raw = find_snapshot(&node, &id.to_hex())?;
+            if let Some(capsule_id) = raw.manifest().capsule_id {
+                let identity_path = destination.join(".abra/capsule_id");
+                if identity_path.exists() && read_capsule_id(destination)? != capsule_id {
+                    return Err("destination belongs to a different capsule".into());
+                }
+            }
             if let Some(files) = raw.manifest().files {
                 materialize(&node.store.cas, &files, destination)?;
             }

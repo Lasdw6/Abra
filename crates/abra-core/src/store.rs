@@ -206,6 +206,29 @@ impl AbraStore {
         Ok(result)
     }
 
+    /// Mark an inbox delivery read and persist the change.
+    pub fn mark_inbox_read(&mut self, id: Hash) -> Result<()> {
+        let entry = self
+            .inbox
+            .get_mut(&id)
+            .ok_or_else(|| Error::not_found("inbox entry", id.to_hex()))?;
+        entry.read = true;
+        let raw = RawManifest::parse(entry.manifest.clone())?;
+        let disk = InboxDisk {
+            spec: crate::SPEC.into(),
+            snapshot_id: id,
+            manifest: String::from_utf8(raw.bytes().to_vec())
+                .map_err(|_| Error::invalid("manifest is not utf-8"))?,
+            from: entry.from.clone(),
+            received_at: entry.received_at.clone(),
+            read: true,
+        };
+        atomic_write(
+            &self.root.join("inbox").join(format!("{id}.cjson")),
+            &canonical::to_vec(&disk)?,
+        )
+    }
+
     fn capsule_dir(&self, id: Hash) -> PathBuf {
         self.root.join("capsules").join(id.to_hex())
     }

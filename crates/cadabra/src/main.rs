@@ -1,15 +1,34 @@
-//! cadabra, the Abra daemon (stub).
-//!
-//! Phase 1 ships the core primitives only. The daemon will later own the device
-//! identity, the capsule store, and the outbox -> health-check -> transfer ->
-//! ack delivery loop.
+use abra_net::LoopbackNetwork;
+use cadabra::Daemon;
+use clap::Parser;
+use std::{path::PathBuf, sync::Arc};
 
-fn main() {
-    println!(
-        "cadabra {} (abra-core {}, spec {})",
-        env!("CARGO_PKG_VERSION"),
-        abra_core::VERSION,
-        abra_core::SPEC,
-    );
-    println!("no daemon loop in phase 1; exiting");
+#[derive(Parser)]
+struct Args {
+    #[arg(long, env = "ABRA_ROOT")]
+    root: Option<PathBuf>,
+    #[arg(long)]
+    yes: bool,
+}
+
+fn default_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".abra")
+}
+
+#[tokio::main]
+async fn main() -> cadabra::Result<()> {
+    let args = Args::parse();
+    let root = args.root.unwrap_or_else(default_root);
+    let daemon = Arc::new(Daemon::loopback(
+        root,
+        &LoopbackNetwork::default(),
+        args.yes,
+    )?);
+    let running = daemon.start().await?;
+    tokio::signal::ctrl_c().await?;
+    running.shutdown().await;
+    Ok(())
 }

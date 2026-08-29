@@ -21,17 +21,17 @@ sync a workspace, resume a sandbox. The sender authors nothing extra.
   a capsule and syncs into the capsule store. `partial` is a delivery — a file,
   a folder, a browser session, a handoff link — and lands in an inbox.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the settled design and
-[docs/SPEC.md](docs/SPEC.md) for the wire format.
+See [DESIGN.md](DESIGN.md) for the settled design and [SPEC.md](SPEC.md) for the
+wire format.
 
 ## Repo layout
 
 ```
 crates/abra-core   library: identity, CAS, snapshots, capsule store, links
-crates/abra        CLI binary (stub in phase 1)
-crates/cadabra     daemon binary (stub in phase 1)
-docs/DESIGN.md     settled design decisions, including later phases
-docs/SPEC.md       envelope/manifest format, abra_spec 1
+crates/abra-cli    thin `abra` UDS client
+crates/cadabra     library-first daemon and `cadabra` binary
+docs/API.md        local NDJSON control protocol
+docs/ADAPTERS.md   external adapter contract
 ```
 
 `abra-core` modules:
@@ -47,27 +47,37 @@ docs/SPEC.md       envelope/manifest format, abra_spec 1
 
 ## Quickstart
 
-_Placeholder — the CLI lands with the transport phase._
+Build the binaries, then start a daemon in the first terminal:
 
 ```console
-$ cargo run -p abra
-abra 0.1.0 (abra-core 0.1.0, abra_spec 1)
+$ cargo build --workspace
+$ target/debug/abra --root /tmp/abra-a daemon --yes
 ```
 
-Planned:
+Use a second terminal as the client:
 
 ```console
-$ abra enroll                 # admit a device into your mesh
-$ abra send ./report.pdf      # teleport a partial to your other devices
-$ abra capsule track ./work   # make a directory a capsule
-$ abra push work              # snapshot it and teleport the new version
+$ target/debug/abra --root /tmp/abra-a status
+$ target/debug/abra --root /tmp/abra-a pair ticket
+$ target/debug/abra --root /tmp/abra-a init ./my-workspace
+$ target/debug/abra --root /tmp/abra-a snapshot ./my-workspace -m first
+$ target/debug/abra --root /tmp/abra-a outbox
 ```
+
+For a two-device demo, run two `Daemon` instances on one `LoopbackNetwork`
+(the end-to-end test is an executable reference), redeem B's `pair ticket` on
+A with `pair add`, then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
+`inbox` shows partial handoffs and `accept <id> --to <empty-path>` materializes
+them; full capsule snapshots appear in `log` and can also be accepted by id.
+The default loopback transport is deliberately in-process; build with the
+optional iroh transport for separate-device routing.
 
 ## Status
 
-Phase 1: local primitives only. There is no network code yet — no transport, no
-outbox, no relay. Everything here is on-disk and offline, and it is the
-foundation the delivery loop is built on.
+Stages 1–3 include local primitives, authenticated transport, durable delivery,
+the daemon, CLI, and end-to-end loopback tests. Relays, capability web viewers,
+external adapter implementations, and iroh-path end-to-end tests remain out of
+scope.
 
 ## Building
 

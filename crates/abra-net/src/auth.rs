@@ -622,6 +622,7 @@ pub struct PairTicket {
     #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[serde(with = "optional_hex32")]
     pub relay_key: Option<[u8; 32]>,
     pub addresses: Vec<String>,
@@ -697,6 +698,7 @@ pub struct PairRequest {
     #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[serde(with = "optional_hex32")]
     pub relay_key: Option<[u8; 32]>,
     pub sig: Signature,

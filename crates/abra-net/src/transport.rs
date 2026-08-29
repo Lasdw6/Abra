@@ -10,8 +10,8 @@ use tokio::{
     sync::{mpsc, Mutex as AsyncMutex},
 };
 
-pub type ControlSend = Box<dyn AsyncWrite + Send + Unpin>;
-pub type ControlRecv = Box<dyn AsyncRead + Send + Unpin>;
+pub type ControlSend = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type ControlRecv = Box<dyn AsyncRead + Send + Sync + Unpin>;
 
 enum Streams {
     Loopback {

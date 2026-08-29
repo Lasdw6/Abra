@@ -187,6 +187,15 @@ pub struct DeliveryNode {
     pub trust: TrustStore,
     pub outbox: Outbox,
     pub allow_agent_send: bool,
+    /// Daemon policy for non-interactive pairing. Interactive daemons leave
+    /// this false and approve requests before retrying; test/automation
+    /// daemons opt in explicitly.
+    pub auto_confirm_pairs: bool,
+    /// Pair requests observed by an interactive daemon and approvals granted
+    /// through its local control API. They are intentionally process-local;
+    /// tickets remain the durable, bounded authorization.
+    pub pending_pair_requests: BTreeMap<PeerId, crate::PairRequest>,
+    pub approved_pair_requests: BTreeSet<PeerId>,
     partial_dir: PathBuf,
     pending_ack_dir: PathBuf,
 }
@@ -198,6 +207,9 @@ impl DeliveryNode {
             trust: TrustStore::open(root)?,
             outbox: Outbox::open(root)?,
             allow_agent_send: false,
+            auto_confirm_pairs: false,
+            pending_pair_requests: BTreeMap::new(),
+            approved_pair_requests: BTreeSet::new(),
             partial_dir: root.join("net/partials"),
             pending_ack_dir: root.join("net/pending-acks"),
         })
@@ -816,6 +828,22 @@ impl DeliveryNode {
                     };
                     let (send, _) = connection.control_mut();
                     write_frame(send, &reply).await?;
+                }
+                "pair-request" => {
+                    let request: crate::PairRequest = serde_json::from_value(value)?;
+                    self.pending_pair_requests
+                        .insert(request.peer_id, request.clone());
+                    let approved = self.auto_confirm_pairs
+                        || self.approved_pair_requests.remove(&request.peer_id);
+                    let accept = self.trust.accept_pair_request(
+                        &request,
+                        connection.peer_id(),
+                        now,
+                        |_, _| approved,
+                    )?;
+                    self.pending_pair_requests.remove(&request.peer_id);
+                    let (send, _) = connection.control_mut();
+                    write_frame(send, &accept).await?;
                 }
                 "pair-confirm" => {
                     let confirm = serde_json::from_value(value)?;

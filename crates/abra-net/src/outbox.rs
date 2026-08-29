@@ -112,6 +112,11 @@ impl Outbox {
         }
     }
     pub fn sync_entry_from(&mut self, other: &Self, id: &str) -> Result<()> {
+        if self.disk.entries.get(id).is_some_and(|entry| {
+            matches!(entry.state, OutboxState::Cancelled | OutboxState::Expired)
+        }) {
+            return Ok(());
+        }
         let entry = other
             .disk
             .entries

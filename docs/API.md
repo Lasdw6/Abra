@@ -33,12 +33,12 @@ Operations and request fields:
 | `enroll-mint` | `capsules`, `kinds`, `ttl_ms`, `send`, `receive` | encoded enrollment token |
 | `enroll-join` | `token` | persisted guest role and effective scopes |
 | `revoke` | `token_id` | revocation confirmation |
-| `policy-grant` | `peer`, `kind`, `auto_accept`, `auto_run_recipes`, `to?` | persisted receive grant |
+| `policy-grant` | `peer`, `kind`, `auto_accept`, `auto_run_recipes`, `to?` | persisted receive grant; auto-run returns unimplemented |
 | `policy-list` / `policy-revoke` | `id?` | list or revoke generic grants |
 | `control` | `peer`, `capsule`, `control_op`, `text?` | signed live control acknowledgement |
 | `events` / `watch` | — | retained events / long-lived NDJSON event stream |
 | `lease-status` / `lease-take` | `capsule` | lease state / signed takeover |
-| `ps` / `stop-recipes` | `capsule?` | managed recipe processes |
+| `ps` / `stop-recipes` | `capsule?` | legacy records / explicit disabled error |
 | `outbox` | — | entries including protocol state and retry metadata |
 | `cancel` | `id` | cancelled outbox id |
 
@@ -54,5 +54,8 @@ run with `--yes` confirms pairing requests automatically for automation.
 `--json` writes exactly one JSON value: the operation's `result` object. In
 human mode, `pair ticket` writes only the copyable `abra-pair/1/...` token.
 `enroll` writes the bare token first and `abra://join/<token>` second. Capsule
-and kind scopes are mandatory; no wildcard is silently introduced. Recipes can
-run only under an explicit peer+kind auto-accept/auto-run grant.
+and kind scopes are mandatory; no wildcard is silently introduced. Recipes are
+transported and materialized as data but never executed by Abra. Control
+messages are surfaced through `events`/`watch`; acting on them belongs to the
+receiving application. Guest enrollment and revocation are issuer-device-local
+in v1.

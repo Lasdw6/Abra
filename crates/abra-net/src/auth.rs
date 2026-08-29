@@ -184,7 +184,10 @@ impl Scopes {
     }
     pub fn allows(&self, capsule: Option<Hash>, kind: &str, direction: Direction) -> bool {
         Self::list_allows(&self.kinds, kind)
-            && capsule.is_none_or(|c| Self::list_allows(&self.capsules, &c.to_hex()))
+            && capsule.map_or_else(
+                || self.capsules.len() == 1 && self.capsules[0] == "*",
+                |c| Self::list_allows(&self.capsules, &c.to_hex()),
+            )
             && match direction {
                 Direction::Send => self.send,
                 Direction::Receive => self.receive,
@@ -219,8 +222,6 @@ struct TrustDisk {
     used_tickets: BTreeSet<String>,
     bound_tokens: BTreeMap<String, PeerId>,
     revoked: BTreeSet<String>,
-    #[serde(default)]
-    revocations: BTreeMap<String, RevocationRecord>,
     control_nonces: BTreeMap<String, u64>,
 }
 #[derive(Clone)]
@@ -229,6 +230,17 @@ pub struct TrustStore {
     disk: TrustDisk,
 }
 impl TrustStore {
+    fn operation_lock(&self, name: &str) -> Result<fs::File> {
+        let path = self.path.with_extension(format!("{name}.lock"));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        Ok(lock)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("net/trust.json");
         let disk = match fs::read(&path) {
@@ -238,12 +250,54 @@ impl TrustStore {
         };
         Ok(Self { path, disk })
     }
+    fn read_disk(&self) -> Result<TrustDisk> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(TrustDisk::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    pub fn reload(&mut self) -> Result<()> {
+        self.disk = self.read_disk()?;
+        Ok(())
+    }
     fn save(&self) -> Result<()> {
         if let Some(p) = self.path.parent() {
             fs::create_dir_all(p)?
         }
+        let lock_path = self.path.with_extension("lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let mut merged = self.read_disk()?;
+        merged.local_role = self.disk.local_role.clone();
+        merged
+            .pending_tickets
+            .extend(self.disk.pending_tickets.clone());
+        merged
+            .awaiting_pair_confirm
+            .extend(self.disk.awaiting_pair_confirm.clone());
+        merged.used_tickets.extend(self.disk.used_tickets.clone());
+        for (token, peer) in &self.disk.bound_tokens {
+            merged.bound_tokens.entry(token.clone()).or_insert(*peer);
+        }
+        merged.revoked.extend(self.disk.revoked.clone());
+        merged
+            .control_nonces
+            .extend(self.disk.control_nonces.clone());
+        merged.peers.extend(self.disk.peers.clone());
+        let revoked = merged.revoked.clone();
+        merged.peers.retain(|_, peer| {
+            peer.token_id
+                .as_ref()
+                .is_none_or(|token| !revoked.contains(token))
+        });
         let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, canonical::to_vec(&self.disk)?)?;
+        fs::write(&tmp, canonical::to_vec(&merged)?)?;
         let f = fs::OpenOptions::new().read(true).open(&tmp)?;
         f.sync_all()?;
         fs::rename(tmp, &self.path)?;
@@ -283,6 +337,8 @@ impl TrustStore {
     where
         F: FnOnce(PeerId, PeerId) -> bool,
     {
+        let _operation_lock = self.operation_lock("pair-op")?;
+        self.reload()?;
         if authenticated != request.peer_id {
             return Err(Error::Authentication(
                 "pair request differs from transport".into(),
@@ -331,6 +387,8 @@ impl TrustStore {
         })
     }
     pub fn confirm_pair(&mut self, confirm: &PairConfirm, authenticated: PeerId) -> Result<()> {
+        let _operation_lock = self.operation_lock("pair-op")?;
+        self.reload()?;
         let Some(peer) = self.disk.awaiting_pair_confirm.remove(&confirm.ticket_id) else {
             return if self.disk.peers.contains_key(&authenticated) {
                 Ok(())
@@ -374,6 +432,8 @@ impl TrustStore {
         })
     }
     pub fn revoke_token(&mut self, id: &str) -> Result<()> {
+        let _operation_lock = self.operation_lock("bind-op")?;
+        self.reload()?;
         self.disk.revoked.insert(id.into());
         self.disk
             .peers
@@ -382,24 +442,6 @@ impl TrustStore {
         self.save()
     }
 
-    pub fn apply_revocation(&mut self, record: RevocationRecord, signer: PeerId) -> Result<()> {
-        let peer = self
-            .get(&signer)
-            .ok_or_else(|| Error::authz("untrusted revocation signer"))?;
-        if peer.role != Role::Full {
-            return Err(Error::authz("revocation signer is not full"));
-        }
-        record.verify(signer)?;
-        self.disk
-            .revocations
-            .insert(record.token_id.clone(), record.clone());
-        self.disk.revoked.insert(record.token_id.clone());
-        self.disk.bound_tokens.remove(&record.token_id);
-        self.disk
-            .peers
-            .retain(|_, p| p.token_id.as_deref() != Some(&record.token_id));
-        self.save()
-    }
     pub fn is_revoked(&self, id: &str) -> bool {
         self.disk.revoked.contains(id)
     }
@@ -410,6 +452,8 @@ impl TrustStore {
         now: u64,
         issuer: &Identity,
     ) -> Result<BindCertificate> {
+        let _operation_lock = self.operation_lock("bind-op")?;
+        self.reload()?;
         if authenticated != bind.guest_peer_id {
             return Err(Error::Authentication(
                 "enroll bind differs from transport".into(),
@@ -475,35 +519,6 @@ impl TrustStore {
             token.expires_at.clone(),
             issuer,
         )
-    }
-    pub fn accept_bind_cert(&mut self, cert: &BindCertificate, issuer: PeerId) -> Result<()> {
-        let signer = self
-            .get(&issuer)
-            .ok_or_else(|| Error::authz("untrusted bind issuer"))?;
-        if signer.role != Role::Full {
-            return Err(Error::authz("bind issuer is not full"));
-        }
-        cert.verify(issuer)?;
-        if self.is_revoked(&cert.token_id) {
-            return Err(Error::authz("token revoked"));
-        }
-        cert.scopes.validate()?;
-        self.disk
-            .bound_tokens
-            .insert(cert.token_id.clone(), cert.guest_peer_id);
-        self.disk.peers.insert(
-            cert.guest_peer_id,
-            TrustedPeer {
-                peer_id: cert.guest_peer_id,
-                name: cert.name.clone(),
-                role: Role::Guest,
-                x25519_pk: cert.x25519_pk,
-                token_id: Some(cert.token_id.clone()),
-                scopes: Some(cert.scopes.clone()),
-                expires_at: Some(cert.expires_at.clone()),
-            },
-        );
-        self.save()
     }
     pub fn authorize_offer(
         &self,
@@ -605,6 +620,8 @@ impl TrustStore {
         Ok(())
     }
     pub fn consume_control_nonce(&mut self, nonce: &str, now: u64) -> Result<()> {
+        let _operation_lock = self.operation_lock("nonce-op")?;
+        self.reload()?;
         self.disk
             .control_nonces
             .retain(|_, t| now.saturating_sub(*t) <= 600_000);
@@ -780,8 +797,16 @@ pub struct Intro {
 pub struct EnrollOk {
     #[serde(rename = "type")]
     pub message_type: String,
-    pub mesh: Vec<TrustedPeer>,
+    pub mesh: Vec<EnrollMeshPeer>,
     pub certificate: BindCertificate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollMeshPeer {
+    pub peer_id: PeerId,
+    pub name: String,
+    pub role: Role,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -844,6 +869,7 @@ impl EnrollmentToken {
         ))
     }
     pub fn parse(s: &str, now: u64) -> Result<Self> {
+        let s = s.strip_prefix("abra://join/").unwrap_or(s);
         let b = BASE64URL_NOPAD
             .decode(
                 s.strip_prefix("abra-enroll/1/")
@@ -988,34 +1014,6 @@ impl BindCertificate {
     }
     pub fn verify(&self, issuer: PeerId) -> Result<()> {
         issuer.verify("bind-cert", &unsigned(self, "sig")?, &self.sig)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RevocationRecord {
-    pub spec: String,
-    #[serde(rename = "type")]
-    pub record_type: String,
-    pub token_id: String,
-    pub revoked_at: String,
-    pub sig: Signature,
-}
-impl RevocationRecord {
-    pub fn sign(token_id: String, now: u64, id: &Identity) -> Result<Self> {
-        let mut x = Self {
-            spec: abra_core::SPEC.into(),
-            record_type: "revoke".into(),
-            token_id,
-            revoked_at: format_time(now),
-            sig: Signature::from_bytes([0; 64]),
-        };
-        x.sig = id.sign("revoke", &unsigned(&x, "sig")?);
-        Ok(x)
-    }
-    pub fn verify(&self, full_peer: PeerId) -> Result<()> {
-        full_peer.verify("revoke", &unsigned(self, "sig")?, &self.sig)?;
         Ok(())
     }
 }

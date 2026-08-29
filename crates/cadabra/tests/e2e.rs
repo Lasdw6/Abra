@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use abra_net::LoopbackNetwork;
-use cadabra::Daemon;
+use cadabra::{control_call, Daemon};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -54,6 +54,68 @@ async fn auto_confirm_pairing_persists_both_trust_stores() {
             .unwrap()
             .is_empty());
     }
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_inbox_reads_partial_committed_by_inbound_session() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+
+    assert_eq!(
+        control_call(b_root.path(), &json!({"op":"log"}))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    let ticket = control_call(b_root.path(), &json!({"op":"pair-ticket"}))
+        .await
+        .unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    control_call(a_root.path(), &json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("payload"), b"teleport me\n").unwrap();
+    let sent = control_call(
+        a_root.path(),
+        &json!({"op":"send","peer":b.peer_id().await,"path":source.path()}),
+    )
+    .await
+    .unwrap();
+    wait_for(|| async {
+        let rows = control_call(a_root.path(), &json!({"op":"outbox"})).await?;
+        if rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == sent["outbox_id"] && row["state"] == "acked")
+        {
+            Ok(rows)
+        } else {
+            Err("outbox not acked".into())
+        }
+    })
+    .await;
+
+    let inbox = control_call(b_root.path(), &json!({"op":"inbox"}))
+        .await
+        .unwrap();
+    assert!(inbox
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == sent["snapshot_id"]));
 
     b_run.shutdown().await;
     a_run.shutdown().await;
@@ -187,6 +249,66 @@ async fn daemons_pair_sync_handoff_and_resume_outbox() {
     })
     .await;
 
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn standing_grant_fires_repeatedly_into_per_snapshot_directories() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    let ticket = b.handle(json!({"op":"pair-ticket"})).await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handle(json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+    let destination = b_root.path().join("granted");
+    b.handle(json!({
+        "op":"policy-grant",
+        "peer":a.peer_id().await,
+        "kind":"dev.abra.bundle",
+        "auto_accept":true,
+        "auto_run_recipes":false,
+        "to":destination
+    }))
+    .await
+    .unwrap();
+    let source = tempfile::tempdir().unwrap();
+    for content in ["one", "two"] {
+        fs::write(source.path().join("value"), content).unwrap();
+        a.handle(json!({
+            "op":"send",
+            "peer":b.peer_id().await,
+            "path":source.path(),
+            "title":content
+        }))
+        .await
+        .unwrap();
+    }
+    wait_for(|| async {
+        let entries = fs::read_dir(&destination)
+            .map_err(|error| error.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if entries.len() == 2 {
+            Ok(json!({"ready":true}))
+        } else {
+            Err("deliveries not materialized".into())
+        }
+    })
+    .await;
+    let mut contents = fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path().join("value")).unwrap())
+        .collect::<Vec<_>>();
+    contents.sort();
+    assert_eq!(contents, ["one", "two"]);
     b_run.shutdown().await;
     a_run.shutdown().await;
 }

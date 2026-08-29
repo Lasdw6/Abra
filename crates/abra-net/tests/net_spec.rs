@@ -6,11 +6,11 @@ use abra_core::{
 };
 use abra_net::{
     bootstrap_allowed, check_hello, Ack, DeliveryNode, DeliveryOutcome, EnrollmentToken, Hello,
-    LoopbackNetwork, LoopbackTransport, Offer, OutboxState, Role, Scopes, Transport, TrustedPeer,
-    WIRE_VERSION,
+    LoopbackNetwork, LoopbackTransport, Offer, OutboxState, Ping, Role, Scopes, Transport,
+    TrustedPeer, WIRE_VERSION,
 };
 use serde_json::Map;
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 const NOW: u64 = 1_800_000_000_000;
 
@@ -301,6 +301,121 @@ fn scope_expiry_revocation_and_guest_to_guest_are_enforced() {
 }
 
 #[test]
+fn capsule_scope_blocks_capsule_less_traffic() {
+    let scopes = Scopes {
+        capsules: vec![Hash::from_bytes([7; 32]).to_hex()],
+        kinds: vec!["dev.abra.bundle".into()],
+        send: true,
+        receive: true,
+        lease_acquire: false,
+        lease_takeover: false,
+    };
+    assert!(!scopes.allows(None, "dev.abra.bundle", abra_net::Direction::Send));
+    let wildcard = Scopes {
+        capsules: vec!["*".into()],
+        ..scopes
+    };
+    assert!(wildcard.allows(None, "dev.abra.bundle", abra_net::Direction::Receive));
+}
+
+#[test]
+fn revocation_survives_concurrent_stale_save() {
+    let root = tempfile::tempdir().unwrap();
+    let guest = Identity::generate();
+    let unrelated = Identity::generate();
+    let token_id = "ab".repeat(16);
+    let mut original = abra_net::TrustStore::open(root.path()).unwrap();
+    original
+        .insert(TrustedPeer {
+            peer_id: guest.peer_id(),
+            name: "guest".into(),
+            role: Role::Guest,
+            x25519_pk: [0; 32],
+            token_id: Some(token_id.clone()),
+            scopes: Some(Scopes {
+                capsules: vec!["*".into()],
+                kinds: vec!["*".into()],
+                send: true,
+                receive: true,
+                lease_acquire: false,
+                lease_takeover: false,
+            }),
+            expires_at: Some(abra_net::format_time(NOW + 10_000)),
+        })
+        .unwrap();
+    let mut stale = abra_net::TrustStore::open(root.path()).unwrap();
+    original.revoke_token(&token_id).unwrap();
+    stale
+        .insert(TrustedPeer {
+            peer_id: unrelated.peer_id(),
+            name: "peer".into(),
+            role: Role::Full,
+            x25519_pk: [0; 32],
+            token_id: None,
+            scopes: None,
+            expires_at: None,
+        })
+        .unwrap();
+    let reopened = abra_net::TrustStore::open(root.path()).unwrap();
+    assert!(reopened.is_revoked(&token_id));
+    assert!(reopened.get(&guest.peer_id()).is_none());
+    assert!(reopened.get(&unrelated.peer_id()).is_some());
+}
+
+#[tokio::test]
+async fn guest_expiry_mid_session_cuts_off_next_frame() {
+    let network = LoopbackNetwork::default();
+    let guest_root = tempfile::tempdir().unwrap();
+    let host_root = tempfile::tempdir().unwrap();
+    let guest = DeliveryNode::open(guest_root.path()).unwrap();
+    let mut host = DeliveryNode::open(host_root.path()).unwrap();
+    let guest_transport = LoopbackTransport::bind(&network, guest.peer_id());
+    let host_transport = LoopbackTransport::bind(&network, host.peer_id());
+    let now = abra_core::now_ms();
+    host.trust
+        .insert(TrustedPeer {
+            peer_id: guest.peer_id(),
+            name: "short-lived".into(),
+            role: Role::Guest,
+            x25519_pk: [0; 32],
+            token_id: Some("cd".repeat(16)),
+            scopes: Some(Scopes {
+                capsules: vec!["*".into()],
+                kinds: vec!["*".into()],
+                send: true,
+                receive: true,
+                lease_acquire: false,
+                lease_takeover: false,
+            }),
+            expires_at: Some(abra_net::format_time(now + 100)),
+        })
+        .unwrap();
+    let mut outgoing = guest_transport.dial(host.peer_id()).await.unwrap();
+    let mut incoming = host_transport.accept().await.unwrap();
+    let host_task = tokio::spawn(async move {
+        host.handle_connection(&mut incoming, abra_core::now_ms())
+            .await
+    });
+    abra_net::dial_handshake(&mut outgoing, guest.peer_id(), "guest".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (send, _) = outgoing.control_mut();
+    abra_net::write_frame(
+        send,
+        &Ping {
+            message_type: "ping".into(),
+            nonce: "00".repeat(16),
+            ts: abra_net::format_time(abra_core::now_ms()),
+        },
+    )
+    .await
+    .unwrap();
+    let error = host_task.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("expired"));
+}
+
+#[test]
 fn handshake_versions_and_bootstrap_allowlist() {
     let id = Identity::generate();
     let mut hello = Hello {
@@ -375,6 +490,9 @@ fn enrollment_token_validation() {
         EnrollmentToken::mint("guest".into(), vec![], None, scopes, NOW, 1000, &issuer).unwrap();
     assert!(token.verify(NOW).is_ok());
     assert!(token.verify(NOW + 61_001).is_err());
+    let encoded = token.encode().unwrap();
+    let from_url = EnrollmentToken::parse(&format!("abra://join/{encoded}"), NOW).unwrap();
+    assert_eq!(from_url.token_id, token.token_id);
 }
 
 #[test]

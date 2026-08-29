@@ -89,7 +89,10 @@ $ target/debug/abra --root /tmp/abra-b daemon --token "$TOKEN"
 
 Human-mode enrollment also prints `abra://join/<token>`. `abra join <token>`
 redeems through an already-running daemon. TCP is retained explicitly as
-`daemon --transport tcp`; it is authenticated but not encrypted.
+`daemon --transport tcp`; it is loopback-only, authenticated, and not encrypted.
+The default iroh transport uses direct addresses only: discovery, relays, port
+mapping, and general cross-NAT reachability are not shipped in v1. Recipes and
+control messages are carried/surfaced as data; Abra does not execute them.
 
 ## Status
 

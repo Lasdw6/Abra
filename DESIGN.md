@@ -11,15 +11,14 @@ The shipped binaries default to iroh 1.1 over QUIC/TLS. Abra's Ed25519 identity
 bytes are supplied directly as the iroh `SecretKey`, so the Abra peer id and
 iroh endpoint id cannot diverge. The workspace MSRV is Rust 1.91. Pairing
 tickets and enrollment-token intro records carry the complete serialized iroh
-`EndpointAddr`: endpoint id, direct UDP addresses, and a relay URL when used.
+`EndpointAddr`: endpoint id and direct UDP addresses.
 
-The default preset is direct-address, pure peer-to-peer connectivity. iroh relay
-servers may be configured for internet reachability: they assist connection
-establishment and hole punching, and forward packets when a direct path cannot
-be established. Data remains end-to-end encrypted by QUIC/TLS and unreadable by
-the relay; iroh relays can be self-hosted. The historical Stage-2 default used
-authenticated but unencrypted TCP. It remains an explicit `--transport tcp`
-fallback and is not the default path.
+The shipped `presets::Minimal` endpoint has no discovery, relay, port mapping,
+or Abra relay configuration. It therefore needs directly usable addresses
+(normally the same LAN or manual routing). Relay and configurable discovery
+support are future work. The historical Stage-2 authenticated but unencrypted
+TCP transport remains an explicit `--transport tcp` loopback-only test mode;
+it is not an inter-device fallback.
 
 ## 1. What Abra is
 
@@ -28,8 +27,8 @@ state between **one user's** devices and their cloud agents.
 
 Abra is transport plus policy-controlled materialization. It carries bytes,
 structure, and descriptions of processes without interpreting payload meaning.
-Recipes run only under an explicit peer+kind standing grant; default delivery
-is inert and waits in the inbox.
+Recipes are carried and materialized as data. Abra never executes them; the
+receiving app or user decides whether and how to act on them.
 
 ### Carry the data, don't prescribe the experience
 
@@ -214,12 +213,10 @@ hash. Un-acked entries stay in the outbox and are retried. Devices are asleep,
 on planes, and behind NATs; the outbox is what makes "teleport" mean "it will
 arrive" rather than "it worked when both were awake".
 
-### Pure p2p by default, optional blind relays
+### Direct p2p in v1
 
-Direct encrypted connections between the user's devices are the default path.
-Relays are **optional and blind**: they see ciphertext and routing metadata, and
-they are never required for correctness. A user who wants zero third-party
-involvement turns relays off and loses only NAT-traversal luck.
+Direct encrypted connections between the user's devices are the only shipped
+iroh path. Configurable discovery and blind relays are future work.
 
 ### Adapters are separate executables
 

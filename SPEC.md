@@ -588,38 +588,33 @@ sig}` (domain `enroll-bind`). The intro peer verifies token signature/expiry/
 revocation and either `audience == guest_peer_id` or (audience-less) now ≤
 `bind_by` and the token is unbound. It persists the guest as
 `TrustedPeer {role:"guest", token_id, scopes}`, replies
-`enroll-ok {mesh:[{peer_id,name,role}]}`, and — as the issuer, or after verifying
-an issuer-signed certificate — gossips a **bind certificate** (CJSON signed
-domain `bind-cert` by the issuer): `{type:"bind-cert", token_id, guest_peer_id,
-bound_at, sig}`. Other full peers accept a guest only via a valid bind
-certificate, so competing binds resolve deterministically to the issuer's one
-choice.
+`enroll-ok {mesh:[{peer_id,name,role}]}`. In v1 the guest trust row is
+device-local to the issuer; bind-certificate distribution is not implemented.
+The mesh projection contains no other guests' token ids, scopes, or keys.
 
 ### 7.3 Revocation
 
-`{spec,type:"revoke",token_id,revoked_at,sig}` (domain `revoke`, any full peer)
-floods to all trusted peers and is retained until token expiry + 7d. On revoke:
-drop the guest, refuse binds/offers both directions. Revocation is fail-open
-until the record propagates (stated limitation); guests MUST re-validate against
-a full device at enrollment and before any `lease` operation, which bounds the
-window for the operations that matter most. Full-peer removal (lost laptop) is a
-local trust-store deletion flooded the same way as a revocation with
-`peer_id` in place of `token_id`.
+Revocation is device-local in v1, matching device-local guest enrollment. On
+revoke the issuer drops the guest and refuses subsequent binds and frames,
+including frames on an already-open session. Cross-device revocation flooding
+and full-peer removal gossip are not implemented.
 
 ### 7.4 Scope enforcement (receiver-side, every operation)
 
 For any offer, ack target, lease op, or fetch involving a guest: token unexpired
-and unrevoked; `kind` ∈ `scopes.kinds`; full snapshots' `capsule_id` ∈
-`scopes.capsules`; direction bit (`send`/`receive`) set; lease ops gated by
+and unrevoked; `kind` ∈ `scopes.kinds`; `capsule_id` ∈ `scopes.capsules`.
+Capsule-less partial/inbox traffic is allowed only when `capsules` is exactly
+`["*"]`; a specific capsule allowlist never authorizes capsule-less traffic.
+The direction bit (`send`/`receive`) must be set; lease ops are gated by
 `lease_acquire`/`lease_takeover`; guests send only to full peers, never to other
 guests; provenance-free partials are allowed if their `kind` is in scope
 (provenance is informational and grants nothing). Full peers are the gate;
 guests self-enforce as defense in depth only. `have` responses to a guest MUST
 NOT disclose possession of objects outside that guest's scoped capsules.
 
-**Send authority:** the guest daemon exposes send only when the token has
-`send:true` **and** the local flag `abra.allow_agent_send` (default false) is
-enabled — infra owns the switch; no token can widen it.
+**Send authority:** a guest daemon initializes its local send switch from the
+token's `send` bit. A full daemon remains default-deny for agent-style sending
+unless explicitly enabled; no token can widen its own scope.
 
 ---
 

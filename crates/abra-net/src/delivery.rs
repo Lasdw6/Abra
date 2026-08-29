@@ -23,6 +23,9 @@ use std::{
 pub const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const MAX_OBJECT_STREAMS: usize = 8;
 pub const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_INBOX_ENTRIES: usize = 10_000;
+const MAX_PENDING_PAIRS: usize = 128;
+const MAX_EVENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -370,12 +373,17 @@ impl DeliveryNode {
         if let Some(parent) = self.event_log.parent() {
             fs::create_dir_all(parent)?;
         }
+        if fs::metadata(&self.event_log).is_ok_and(|metadata| metadata.len() >= MAX_EVENT_LOG_BYTES)
+        {
+            fs::write(&self.event_log, [])?;
+        }
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.event_log)?;
-        serde_json::to_writer(&mut file, value)?;
-        file.write_all(b"\n")?;
+        file.write_all(&bytes)?;
         file.sync_data()?;
         Ok(())
     }
@@ -696,7 +704,12 @@ impl DeliveryNode {
         Ok(DeliveryOutcome::Complete { ack, stats })
     }
 
-    pub async fn handle_connection(&mut self, connection: &mut Connection, now: u64) -> Result<()> {
+    pub async fn handle_connection(
+        &mut self,
+        connection: &mut Connection,
+        _now: u64,
+    ) -> Result<()> {
+        let session_started = abra_core::now_ms();
         let hello = accept_handshake(connection, self.peer_id(), &self.trust).await?;
         let trusted = hello.session == "trusted";
         if trusted {
@@ -712,6 +725,31 @@ impl DeliveryNode {
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
+            let now = abra_core::now_ms();
+            self.trust.reload()?;
+            if let Some(peer) = self.trust.get(&connection.peer_id()) {
+                if peer.role == crate::Role::Guest {
+                    let token = peer
+                        .token_id
+                        .as_deref()
+                        .ok_or_else(|| Error::authz("guest lacks token"))?;
+                    if self.trust.is_revoked(token) {
+                        return Err(Error::authz("token revoked"));
+                    }
+                    let expires = peer
+                        .expires_at
+                        .as_deref()
+                        .map(crate::auth::parse_time)
+                        .transpose()?
+                        .ok_or_else(|| Error::authz("guest lacks expiry"))?;
+                    if now > expires {
+                        return Err(Error::authz("token expired"));
+                    }
+                    if now.saturating_sub(session_started) > 24 * 60 * 60 * 1000 {
+                        return Err(Error::authz("guest session lifetime exceeded"));
+                    }
+                }
+            }
             let kind = value
                 .get("type")
                 .and_then(|x| x.as_str())
@@ -880,6 +918,11 @@ impl DeliveryNode {
                             self.store.add_capsule(genesis, grant)?;
                         }
                     }
+                    if raw.manifest().scope == Scope::Partial
+                        && self.store.inbox.len() >= MAX_INBOX_ENTRIES
+                    {
+                        return Err(Error::authz("inbox quota exceeded"));
+                    }
                     let shelf = self.commit_manifest(raw, connection.peer_id(), now)?;
                     let ack = Ack::sign(
                         offer.offer_id,
@@ -925,8 +968,17 @@ impl DeliveryNode {
                 }
                 "pair-request" => {
                     let request: crate::PairRequest = serde_json::from_value(value)?;
+                    if request.peer_id != connection.peer_id() {
+                        return Err(Error::Authentication(
+                            "pair request differs from transport".into(),
+                        ));
+                    }
                     fs::create_dir_all(&self.pending_pair_dir)?;
                     fs::create_dir_all(&self.approved_pair_dir)?;
+                    let pending_count = fs::read_dir(&self.pending_pair_dir)?.count();
+                    if pending_count >= MAX_PENDING_PAIRS {
+                        return Err(Error::authz("too many pending pair requests"));
+                    }
                     let pending_path = self.pending_pair_dir.join(request.peer_id.to_hex());
                     let approved_path = self.approved_pair_dir.join(request.peer_id.to_hex());
                     fs::write(&pending_path, abra_core::canonical::to_vec(&request)?)?;
@@ -976,7 +1028,17 @@ impl DeliveryNode {
                     let certificate =
                         self.trust
                             .bind_enrollment(&bind, connection.peer_id(), now, &issuer)?;
-                    let mesh = self.trust.peers().values().cloned().collect();
+                    let mesh = self
+                        .trust
+                        .peers()
+                        .values()
+                        .filter(|peer| peer.role == crate::Role::Full)
+                        .map(|peer| crate::EnrollMeshPeer {
+                            peer_id: peer.peer_id,
+                            name: peer.name.clone(),
+                            role: peer.role.clone(),
+                        })
+                        .collect();
                     let reply = crate::EnrollOk {
                         message_type: "enroll-ok".into(),
                         mesh,

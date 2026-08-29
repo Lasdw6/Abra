@@ -255,7 +255,9 @@ impl Transport for TcpTransport {
     }
     async fn accept(&self) -> Result<Connection> {
         let (stream, _) = self.listener.accept().await?;
-        self.authenticate(stream).await
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.authenticate(stream))
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 }
 
@@ -442,6 +444,8 @@ impl Transport for IrohTransport {
         let conn = incoming
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
-        Self::wrap(conn, false).await
+        tokio::time::timeout(std::time::Duration::from_secs(1), Self::wrap(conn, false))
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 }

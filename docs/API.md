@@ -6,6 +6,14 @@ a newline and receives one JSON object followed by a newline. Connections may be
 reused. Requests have an `op`; successful responses are
 `{"ok":true,"result":...}` and failures are `{"ok":false,"error":"..."}`.
 
+The store root and every store directory are owner-only (`0700`). Cadabra
+refuses an existing root that is group- or world-accessible. The listener checks
+kernel peer credentials and accepts only the daemon uid. A control line is at
+most 1 MiB and an idle connection is closed after 30 seconds. The socket carries
+full device authority: any process able to connect can pair peers, mint scoped
+tokens, enqueue private data, and materialize received data. Treat access to it
+exactly like access to the device key.
+
 Operations and request fields:
 
 | Operation | Fields | Result |
@@ -26,6 +34,14 @@ Operations and request fields:
 | `outbox` | — | entries including protocol state and retry metadata |
 | `cancel` | `id` | cancelled outbox id |
 
-`pair-confirm` and `pending-pairs` are the stable interactive API. A daemon run
-with `--yes` confirms pairing requests automatically for automation.
+Paths sent to `capsule-create`, `snapshot`, and `accept` must be absolute. The
+CLI resolves them in the caller's working directory before making the request;
+`capsule-create` creates a missing directory.
 
+`pair-confirm` and `pending-pairs` are the stable interactive API. The issuer
+keeps the bootstrap connection open until confirmation or ticket timeout;
+confirmation completes that connection without retrying the ticket. A daemon
+run with `--yes` confirms pairing requests automatically for automation.
+
+`--json` writes exactly one JSON value: the operation's `result` object. In
+human mode, `pair ticket` writes only the copyable `abra-pair/1/...` token.

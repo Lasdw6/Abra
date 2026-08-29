@@ -198,6 +198,8 @@ pub struct DeliveryNode {
     pub approved_pair_requests: BTreeSet<PeerId>,
     partial_dir: PathBuf,
     pending_ack_dir: PathBuf,
+    pending_pair_dir: PathBuf,
+    approved_pair_dir: PathBuf,
 }
 impl DeliveryNode {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -212,12 +214,33 @@ impl DeliveryNode {
             approved_pair_requests: BTreeSet::new(),
             partial_dir: root.join("net/partials"),
             pending_ack_dir: root.join("net/pending-acks"),
+            pending_pair_dir: root.join("net/pending-pairs"),
+            approved_pair_dir: root.join("net/approved-pairs"),
         })
     }
     pub fn peer_id(&self) -> PeerId {
         self.store.keys.identity.peer_id()
     }
+    pub fn approve_pair(&self, peer: PeerId) -> Result<()> {
+        fs::create_dir_all(&self.approved_pair_dir)?;
+        fs::write(self.approved_pair_dir.join(peer.to_hex()), b"approved")?;
+        Ok(())
+    }
+    pub fn durable_pending_pairs(&self) -> Result<Vec<crate::PairRequest>> {
+        let mut requests = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.pending_pair_dir) else {
+            return Ok(requests);
+        };
+        for entry in entries {
+            let bytes = fs::read(entry?.path())?;
+            requests.push(serde_json::from_slice(&bytes)?);
+        }
+        Ok(requests)
+    }
     pub fn enqueue(&mut self, peer: PeerId, raw: &RawManifest, now: u64) -> Result<String> {
+        if self.trust.get(&peer).is_none() {
+            return Err(Error::authz("unknown or untrusted recipient"));
+        }
         if let LocalRole::Guest { token } = self.trust.local_role() {
             if !self.allow_agent_send || !token.scopes.send || token.verify(now).is_err() {
                 return Err(Error::authz("local agent sending disabled"));
@@ -712,6 +735,13 @@ impl DeliveryNode {
                     {
                         return Err(Error::protocol("invalid plan"));
                     }
+                    let planned_bytes = plan.objects.iter().try_fold(0u64, |sum, object| {
+                        sum.checked_add(object.bytes)
+                            .ok_or_else(|| Error::protocol("plan byte count overflow"))
+                    })?;
+                    if planned_bytes != offer.bytes_hint || planned_bytes > MAX_OBJECT_SIZE {
+                        return Err(Error::protocol("plan quota mismatch"));
+                    }
                     let mut have =
                         self.compute_have(&offer.offer_id, &allowed.keys().copied().collect())?;
                     if self
@@ -831,17 +861,42 @@ impl DeliveryNode {
                 }
                 "pair-request" => {
                     let request: crate::PairRequest = serde_json::from_value(value)?;
-                    self.pending_pair_requests
-                        .insert(request.peer_id, request.clone());
-                    let approved = self.auto_confirm_pairs
-                        || self.approved_pair_requests.remove(&request.peer_id);
+                    fs::create_dir_all(&self.pending_pair_dir)?;
+                    fs::create_dir_all(&self.approved_pair_dir)?;
+                    let pending_path = self.pending_pair_dir.join(request.peer_id.to_hex());
+                    let approved_path = self.approved_pair_dir.join(request.peer_id.to_hex());
+                    fs::write(&pending_path, abra_core::canonical::to_vec(&request)?)?;
+                    let approved = if self.auto_confirm_pairs {
+                        true
+                    } else {
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+                        loop {
+                            if approved_path.exists() {
+                                break true;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                let error = ProtocolError {
+                                    message_type: "error".into(),
+                                    code: "untrusted".into(),
+                                    message: "pairing confirmation timed out".into(),
+                                };
+                                let (send, _) = connection.control_mut();
+                                write_frame(send, &error).await?;
+                                break false;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    };
                     let accept = self.trust.accept_pair_request(
                         &request,
                         connection.peer_id(),
                         now,
                         |_, _| approved,
-                    )?;
-                    self.pending_pair_requests.remove(&request.peer_id);
+                    );
+                    let _ = fs::remove_file(&pending_path);
+                    let _ = fs::remove_file(&approved_path);
+                    let accept = accept?;
                     let (send, _) = connection.control_mut();
                     write_frame(send, &accept).await?;
                 }

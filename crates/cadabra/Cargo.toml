@@ -19,6 +19,8 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
 rand.workspace = true
 hex.workspace = true
+fs2 = "0.4"
+rustix = { version = "1", features = ["fs", "process"] }
 clap.workspace = true
 
 [dev-dependencies]

@@ -216,7 +216,7 @@ impl Outbox {
             .entries
             .get_mut(id)
             .ok_or_else(|| Error::protocol("unknown outbox id"))?;
-        if e.state != OutboxState::AwaitingAck
+        if !matches!(e.state, OutboxState::AwaitingAck | OutboxState::Healthcheck)
             || e.offer_id != ack.offer_id
             || e.snapshot_id != ack.snapshot_id
         {

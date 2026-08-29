@@ -1,4 +1,3 @@
-use abra_net::LoopbackNetwork;
 use cadabra::Daemon;
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
@@ -22,11 +21,7 @@ fn default_root() -> PathBuf {
 async fn main() -> cadabra::Result<()> {
     let args = Args::parse();
     let root = args.root.unwrap_or_else(default_root);
-    let daemon = Arc::new(Daemon::loopback(
-        root,
-        &LoopbackNetwork::default(),
-        args.yes,
-    )?);
+    let daemon = Arc::new(Daemon::tcp(root, args.yes).await?);
     let running = daemon.start().await?;
     tokio::signal::ctrl_c().await?;
     running.shutdown().await;

@@ -1,4 +1,3 @@
-use abra_net::LoopbackNetwork;
 use cadabra::{control_call, Daemon};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -118,7 +117,7 @@ async fn main() -> cadabra::Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(default_root);
     if let Command::Daemon { yes } = cli.command {
-        let daemon = Arc::new(Daemon::loopback(&root, &LoopbackNetwork::default(), yes)?);
+        let daemon = Arc::new(Daemon::tcp(&root, yes).await?);
         let running = daemon.start().await?;
         tokio::signal::ctrl_c().await?;
         running.shutdown().await;
@@ -133,13 +132,26 @@ async fn main() -> cadabra::Result<()> {
             PairCommand::Pending => json!({"op":"pending-pairs"}),
         },
         Command::Peers => json!({"op":"peers"}),
-        Command::Init { path } => json!({"op":"capsule-create","path":path}),
-        Command::Snapshot { label, path } => json!({"op":"snapshot","path":path,"label":label}),
+        Command::Init { path } => {
+            std::fs::create_dir_all(&path)?;
+            json!({"op":"capsule-create","path":std::fs::canonicalize(path)?})
+        }
+        Command::Snapshot { label, path } => {
+            json!({"op":"snapshot","path":std::fs::canonicalize(path)?,"label":label})
+        }
         Command::Send(args) => {
-            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":args.path,"snapshot_id":args.capsule})
+            let path = args.path.map(std::fs::canonicalize).transpose()?;
+            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule})
         }
         Command::Inbox => json!({"op":"inbox"}),
-        Command::Accept { id, to } => json!({"op":"accept","id":id,"to":to}),
+        Command::Accept { id, to } => {
+            let absolute = if to.is_absolute() {
+                to
+            } else {
+                std::env::current_dir()?.join(to)
+            };
+            json!({"op":"accept","id":id,"to":absolute})
+        }
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
         Command::Outbox => json!({"op":"outbox"}),
         Command::Cancel { id } => json!({"op":"cancel","id":id}),
@@ -152,7 +164,20 @@ async fn main() -> cadabra::Result<()> {
     if cli.json {
         println!("{}", serde_json::to_string(&result)?);
     } else {
-        print_human(&result);
+        if matches!(
+            request.get("op").and_then(Value::as_str),
+            Some("pair-ticket")
+        ) {
+            println!(
+                "{}",
+                result
+                    .get("ticket")
+                    .and_then(Value::as_str)
+                    .ok_or("daemon returned no ticket")?
+            );
+        } else {
+            print_human(&result);
+        }
     }
     Ok(())
 }

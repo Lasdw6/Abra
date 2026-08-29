@@ -8,6 +8,7 @@ use abra_core::{
     manifest::{Manifest, Origin, RawManifest, Scope},
     now_ms,
 };
+use abra_net::TcpTransport;
 use abra_net::{
     dial_handshake, format_time, read_frame, write_frame, DeliveryNode, EnrollmentToken, Intro,
     LoopbackNetwork, LoopbackTransport, PairAccept, PairRequest, PairTicket, Scopes, Transport,
@@ -15,19 +16,22 @@ use abra_net::{
 use rand::Rng;
 use serde_json::{json, Map, Value};
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Semaphore},
     task::JoinHandle,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+const MAX_CONTROL_LINE: u64 = 1024 * 1024;
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONTROL_CLIENTS: usize = 64;
 
 /// A running daemon owns exactly one durable network/store node.
 pub struct Daemon {
@@ -35,11 +39,14 @@ pub struct Daemon {
     node: Arc<Mutex<DeliveryNode>>,
     transport: Arc<dyn Transport>,
     shutdown: watch::Sender<bool>,
+    yes: bool,
 }
 
 pub struct RunningDaemon {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    socket: PathBuf,
+    _lock: File,
 }
 
 impl RunningDaemon {
@@ -48,6 +55,7 @@ impl RunningDaemon {
         for task in self.tasks {
             let _ = task.await;
         }
+        let _ = fs::remove_file(&self.socket);
     }
 }
 
@@ -65,6 +73,7 @@ impl Daemon {
             node: Arc::new(Mutex::new(node)),
             transport,
             shutdown,
+            yes,
         })
     }
 
@@ -72,6 +81,14 @@ impl Daemon {
         let node = DeliveryNode::open(root.as_ref())?;
         let transport = Arc::new(LoopbackTransport::bind(network, node.peer_id()));
         drop(node);
+        Self::new(root, transport, yes)
+    }
+
+    pub async fn tcp(root: impl AsRef<Path>, yes: bool) -> Result<Self> {
+        let node = DeliveryNode::open(root.as_ref())?;
+        let secret = node.store.keys.identity.secret_bytes();
+        drop(node);
+        let transport = Arc::new(TcpTransport::bind(secret).await?);
         Self::new(root, transport, yes)
     }
 
@@ -85,12 +102,36 @@ impl Daemon {
 
     pub async fn start(self: &Arc<Self>) -> Result<RunningDaemon> {
         let socket = self.root.join("cadabra.sock");
+        if socket.exists()
+            && tokio::time::timeout(
+                Duration::from_millis(500),
+                control_call(&self.root, &json!({"op":"status"})),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            return Err(format!("daemon already running at {}", self.root.display()).into());
+        }
+        let lock_path = self.root.join("cadabra.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .map_err(|_| format!("daemon already running at {}", self.root.display()))?;
         match fs::remove_file(&socket) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let listener = UnixListener::bind(&socket)?;
+        #[cfg(unix)]
+        let old_umask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        let listener_result = UnixListener::bind(&socket);
+        #[cfg(unix)]
+        rustix::process::umask(old_umask);
+        let listener = listener_result?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -98,6 +139,7 @@ impl Daemon {
         }
         let mut tasks = Vec::new();
         let daemon = Arc::clone(self);
+        let clients = Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS));
         let mut stop = self.shutdown.subscribe();
         tasks.push(tokio::spawn(async move {
             loop {
@@ -106,9 +148,19 @@ impl Daemon {
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
                             let daemon = Arc::clone(&daemon);
-                            tokio::spawn(async move { let _ = daemon.serve_client(stream).await; });
+                            let clients = Arc::clone(&clients);
+                            tokio::spawn(async move {
+                                if let Ok(_permit) = clients.acquire_owned().await {
+                                    if let Err(error) = daemon.serve_client(stream).await {
+                                        eprintln!("cadabra: control client error: {error}");
+                                    }
+                                }
+                            });
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            eprintln!("cadabra: control accept error: {error}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
             }
@@ -120,9 +172,18 @@ impl Daemon {
                 tokio::select! {
                     _ = stop.changed() => break,
                     incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
-                        let node = Arc::clone(&daemon.node);
+                        let root = daemon.root.clone();
+                        let yes = daemon.yes;
                         tokio::spawn(async move {
-                            let _ = node.lock().await.handle_connection(&mut connection, now_ms()).await;
+                            match DeliveryNode::open(root) {
+                                Ok(mut node) => {
+                                    node.auto_confirm_pairs = yes;
+                                    if let Err(error) = node.handle_connection(&mut connection, now_ms()).await {
+                                        eprintln!("cadabra: incoming session error: {error}");
+                                    }
+                                }
+                                Err(error) => eprintln!("cadabra: session store error: {error}"),
+                            }
                         });
                     }
                 }
@@ -141,6 +202,8 @@ impl Daemon {
         Ok(RunningDaemon {
             shutdown: self.shutdown.clone(),
             tasks,
+            socket,
+            _lock: lock,
         })
     }
 
@@ -152,14 +215,15 @@ impl Daemon {
                 None => continue,
             };
             match self.transport.dial(peer).await {
-                Ok(mut connection) => {
-                    let _ = self
-                        .node
-                        .lock()
-                        .await
-                        .send_offer(&id, &mut connection, now_ms())
-                        .await;
-                }
+                Ok(mut connection) => match DeliveryNode::open(&self.root) {
+                    Ok(mut session) => {
+                        if let Err(error) = session.send_offer(&id, &mut connection, now_ms()).await
+                        {
+                            eprintln!("cadabra: outgoing session error: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("cadabra: session store error: {error}"),
+                },
                 Err(error) => {
                     let _ = self.node.lock().await.outbox.fail_attempt(
                         &id,
@@ -172,26 +236,59 @@ impl Daemon {
     }
 
     async fn serve_client(&self, stream: UnixStream) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let peer = stream.peer_cred()?;
+            if peer.uid() != rustix::process::geteuid().as_raw() {
+                return Err("control client uid differs from daemon uid".into());
+            }
+        }
         let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-        while let Some(line) = lines.next_line().await? {
-            let response = match serde_json::from_str::<Value>(&line) {
-                Ok(request) => match self.handle(request).await {
-                    Ok(value) => json!({"ok":true,"result":value}),
-                    Err(error) => json!({"ok":false,"error":error.to_string()}),
-                },
-                Err(error) => json!({"ok":false,"error":format!("invalid request: {error}")}),
+        let mut reader = BufReader::new(read);
+        loop {
+            let mut bytes = Vec::new();
+            let read = tokio::time::timeout(
+                CONTROL_IDLE_TIMEOUT,
+                (&mut reader)
+                    .take(MAX_CONTROL_LINE + 1)
+                    .read_until(b'\n', &mut bytes),
+            )
+            .await
+            .map_err(|_| "control client idle timeout")??;
+            if read == 0 {
+                break;
+            }
+            let response = if bytes.len() as u64 > MAX_CONTROL_LINE || !bytes.ends_with(b"\n") {
+                json!({"ok":false,"error":"request too large"})
+            } else if let Ok(line) = std::str::from_utf8(&bytes[..bytes.len() - 1]) {
+                match serde_json::from_str::<Value>(line) {
+                    Ok(request) => match self.handle(request).await {
+                        Ok(value) => json!({"ok":true,"result":value}),
+                        Err(error) => json!({"ok":false,"error":error.to_string()}),
+                    },
+                    Err(error) => json!({"ok":false,"error":format!("invalid request: {error}")}),
+                }
+            } else {
+                json!({"ok":false,"error":"invalid request: request is not UTF-8"})
             };
             write
                 .write_all(serde_json::to_string(&response)?.as_bytes())
                 .await?;
             write.write_all(b"\n").await?;
+            if bytes.len() as u64 > MAX_CONTROL_LINE || !bytes.ends_with(b"\n") {
+                break;
+            }
         }
         Ok(())
     }
 
     /// Execute one control request. This is also the in-process test API.
     pub async fn handle(&self, request: Value) -> Result<Value> {
+        {
+            let mut fresh = DeliveryNode::open(&self.root)?;
+            fresh.auto_confirm_pairs = self.yes;
+            *self.node.lock().await = fresh;
+        }
         let op = request
             .get("op")
             .and_then(Value::as_str)
@@ -199,8 +296,18 @@ impl Daemon {
         match op {
             "status" => {
                 let node = self.node.lock().await;
+                let outbox_errors = node
+                    .outbox
+                    .entries()
+                    .filter_map(|entry| {
+                        entry
+                            .last_error
+                            .as_ref()
+                            .map(|error| json!({"id":entry.id,"error":error}))
+                    })
+                    .collect::<Vec<_>>();
                 Ok(
-                    json!({"running":true,"peer_id":node.peer_id(),"root":self.root,"peers":node.trust.peers().len(),"outbox_pending":node.outbox.entries().filter(|e| !e.state.terminal()).count()}),
+                    json!({"running":true,"peer_id":node.peer_id(),"root":self.root,"peers":node.trust.peers().len(),"outbox_pending":node.outbox.entries().filter(|e| !e.state.terminal()).count(),"outbox_errors":outbox_errors}),
                 )
             }
             "pair-ticket" => {
@@ -209,7 +316,7 @@ impl Daemon {
                     string_or(&request, "name", "device"),
                     node.store.keys.x25519_public(),
                     None,
-                    vec![],
+                    self.transport.local_addresses(),
                     now_ms(),
                     600_000,
                     &node.store.keys.identity,
@@ -220,14 +327,12 @@ impl Daemon {
             "pair-add" => self.pair_add(required_str(&request, "ticket")?).await,
             "pair-confirm" => {
                 let peer: PeerId = required_str(&request, "id")?.parse()?;
-                self.node.lock().await.approved_pair_requests.insert(peer);
-                Ok(json!({"confirmed":peer,"instruction":"retry pair add with the same ticket"}))
+                self.node.lock().await.approve_pair(peer)?;
+                Ok(json!({"confirmed":peer}))
             }
             "pending-pairs" => {
                 let node = self.node.lock().await;
-                Ok(serde_json::to_value(
-                    node.pending_pair_requests.values().collect::<Vec<_>>(),
-                )?)
+                Ok(serde_json::to_value(node.durable_pending_pairs()?)?)
             }
             "peers" => {
                 let node = self.node.lock().await;
@@ -265,6 +370,9 @@ impl Daemon {
 
     async fn pair_add(&self, encoded: &str) -> Result<Value> {
         let ticket = PairTicket::parse(encoded, now_ms())?;
+        for address in &ticket.addresses {
+            self.transport.add_peer_address(ticket.peer_id, address)?;
+        }
         let mut connection = self.transport.dial(ticket.peer_id).await?;
         dial_handshake(&mut connection, self.peer_id().await, "abra".into()).await?;
         let (request, nonce) = {
@@ -295,6 +403,10 @@ impl Daemon {
     }
 
     async fn capsule_create(&self, path: &Path) -> Result<Value> {
+        if !path.is_absolute() {
+            return Err("capsule path must be absolute".into());
+        }
+        fs::create_dir_all(path)?;
         if !path.is_dir() {
             return Err("capsule path must be a directory".into());
         }
@@ -331,6 +443,9 @@ impl Daemon {
 
     async fn snapshot(&self, request: &Value) -> Result<Value> {
         let path = PathBuf::from(required_str(request, "path")?);
+        if !path.is_absolute() {
+            return Err("snapshot path must be absolute".into());
+        }
         let capsule = read_capsule_id(&path)?;
         let mut node = self.node.lock().await;
         let files = snapshot_dir(&node.store.cas, &path)?;
@@ -440,6 +555,9 @@ impl Daemon {
     async fn accept(&self, request: &Value) -> Result<Value> {
         let id: Hash = required_str(request, "id")?.parse()?;
         let destination = Path::new(required_str(request, "to")?);
+        if !destination.is_absolute() {
+            return Err("accept destination must be absolute".into());
+        }
         let mut node = self.node.lock().await;
         if let Some(entry) = node.store.inbox.get(&id).cloned() {
             let raw = RawManifest::parse(entry.manifest)?;
@@ -472,27 +590,28 @@ impl Daemon {
 
     async fn enroll(&self, request: &Value) -> Result<Value> {
         let node = self.node.lock().await;
+        let required_scope = |key: &str| -> Result<Vec<String>> {
+            let values = request
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("request lacks {key}"))?;
+            let values = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("{key} must contain strings"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if values.is_empty() {
+                return Err(format!("{key} must not be empty").into());
+            }
+            Ok(values)
+        };
         let scopes = Scopes {
-            capsules: request
-                .get("capsules")
-                .and_then(Value::as_array)
-                .map(|xs| {
-                    xs.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_else(|| vec!["*".into()]),
-            kinds: request
-                .get("kinds")
-                .and_then(Value::as_array)
-                .map(|xs| {
-                    xs.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_else(|| vec!["*".into()]),
+            capsules: required_scope("capsules")?,
+            kinds: required_scope("kinds")?,
             send: request
                 .get("send")
                 .and_then(Value::as_bool)

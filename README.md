@@ -64,20 +64,28 @@ $ target/debug/abra --root /tmp/abra-a snapshot ./my-workspace -m first
 $ target/debug/abra --root /tmp/abra-a outbox
 ```
 
-For a two-device demo, run two `Daemon` instances on one `LoopbackNetwork`
-(the end-to-end test is an executable reference), redeem B's `pair ticket` on
-A with `pair add`, then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
+For a two-device demo, start a second daemon with a different root, copy the
+bare ticket printed by B, and redeem it on A:
+
+```console
+$ target/debug/abra --root /tmp/abra-b daemon --yes
+$ TICKET=$(target/debug/abra --root /tmp/abra-b pair ticket)
+$ target/debug/abra --root /tmp/abra-a pair add "$TICKET"
+```
+
+Then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
 `inbox` shows partial handoffs and `accept <id> --to <empty-path>` materializes
 them; full capsule snapshots appear in `log` and can also be accepted by id.
-The default loopback transport is deliberately in-process; build with the
-optional iroh transport for separate-device routing.
+
+Without `--yes`, leave `pair add` running, inspect `pair pending` on the ticket
+issuer, and run `pair confirm <peer-id>`. Confirmation completes the existing
+bootstrap connection; the joiner does not retry the ticket.
 
 ## Status
 
-Stages 1–3 include local primitives, authenticated transport, durable delivery,
-the daemon, CLI, and end-to-end loopback tests. Relays, capability web viewers,
-external adapter implementations, and iroh-path end-to-end tests remain out of
-scope.
+Stages 1–3 include local primitives, authenticated TCP transport in the shipped binaries,
+durable delivery, the daemon, CLI, and cross-process tests. Capability web
+viewers and external adapter implementations remain out of scope.
 
 ## Building
 

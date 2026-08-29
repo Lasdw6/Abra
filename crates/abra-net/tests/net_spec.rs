@@ -406,14 +406,12 @@ fn guest_send_requires_scope_and_local_switch() {
             token: Box::new(token),
         })
         .unwrap();
+    let recipient = Identity::generate().peer_id();
+    node.trust.insert(full_peer(recipient)).unwrap();
     let raw = partial(&mut node, input.path(), "x");
-    assert!(node
-        .enqueue(Identity::generate().peer_id(), &raw, NOW)
-        .is_err());
+    assert!(node.enqueue(recipient, &raw, NOW).is_err());
     node.allow_agent_send = true;
-    assert!(node
-        .enqueue(Identity::generate().peer_id(), &raw, NOW)
-        .is_ok());
+    assert!(node.enqueue(recipient, &raw, NOW).is_ok());
 }
 
 #[tokio::test]

@@ -8,12 +8,13 @@ described here so it is designed for, not designed around.
 ### Stage 2 transport implementation
 
 `abra-net` exposes one transport contract and ships two implementations: a
-deterministic in-process loopback used by protocol tests, and an optional
-`iroh` 1.1 adapter (`--features iroh`) using ALPN `abra/1`. The adapter derives
-the authenticated Abra peer id directly from iroh's authenticated endpoint id;
-there is no second transport identity. Iroh remains optional because its current
-MSRV is newer than Abra's core crate MSRV, while the wire protocol and loopback
-implementation continue to build on the workspace baseline.
+deterministic in-process loopback used by protocol tests, an authenticated TCP
+transport used by both shipped binaries, and an optional iroh 1.1 adapter. TCP
+connections perform an Ed25519 nonce challenge before any Abra frame; the
+resulting peer id must also match the signed pairing ticket and protocol hello.
+Signed pairing tickets carry the concrete loopback socket address. This v0.1
+choice avoids iroh's higher MSRV and platform network-monitor requirements;
+iroh remains available behind `abra-net/iroh` for integrators.
 
 ## 1. What Abra is
 

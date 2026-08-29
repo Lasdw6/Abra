@@ -8,6 +8,8 @@ use crate::{
     Error, Result,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::{
     collections::BTreeMap,
     fs,
@@ -56,14 +58,51 @@ pub struct AbraStore {
 impl AbraStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        for d in ["capsules", "inbox", "outbox", "keys"] {
-            fs::create_dir_all(root.join(d)).map_err(|e| Error::io(root.join(d), e))?;
+        if !root.exists() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(&root).map_err(|e| Error::io(&root, e))?;
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(root.join("keys"), fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::io(root.join("keys"), e))?;
+            let mode = fs::symlink_metadata(&root)
+                .map_err(|e| Error::io(&root, e))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                if fs::read_dir(&root)
+                    .map_err(|e| Error::io(&root, e))?
+                    .next()
+                    .is_none()
+                {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                        .map_err(|e| Error::io(&root, e))?;
+                } else {
+                    return Err(Error::corrupt(
+                        "store permissions",
+                        format!(
+                            "{} must not be group/world accessible (mode {:o})",
+                            root.display(),
+                            mode & 0o777
+                        ),
+                    ));
+                }
+            }
+        }
+        for d in [
+            "capsules", "inbox", "outbox", "keys", "objects", "tmp", "net",
+        ] {
+            let path = root.join(d);
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(&path).map_err(|e| Error::io(&path, e))?;
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::io(&path, e))?;
         }
         let cas = BlobStore::open(&root)?;
         let keys = DeviceKeys::load_or_generate(root.join("keys/device.json"))?;

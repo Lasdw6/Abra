@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+    let bytes = abra_core::canonical::to_vec(value)?;
     if bytes.is_empty() || bytes.len() > MAX_CONTROL_FRAME {
         return Err(Error::protocol("control frame length outside 1..=16 MiB"));
     }
@@ -23,6 +23,15 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) ->
     let mut bytes = vec![0; len];
     r.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub async fn read_frame_timeout<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    r: &mut R,
+    timeout: std::time::Duration,
+) -> Result<T> {
+    tokio::time::timeout(timeout, read_frame(r))
+        .await
+        .map_err(|_| Error::Timeout)?
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

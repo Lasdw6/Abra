@@ -821,3 +821,10 @@ turn.
   remain independently verifiable after persistence, gossip, or relay.
 - Stage-1 review clarification: v0.1 materialization requires a nonexistent or
   empty, non-symlink destination.
+- Stage-2 review erratum: `pair-confirm` is permitted on bootstrap sessions;
+  otherwise the pairing flow cannot reach either side's final trust insertion.
+- Stage-2 review erratum: bind certificates carry the guest name, X25519 key,
+  effective scopes, and token expiry so non-issuer intro peers can verify and
+  install the same bounded guest authority without an out-of-band token cache.
+- Stage-2 review clarification: a first full-capsule offer carries both signed
+  genesis and its signed epoch-1 grant, since capsule installation verifies both.

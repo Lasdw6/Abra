@@ -1,5 +1,5 @@
 use crate::{
-    auth::{format_time, Role, TrustStore},
+    auth::{format_time, parse_time, Role, TrustStore},
     Error, Result,
 };
 use abra_core::{
@@ -75,6 +75,21 @@ impl ControlMessage {
         trust: &mut TrustStore,
         now: u64,
     ) -> Result<()> {
+        if self.message_type != "control" || (self.op == ControlOp::Instruct) != self.text.is_some()
+        {
+            return Err(Error::protocol("invalid control message"));
+        }
+        if self.text.as_ref().is_some_and(|x| x.len() > 8192) {
+            return Err(Error::protocol("control text too large"));
+        }
+        if self.nonce.len() != 32
+            || !self
+                .nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::protocol("invalid control nonce"));
+        }
         let p = trust
             .get(&signer)
             .ok_or_else(|| Error::authz("untrusted control signer"))?;
@@ -82,38 +97,10 @@ impl ControlMessage {
             return Err(Error::authz("guests cannot send control"));
         }
         signer.verify("control", &unsigned(self)?, &self.sig)?;
-        let at = parse_control_time(&self.at)?;
+        let at = parse_time(&self.at)?;
         if now.saturating_sub(at) > 300_000 || at > now + 60_000 {
             return Err(Error::authz("control timestamp outside window"));
         }
         trust.consume_control_nonce(&self.nonce, now)
     }
-}
-fn parse_control_time(s: &str) -> Result<u64> {
-    // Reuse enrollment validation without exposing its parser: convert the
-    // canonical UTC fields with a small, dependency-free civil-date routine.
-    if s.len() != 24 {
-        return Err(Error::protocol("bad control time"));
-    }
-    let n = |a, b| {
-        s[a..b]
-            .parse::<i64>()
-            .map_err(|_| Error::protocol("bad control time"))
-    };
-    let (y, m, d, h, mi, se, ms) = (
-        n(0, 4)?,
-        n(5, 7)?,
-        n(8, 10)?,
-        n(11, 13)?,
-        n(14, 16)?,
-        n(17, 19)?,
-        n(20, 23)?,
-    );
-    let y0 = y - i64::from(m <= 2);
-    let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
-    let yoe = y0 - era * 400;
-    let mp = m + if m > 2 { -3 } else { 9 };
-    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * mp + 2) / 5 + d - 1 - 719468;
-    u64::try_from((days * 86400 + h * 3600 + mi * 60 + se) * 1000 + ms)
-        .map_err(|_| Error::protocol("bad control time"))
 }

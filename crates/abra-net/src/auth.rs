@@ -13,6 +13,48 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod hex32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &[u8; 32],
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(value))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<[u8; 32], D::Error> {
+        let value = String::deserialize(d)?;
+        let bytes = hex::decode(value).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32-byte hex"))
+    }
+}
+mod optional_hex32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &Option<[u8; 32]>,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => s.serialize_some(&hex::encode(v)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<[u8; 32]>, D::Error> {
+        let value = Option::<String>::deserialize(d)?;
+        value
+            .map(|x| {
+                hex::decode(x)
+                    .map_err(serde::de::Error::custom)?
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("expected 32-byte hex"))
+            })
+            .transpose()
+    }
+}
+
 pub const CLOCK_SKEW_MS: u64 = 60_000;
 
 fn random16() -> String {
@@ -28,21 +70,25 @@ fn unsigned<T: Serialize>(x: &T, field: &str) -> Result<Vec<u8>> {
     Ok(canonical::to_vec(&v)?)
 }
 pub(crate) fn parse_time(s: &str) -> Result<u64> {
-    if s.len() != 24
-        || &s[4..5] != "-"
-        || &s[7..8] != "-"
-        || &s[10..11] != "T"
-        || &s[13..14] != ":"
-        || &s[16..17] != ":"
-        || &s[19..20] != "."
-        || &s[23..] != "Z"
+    let b = s.as_bytes();
+    if b.len() != 24
+        || !b.is_ascii()
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'.'
+        || b[23] != b'Z'
     {
         return Err(Error::protocol("noncanonical time"));
     }
-    let n = |a, b| {
-        s[a..b]
-            .parse::<i64>()
-            .map_err(|_| Error::protocol("bad time"))
+    let n = |a: usize, z: usize| -> Result<i64> {
+        b[a..z].iter().try_fold(0_i64, |v, c| {
+            c.is_ascii_digit()
+                .then(|| v * 10 + i64::from(c - b'0'))
+                .ok_or_else(|| Error::protocol("bad time"))
+        })
     };
     let (y, m, d, hh, mm, ss, ms) = (
         n(0, 4)?,
@@ -53,7 +99,15 @@ pub(crate) fn parse_time(s: &str) -> Result<u64> {
         n(17, 19)?,
         n(20, 23)?,
     );
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if d < 1 || d > max_day || hh > 23 || mm > 59 || ss > 59 {
         return Err(Error::protocol("bad time"));
     }
     let y0 = y - i64::from(m <= 2);
@@ -94,6 +148,16 @@ pub fn format_time(ms: u64) -> String {
 pub enum Role {
     Full,
     Guest,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
+pub enum LocalRole {
+    #[default]
+    Full,
+    Guest {
+        token: Box<EnrollmentToken>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,12 +211,16 @@ pub struct TrustedPeer {
 
 #[derive(Serialize, Deserialize, Default)]
 struct TrustDisk {
+    #[serde(default)]
+    local_role: LocalRole,
     peers: BTreeMap<PeerId, TrustedPeer>,
     pending_tickets: BTreeMap<String, PairTicket>,
     awaiting_pair_confirm: BTreeMap<String, TrustedPeer>,
     used_tickets: BTreeSet<String>,
     bound_tokens: BTreeMap<String, PeerId>,
     revoked: BTreeSet<String>,
+    #[serde(default)]
+    revocations: BTreeMap<String, RevocationRecord>,
     control_nonces: BTreeMap<String, u64>,
 }
 pub struct TrustStore {
@@ -185,6 +253,13 @@ impl TrustStore {
     }
     pub fn peers(&self) -> &BTreeMap<PeerId, TrustedPeer> {
         &self.disk.peers
+    }
+    pub fn local_role(&self) -> &LocalRole {
+        &self.disk.local_role
+    }
+    pub fn set_local_role(&mut self, role: LocalRole) -> Result<()> {
+        self.disk.local_role = role;
+        self.save()
     }
     pub fn insert(&mut self, p: TrustedPeer) -> Result<()> {
         self.disk.peers.insert(p.peer_id, p);
@@ -249,12 +324,17 @@ impl TrustStore {
             nonce: request.nonce.clone(),
         })
     }
-    pub fn confirm_pair(&mut self, confirm: &PairConfirm) -> Result<()> {
+    pub fn confirm_pair(&mut self, confirm: &PairConfirm, authenticated: PeerId) -> Result<()> {
         let peer = self
             .disk
             .awaiting_pair_confirm
             .remove(&confirm.ticket_id)
             .ok_or_else(|| Error::authz("pair confirmation is not pending"))?;
+        if peer.peer_id != authenticated {
+            return Err(Error::Authentication(
+                "pair confirmation differs from transport".into(),
+            ));
+        }
         self.disk.peers.insert(peer.peer_id, peer);
         self.save()
     }
@@ -262,8 +342,9 @@ impl TrustStore {
         &mut self,
         ticket: &PairTicket,
         accept: &PairAccept,
+        expected_nonce: &str,
     ) -> Result<PairConfirm> {
-        if accept.peer_id != ticket.peer_id {
+        if accept.peer_id != ticket.peer_id || accept.nonce != expected_nonce {
             return Err(Error::Authentication("pair accept issuer mismatch".into()));
         }
         self.disk.peers.insert(
@@ -289,6 +370,26 @@ impl TrustStore {
         self.disk
             .peers
             .retain(|_, p| p.token_id.as_deref() != Some(id));
+        self.disk.bound_tokens.remove(id);
+        self.save()
+    }
+
+    pub fn apply_revocation(&mut self, record: RevocationRecord, signer: PeerId) -> Result<()> {
+        let peer = self
+            .get(&signer)
+            .ok_or_else(|| Error::authz("untrusted revocation signer"))?;
+        if peer.role != Role::Full {
+            return Err(Error::authz("revocation signer is not full"));
+        }
+        record.verify(signer)?;
+        self.disk
+            .revocations
+            .insert(record.token_id.clone(), record.clone());
+        self.disk.revoked.insert(record.token_id.clone());
+        self.disk.bound_tokens.remove(&record.token_id);
+        self.disk
+            .peers
+            .retain(|_, p| p.token_id.as_deref() != Some(&record.token_id));
         self.save()
     }
     pub fn is_revoked(&self, id: &str) -> bool {
@@ -356,7 +457,45 @@ impl TrustStore {
             },
         );
         self.save()?;
-        BindCertificate::sign(token.token_id.clone(), bind.guest_peer_id, now, issuer)
+        BindCertificate::sign(
+            token.token_id.clone(),
+            bind.guest_peer_id,
+            now,
+            bind.name.clone().unwrap_or_else(|| token.label.clone()),
+            bind.x25519_pk,
+            token.scopes.clone(),
+            token.expires_at.clone(),
+            issuer,
+        )
+    }
+    pub fn accept_bind_cert(&mut self, cert: &BindCertificate, issuer: PeerId) -> Result<()> {
+        let signer = self
+            .get(&issuer)
+            .ok_or_else(|| Error::authz("untrusted bind issuer"))?;
+        if signer.role != Role::Full {
+            return Err(Error::authz("bind issuer is not full"));
+        }
+        cert.verify(issuer)?;
+        if self.is_revoked(&cert.token_id) {
+            return Err(Error::authz("token revoked"));
+        }
+        cert.scopes.validate()?;
+        self.disk
+            .bound_tokens
+            .insert(cert.token_id.clone(), cert.guest_peer_id);
+        self.disk.peers.insert(
+            cert.guest_peer_id,
+            TrustedPeer {
+                peer_id: cert.guest_peer_id,
+                name: cert.name.clone(),
+                role: Role::Guest,
+                x25519_pk: cert.x25519_pk,
+                token_id: Some(cert.token_id.clone()),
+                scopes: Some(cert.scopes.clone()),
+                expires_at: Some(cert.expires_at.clone()),
+            },
+        );
+        self.save()
     }
     pub fn authorize_offer(
         &self,
@@ -370,9 +509,11 @@ impl TrustStore {
         let actor = self
             .get(&actor)
             .ok_or_else(|| Error::authz("untrusted peer"))?;
-        let other_role = self.get(&other).map(|p| &p.role).unwrap_or(&Role::Full);
         if actor.role == Role::Guest {
-            if *other_role == Role::Guest {
+            let other_role = self
+                .get(&other)
+                .ok_or_else(|| Error::authz("unknown counterparty"))?;
+            if other_role.role == Role::Guest {
                 return Err(Error::authz("guest-to-guest forbidden"));
             }
             let id = actor
@@ -478,8 +619,10 @@ pub struct PairTicket {
     pub ticket_id: String,
     pub issued_at: String,
     pub expires_at: String,
+    #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "optional_hex32")]
     pub relay_key: Option<[u8; 32]>,
     pub addresses: Vec<String>,
     pub sig: Signature,
@@ -551,8 +694,10 @@ pub struct PairRequest {
     pub peer_id: PeerId,
     pub name: String,
     pub nonce: String,
+    #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "optional_hex32")]
     pub relay_key: Option<[u8; 32]>,
     pub sig: Signature,
 }
@@ -684,13 +829,16 @@ impl EnrollmentToken {
                     .as_bytes(),
             )
             .map_err(|_| Error::protocol("bad enrollment base64"))?;
+        if b.len() > 8192 {
+            return Err(Error::protocol("enrollment too large"));
+        }
         let x: Self = serde_json::from_slice(&b)?;
         if canonical::to_vec(&x)? != b || x.v != 1 || x.record_type != "enrollment" {
             return Err(Error::protocol("invalid enrollment"));
         }
         x.scopes.validate()?;
         x.issuer.verify("enroll", &unsigned(&x, "sig")?, &x.sig)?;
-        if now > parse_time(&x.expires_at)? {
+        if now > parse_time(&x.expires_at)?.saturating_add(CLOCK_SKEW_MS) {
             return Err(Error::authz("token expired"));
         }
         if x.audience.is_none() && x.bind_by.is_none() {
@@ -709,6 +857,7 @@ pub struct EnrollBind {
     pub guest_peer_id: PeerId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
     pub sig: Signature,
 }
@@ -757,8 +906,18 @@ impl EnrollmentToken {
         self.scopes.validate()?;
         self.issuer
             .verify("enroll", &unsigned(self, "sig")?, &self.sig)?;
-        if now > parse_time(&self.expires_at)? {
+        let issued = parse_time(&self.issued_at)?;
+        if now > parse_time(&self.expires_at)?.saturating_add(CLOCK_SKEW_MS) {
             return Err(Error::authz("token expired"));
+        }
+        if self.audience.is_none() {
+            let bind_by = self
+                .bind_by
+                .as_deref()
+                .ok_or_else(|| Error::protocol("unbound token lacks bind_by"))?;
+            if parse_time(bind_by)? > issued.saturating_add(900_000) {
+                return Err(Error::protocol("bind window exceeds 15m"));
+            }
         }
         Ok(())
     }
@@ -772,13 +931,23 @@ pub struct BindCertificate {
     pub token_id: String,
     pub guest_peer_id: PeerId,
     pub bound_at: String,
+    pub name: String,
+    #[serde(with = "hex32")]
+    pub x25519_pk: [u8; 32],
+    pub scopes: Scopes,
+    pub expires_at: String,
     pub sig: Signature,
 }
 impl BindCertificate {
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         token_id: String,
         guest_peer_id: PeerId,
         now: u64,
+        name: String,
+        x25519_pk: [u8; 32],
+        scopes: Scopes,
+        expires_at: String,
         issuer: &Identity,
     ) -> Result<Self> {
         let mut x = Self {
@@ -786,6 +955,10 @@ impl BindCertificate {
             token_id,
             guest_peer_id,
             bound_at: format_time(now),
+            name,
+            x25519_pk,
+            scopes,
+            expires_at,
             sig: Signature::from_bytes([0; 64]),
         };
         x.sig = issuer.sign("bind-cert", &unsigned(&x, "sig")?);
@@ -1007,5 +1180,41 @@ mod tests {
         for n in [0, 1_800_000_000_000] {
             assert_eq!(parse_time(&format_time(n)).unwrap(), n)
         }
+    }
+    #[test]
+    fn strict_time_parser_never_panics_on_hostile_utf8_or_bad_calendar() {
+        for value in [
+            "202\u{e9}-01-01T00:00:00.00Z",
+            "+123-01-01T00:00:00.000Z",
+            "2024-02-30T00:00:00.000Z",
+            "2024-13-01T00:00:00.000Z",
+            "2024-01-01X00:00:00.000Z",
+        ] {
+            assert!(parse_time(value).is_err(), "accepted {value:?}");
+        }
+    }
+    #[test]
+    fn malformed_signed_enrollment_time_is_an_error_not_a_panic() {
+        let issuer = Identity::generate();
+        let mut token = EnrollmentToken::mint(
+            "x".into(),
+            vec![],
+            Some(Identity::generate().peer_id()),
+            Scopes {
+                capsules: vec!["*".into()],
+                kinds: vec!["*".into()],
+                send: false,
+                receive: true,
+                lease_acquire: false,
+                lease_takeover: false,
+            },
+            1_800_000_000_000,
+            1000,
+            &issuer,
+        )
+        .unwrap();
+        token.expires_at = "202\u{e9}-01-01T00:00:00.00Z".into();
+        token.sig = issuer.sign("enroll", &unsigned(&token, "sig").unwrap());
+        assert!(token.verify(1_800_000_000_000).is_err());
     }
 }

@@ -59,14 +59,20 @@ impl Connection {
             }
         }
     }
-    pub async fn accept_uni(&self) -> Result<Vec<u8>> {
+    pub async fn accept_uni_bounded(&self, max: usize) -> Result<Vec<u8>> {
         match &self.streams {
-            Streams::Loopback { uni_recv, .. } => uni_recv
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| Error::Transport("connection closed".into())),
+            Streams::Loopback { uni_recv, .. } => {
+                let bytes = uni_recv
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| Error::Transport("connection closed".into()))?;
+                if bytes.len() > max {
+                    return Err(Error::protocol("object stream exceeds quota"));
+                }
+                Ok(bytes)
+            }
             #[cfg(feature = "iroh")]
             Streams::Iroh(conn) => {
                 let mut stream = conn
@@ -74,7 +80,7 @@ impl Connection {
                     .await
                     .map_err(|e| Error::Transport(e.to_string()))?;
                 stream
-                    .read_to_end(usize::MAX)
+                    .read_to_end(max)
                     .await
                     .map_err(|e| Error::Transport(e.to_string()))
             }

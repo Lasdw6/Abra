@@ -182,10 +182,7 @@ impl AbraStore {
             .clone();
         let result = staged.insert_snapshot(raw, at.clone(), now_ms)?;
         let mut fork_op = None;
-        if result.forked {
-            let signer = fork_signer.ok_or_else(|| {
-                Error::invalid("forked write requires the writer identity to create its label-op")
-            })?;
+        if let (true, Some(signer)) = (result.forked, fork_signer) {
             let name = result.fork_label.clone().expect("fork label");
             let seq = staged.label(&name).map_or(1, |old| old.seq + 1);
             let epoch = staged.winning_lease().map_or(0, |lease| lease.epoch);

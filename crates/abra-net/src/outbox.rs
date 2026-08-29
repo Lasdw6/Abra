@@ -12,6 +12,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod base64_bytes {
+    use data_encoding::BASE64URL_NOPAD;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &[u8], s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64URL_NOPAD.encode(value))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<u8>, D::Error> {
+        let value = String::deserialize(d)?;
+        BASE64URL_NOPAD
+            .decode(value.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 pub const OUTBOX_TTL_MS: u64 = 7 * 86_400_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +59,7 @@ pub struct OutboxEntry {
     pub last_error: Option<String>,
     pub ack_sig: Option<Signature>,
     pub next_attempt_at: String,
+    #[serde(with = "base64_bytes")]
     pub manifest_raw: Vec<u8>,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -78,6 +93,7 @@ impl Outbox {
         fs::write(&tmp, canonical::to_vec(&self.disk)?)?;
         fs::OpenOptions::new().read(true).open(&tmp)?.sync_all()?;
         fs::rename(tmp, &self.path)?;
+        fs::File::open(self.path.parent().expect("outbox parent"))?.sync_all()?;
         Ok(())
     }
     pub fn enqueue(
@@ -112,11 +128,12 @@ impl Outbox {
     pub fn entries(&self) -> impl Iterator<Item = &OutboxEntry> {
         self.disk.entries.values()
     }
-    pub fn pending_ids(&self) -> Vec<String> {
+    pub fn pending_ids(&self, now: u64) -> Vec<String> {
         self.disk
             .entries
             .values()
             .filter(|e| !e.state.terminal() && e.state != OutboxState::Failed)
+            .filter(|e| crate::auth::parse_time(&e.next_attempt_at).is_ok_and(|t| t <= now))
             .map(|e| e.id.clone())
             .collect()
     }
@@ -126,6 +143,27 @@ impl Outbox {
             .entries
             .get_mut(id)
             .ok_or_else(|| Error::protocol("unknown outbox id"))?;
+        let legal = matches!(
+            (e.state, state),
+            (OutboxState::Queued, OutboxState::Healthcheck)
+                | (
+                    OutboxState::Offered | OutboxState::Transferring | OutboxState::AwaitingAck,
+                    OutboxState::Healthcheck
+                )
+                | (OutboxState::Healthcheck, OutboxState::Offered)
+                | (OutboxState::Offered, OutboxState::Transferring)
+                | (OutboxState::Transferring, OutboxState::AwaitingAck)
+                | (
+                    OutboxState::Healthcheck
+                        | OutboxState::Offered
+                        | OutboxState::Transferring
+                        | OutboxState::AwaitingAck,
+                    OutboxState::Queued
+                )
+        );
+        if !legal {
+            return Err(Error::protocol("illegal outbox transition"));
+        }
         e.state = state;
         e.updated_at = format_time(now);
         self.save()
@@ -142,7 +180,8 @@ impl Outbox {
             e.state = OutboxState::Failed
         } else {
             e.state = OutboxState::Queued;
-            let base = (1000u64.saturating_mul(1u64 << e.attempts.min(18))).min(300_000);
+            let base =
+                (1000u64.saturating_mul(1u64 << e.attempts.saturating_sub(1).min(18))).min(300_000);
             let pct = rand::thread_rng().gen_range(80..=120);
             e.next_attempt_at = format_time(now + base * pct / 100);
         }
@@ -165,12 +204,11 @@ impl Outbox {
         self.save()?;
         Ok(offer)
     }
-    pub fn mark_acked(
+    pub fn apply_ack(
         &mut self,
         id: &str,
-        offer_id: &str,
-        snapshot_id: Hash,
-        sig: Signature,
+        ack: &crate::Ack,
+        local_peer: PeerId,
         now: u64,
     ) -> Result<bool> {
         let e = self
@@ -178,22 +216,39 @@ impl Outbox {
             .entries
             .get_mut(id)
             .ok_or_else(|| Error::protocol("unknown outbox id"))?;
-        if e.offer_id != offer_id || e.snapshot_id != snapshot_id {
+        if e.state != OutboxState::AwaitingAck
+            || e.offer_id != ack.offer_id
+            || e.snapshot_id != ack.snapshot_id
+        {
             return Ok(false);
         }
+        ack.verify(local_peer, e.peer_id)?;
         e.state = OutboxState::Acked;
-        e.ack_sig = Some(sig);
+        e.ack_sig = Some(ack.sig);
         e.updated_at = format_time(now);
         self.save()?;
         Ok(true)
     }
     pub fn expire(&mut self, now: u64) -> Result<()> {
         for e in self.disk.entries.values_mut() {
-            if !e.state.terminal() && age_ms(&e.created_at, now) > OUTBOX_TTL_MS {
+            if e.state == OutboxState::Queued && age_ms(&e.created_at, now) > OUTBOX_TTL_MS {
                 e.state = OutboxState::Expired;
                 e.updated_at = format_time(now)
             }
         }
+        self.save()
+    }
+    pub fn cancel(&mut self, id: &str, now: u64) -> Result<()> {
+        let e = self
+            .disk
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| Error::protocol("unknown outbox id"))?;
+        if e.state.terminal() || e.state == OutboxState::Failed {
+            return Err(Error::protocol("cannot cancel terminal outbox entry"));
+        }
+        e.state = OutboxState::Cancelled;
+        e.updated_at = format_time(now);
         self.save()
     }
 }

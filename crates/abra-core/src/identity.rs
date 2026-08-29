@@ -49,6 +49,7 @@ pub fn domain_message(domain: &str, payload: &[u8]) -> Vec<u8> {
     signature_preimage(domain, payload)
 }
 
+#[derive(Clone)]
 pub struct Identity {
     signing: SigningKey,
 }
@@ -112,6 +113,7 @@ struct DeviceFile {
     relay_discovery_key: String,
 }
 /// The three independently generated persistent device secrets (SPEC §0, §7.1).
+#[derive(Clone)]
 pub struct DeviceKeys {
     pub identity: Identity,
     pub x25519_secret: [u8; 32],

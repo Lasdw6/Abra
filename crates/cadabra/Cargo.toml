@@ -7,13 +7,18 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["iroh", "tcp"]
+iroh = ["abra-net/iroh"]
+tcp = ["abra-net/tcp"]
+
 [[bin]]
 name = "cadabra"
 path = "src/main.rs"
 
 [dependencies]
 abra-core.workspace = true
-abra-net = { path = "../abra-net" }
+abra-net = { path = "../abra-net", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }

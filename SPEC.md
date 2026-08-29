@@ -828,3 +828,5 @@ turn.
   install the same bounded guest authority without an out-of-band token cache.
 - Stage-2 review clarification: a first full-capsule offer carries both signed
   genesis and its signed epoch-1 grant, since capsule installation verifies both.
+- Stage-4 clarification: enrollment intro records include the peer's X25519 key
+  and transport dialing addresses, avoiding a parallel discovery or identity channel.

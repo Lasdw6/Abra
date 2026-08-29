@@ -62,13 +62,14 @@ pub struct OutboxEntry {
     #[serde(with = "base64_bytes")]
     pub manifest_raw: Vec<u8>,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Disk {
     entries: BTreeMap<String, OutboxEntry>,
 }
 pub struct Outbox {
     path: PathBuf,
     disk: Disk,
+    persist: bool,
 }
 fn random_id(bytes: usize) -> String {
     let mut v = vec![0; bytes];
@@ -83,9 +84,16 @@ impl Outbox {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Disk::default(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { path, disk })
+        Ok(Self {
+            path,
+            disk,
+            persist: true,
+        })
     }
     fn save(&self) -> Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
         if let Some(p) = self.path.parent() {
             fs::create_dir_all(p)?
         }
@@ -95,6 +103,23 @@ impl Outbox {
         fs::rename(tmp, &self.path)?;
         fs::File::open(self.path.parent().expect("outbox parent"))?.sync_all()?;
         Ok(())
+    }
+    pub fn detached(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            disk: self.disk.clone(),
+            persist: false,
+        }
+    }
+    pub fn sync_entry_from(&mut self, other: &Self, id: &str) -> Result<()> {
+        let entry = other
+            .disk
+            .entries
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::protocol("unknown outbox id"))?;
+        self.disk.entries.insert(id.to_owned(), entry);
+        self.save()
     }
     pub fn enqueue(
         &mut self,
@@ -252,6 +277,41 @@ impl Outbox {
         self.save()
     }
 }
+
 fn age_ms(created: &str, now: u64) -> u64 {
     crate::auth::parse_time(created).map_or(u64::MAX, |t| now.saturating_sub(t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abra_core::identity::Identity;
+
+    #[test]
+    fn pending_selection_respects_backoff_and_preserves_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(root.path()).unwrap();
+        let id = outbox
+            .enqueue(
+                Identity::generate().peer_id(),
+                Hash::of(b"snapshot"),
+                b"manifest".to_vec(),
+                1_000,
+            )
+            .unwrap();
+        outbox
+            .fail_attempt(&id, "first dial failed".into(), 1_000)
+            .unwrap();
+
+        let entry = outbox.get(&id).unwrap().clone();
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.last_error.as_deref(), Some("first dial failed"));
+        assert!(!outbox.pending_ids(1_000).contains(&id));
+
+        let retry_at = crate::auth::parse_time(&entry.next_attempt_at).unwrap();
+        assert!(outbox.pending_ids(retry_at).contains(&id));
+        let unchanged = outbox.get(&id).unwrap();
+        assert_eq!(unchanged.attempts, 1);
+        assert_eq!(unchanged.last_error.as_deref(), Some("first dial failed"));
+    }
 }

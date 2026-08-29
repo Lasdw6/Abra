@@ -8,14 +8,20 @@ use abra_core::{
     manifest::{Manifest, Origin, RawManifest, Scope},
     now_ms,
 };
+#[cfg(feature = "iroh")]
+use abra_net::IrohTransport;
+#[cfg(feature = "tcp")]
 use abra_net::TcpTransport;
 use abra_net::{
-    dial_handshake, format_time, read_frame, write_frame, DeliveryNode, EnrollmentToken, Intro,
-    LoopbackNetwork, LoopbackTransport, PairAccept, PairRequest, PairTicket, Scopes, Transport,
+    dial_handshake, format_time, read_frame, write_frame, ControlAck, ControlMessage, ControlOp,
+    DeliveryNode, EnrollBind, EnrollmentToken, Intro, LocalRole, LoopbackNetwork,
+    LoopbackTransport, PairAccept, PairRequest, PairTicket, Role, Scopes, Transport, TrustedPeer,
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
@@ -47,6 +53,24 @@ pub struct RunningDaemon {
     tasks: Vec<JoinHandle<()>>,
     socket: PathBuf,
     _lock: File,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReceiveGrant {
+    id: String,
+    peer: PeerId,
+    kind: String,
+    auto_accept: bool,
+    auto_run_recipes: bool,
+    destination: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecipeProcess {
+    capsule: String,
+    snapshot: Hash,
+    pid: u32,
+    argv: Vec<String>,
 }
 
 impl RunningDaemon {
@@ -92,12 +116,76 @@ impl Daemon {
         Self::new(root, transport, yes)
     }
 
+    #[cfg(feature = "iroh")]
+    pub async fn iroh(root: impl AsRef<Path>, yes: bool) -> Result<Self> {
+        let node = DeliveryNode::open(root.as_ref())?;
+        let secret = node.store.keys.identity.secret_bytes();
+        drop(node);
+        let transport = Arc::new(IrohTransport::bind(secret).await?);
+        Self::new(root, transport, yes)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     pub async fn peer_id(&self) -> PeerId {
         self.node.lock().await.peer_id()
+    }
+
+    pub async fn join(&self, encoded: &str) -> Result<Value> {
+        let token = EnrollmentToken::parse(encoded, now_ms())?;
+        let intro = token
+            .intro
+            .iter()
+            .find(|intro| intro.peer_id == token.issuer)
+            .or_else(|| token.intro.first())
+            .ok_or("enrollment token has no intro peer")?;
+        for address in &intro.addresses {
+            self.transport.add_peer_address(intro.peer_id, address)?;
+        }
+        let mut connection = self.transport.dial(intro.peer_id).await?;
+        dial_handshake(&mut connection, self.peer_id().await, "abra".into()).await?;
+        let bind = {
+            let node = self.node.lock().await;
+            EnrollBind::sign(
+                token.clone(),
+                Some("guest".into()),
+                node.store.keys.x25519_public(),
+                &node.store.keys.identity,
+            )?
+        };
+        let (send, recv) = connection.control_mut();
+        write_frame(send, &bind).await?;
+        let ok: abra_net::EnrollOk = read_frame(recv).await?;
+        if ok.message_type != "enroll-ok"
+            || ok.certificate.guest_peer_id != self.peer_id().await
+            || intro.peer_id != token.issuer
+        {
+            return Err("invalid enrollment response".into());
+        }
+        ok.certificate.verify(token.issuer)?;
+        let mut node = self.node.lock().await;
+        node.trust.insert(TrustedPeer {
+            peer_id: intro.peer_id,
+            name: intro.name.clone(),
+            role: Role::Full,
+            x25519_pk: intro.x25519_pk,
+            token_id: None,
+            scopes: None,
+            expires_at: None,
+        })?;
+        for peer in ok.mesh {
+            if peer.role == Role::Full {
+                node.trust.insert(peer)?;
+            }
+        }
+        node.trust.set_local_role(LocalRole::Guest {
+            token: Box::new(token.clone()),
+        })?;
+        Ok(
+            json!({"joined":true,"issuer":token.issuer,"token_id":token.token_id,"scopes":token.scopes}),
+        )
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<RunningDaemon> {
@@ -171,15 +259,30 @@ impl Daemon {
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        if let Err(error) = daemon.renew_leases().await {
+                            eprintln!("cadabra: lease renewal error: {error}");
+                        }
+                    }
+                }
+            }
+        }));
+        let daemon = Arc::clone(self);
+        let mut stop = self.shutdown.subscribe();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.changed() => break,
                     incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
-                        let root = daemon.root.clone();
-                        let yes = daemon.yes;
+                        let daemon = Arc::clone(&daemon);
                         tokio::spawn(async move {
-                            match DeliveryNode::open(root) {
+                            match DeliveryNode::open(&daemon.root) {
                                 Ok(mut node) => {
-                                    node.auto_confirm_pairs = yes;
+                                    node.auto_confirm_pairs = daemon.yes;
                                     if let Err(error) = node.handle_connection(&mut connection, now_ms()).await {
                                         eprintln!("cadabra: incoming session error: {error}");
+                                    } else if let Err(error) = daemon.apply_receive_grants().await {
+                                        eprintln!("cadabra: receive policy error: {error}");
                                     }
                                 }
                                 Err(error) => eprintln!("cadabra: session store error: {error}"),
@@ -215,15 +318,22 @@ impl Daemon {
                 None => continue,
             };
             match self.transport.dial(peer).await {
-                Ok(mut connection) => match DeliveryNode::open(&self.root) {
-                    Ok(mut session) => {
-                        if let Err(error) = session.send_offer(&id, &mut connection, now_ms()).await
-                        {
-                            eprintln!("cadabra: outgoing session error: {error}");
-                        }
+                Ok(mut connection) => {
+                    let mut session = self.node.lock().await.outgoing_session();
+                    let result = session.send_offer(&id, &mut connection, now_ms()).await;
+                    if let Err(error) = &result {
+                        eprintln!("cadabra: outgoing session error: {error}");
                     }
-                    Err(error) => eprintln!("cadabra: session store error: {error}"),
-                },
+                    if let Err(error) = self
+                        .node
+                        .lock()
+                        .await
+                        .outbox
+                        .sync_entry_from(&session.outbox, &id)
+                    {
+                        eprintln!("cadabra: outbox session merge error: {error}");
+                    }
+                }
                 Err(error) => {
                     let _ = self.node.lock().await.outbox.fail_attempt(
                         &id,
@@ -258,6 +368,17 @@ impl Daemon {
             if read == 0 {
                 break;
             }
+            if bytes.len() as u64 <= MAX_CONTROL_LINE && bytes.ends_with(b"\n") {
+                if let Ok(request) = serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]) {
+                    if request.get("op").and_then(Value::as_str) == Some("watch") {
+                        write
+                            .write_all(b"{\"ok\":true,\"result\":{\"watching\":true}}\n")
+                            .await?;
+                        self.serve_watch(&mut write).await?;
+                        return Ok(());
+                    }
+                }
+            }
             let response = if bytes.len() as u64 > MAX_CONTROL_LINE || !bytes.ends_with(b"\n") {
                 json!({"ok":false,"error":"request too large"})
             } else if let Ok(line) = std::str::from_utf8(&bytes[..bytes.len() - 1]) {
@@ -280,6 +401,26 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    async fn serve_watch(&self, write: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+        let path = self.root.join("net/events.ndjson");
+        let mut sent = 0usize;
+        let mut shutdown = self.shutdown.subscribe();
+        loop {
+            let bytes = fs::read(&path).unwrap_or_default();
+            if bytes.len() < sent {
+                sent = 0;
+            }
+            if bytes.len() > sent {
+                write.write_all(&bytes[sent..]).await?;
+                sent = bytes.len();
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
     }
 
     /// Execute one control request. This is also the in-process test API.
@@ -350,6 +491,29 @@ impl Daemon {
             "accept" => self.accept(&request).await,
             "log" => self.log(&request).await,
             "enroll-mint" => self.enroll(&request).await,
+            "enroll-join" => self.join(required_str(&request, "token")?).await,
+            "revoke" => {
+                let token_id = required_str(&request, "token_id")?;
+                self.node.lock().await.trust.revoke_token(token_id)?;
+                Ok(json!({"revoked":token_id}))
+            }
+            "policy-grant" => self.policy_grant(&request).await,
+            "policy-list" => Ok(serde_json::to_value(self.load_grants()?)?),
+            "policy-revoke" => {
+                let id = required_str(&request, "id")?;
+                let mut grants = self.load_grants()?;
+                if grants.remove(id).is_none() {
+                    return Err("unknown policy grant".into());
+                }
+                self.save_grants(&grants)?;
+                Ok(json!({"revoked":id}))
+            }
+            "ps" => Ok(serde_json::to_value(self.load_processes()?)?),
+            "stop-recipes" => self.stop_recipes(required_str(&request, "capsule")?),
+            "events" => self.events(),
+            "control" => self.send_control(&request).await,
+            "lease-status" => self.lease_status(&request).await,
+            "lease-take" => self.lease_take(&request).await,
             "outbox" => {
                 let node = self.node.lock().await;
                 Ok(serde_json::to_value(
@@ -555,9 +719,7 @@ impl Daemon {
     async fn accept(&self, request: &Value) -> Result<Value> {
         let id: Hash = required_str(request, "id")?.parse()?;
         let destination = Path::new(required_str(request, "to")?);
-        if !destination.is_absolute() {
-            return Err("accept destination must be absolute".into());
-        }
+        validate_destination(destination)?;
         let mut node = self.node.lock().await;
         if let Some(entry) = node.store.inbox.get(&id).cloned() {
             let raw = RawManifest::parse(entry.manifest)?;
@@ -628,6 +790,8 @@ impl Daemon {
             vec![Intro {
                 peer_id: node.peer_id(),
                 name: "device".into(),
+                x25519_pk: node.store.keys.x25519_public(),
+                addresses: self.transport.local_addresses(),
             }],
             None,
             scopes,
@@ -640,6 +804,310 @@ impl Daemon {
         )?;
         Ok(json!({"token":token.encode()?}))
     }
+
+    fn grants_path(&self) -> PathBuf {
+        self.root.join("policy/grants.json")
+    }
+    fn processes_path(&self) -> PathBuf {
+        self.root.join("policy/processes.json")
+    }
+    fn load_grants(&self) -> Result<BTreeMap<String, ReceiveGrant>> {
+        match fs::read(self.grants_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn save_grants(&self, grants: &BTreeMap<String, ReceiveGrant>) -> Result<()> {
+        let path = self.grants_path();
+        fs::create_dir_all(path.parent().expect("policy parent"))?;
+        fs::write(path, serde_json::to_vec(grants)?)?;
+        Ok(())
+    }
+    async fn policy_grant(&self, request: &Value) -> Result<Value> {
+        let peer: PeerId = required_str(request, "peer")?.parse()?;
+        let kind = required_str(request, "kind")?.to_owned();
+        let auto_accept = request
+            .get("auto_accept")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let auto_run_recipes = request
+            .get("auto_run_recipes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if auto_run_recipes && !auto_accept {
+            return Err("auto-run-recipes requires auto-accept".into());
+        }
+        let destination = request.get("to").and_then(Value::as_str).map(PathBuf::from);
+        if auto_accept {
+            validate_destination(destination.as_deref().ok_or("auto-accept requires --to")?)?;
+        }
+        let id = format!("{}:{}", peer, kind);
+        let grant = ReceiveGrant {
+            id: id.clone(),
+            peer,
+            kind,
+            auto_accept,
+            auto_run_recipes,
+            destination,
+        };
+        let mut grants = self.load_grants()?;
+        grants.insert(id.clone(), grant.clone());
+        self.save_grants(&grants)?;
+        Ok(serde_json::to_value(grant)?)
+    }
+    async fn apply_receive_grants(&self) -> Result<()> {
+        let grants = self.load_grants()?;
+        if grants.is_empty() {
+            return Ok(());
+        }
+        let mut node = DeliveryNode::open(&self.root)?;
+        let unread = node
+            .store
+            .inbox
+            .values()
+            .filter(|entry| !entry.read)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in unread {
+            let raw = RawManifest::parse(entry.manifest.clone())?;
+            let from: PeerId = entry.from.parse()?;
+            let Some(grant) = grants
+                .values()
+                .find(|g| g.peer == from && g.kind == raw.manifest().kind)
+            else {
+                continue;
+            };
+            if !grant.auto_accept {
+                continue;
+            }
+            let destination = grant
+                .destination
+                .as_deref()
+                .ok_or("grant lacks destination")?;
+            validate_destination(destination)?;
+            if let Some(files) = raw.manifest().files {
+                materialize(&node.store.cas, &files, destination)?;
+            }
+            node.store.mark_inbox_read(entry.snapshot_id)?;
+            if grant.auto_run_recipes {
+                for recipe in raw.manifest().recipes.clone().unwrap_or_default() {
+                    if recipe.argv.is_empty() {
+                        continue;
+                    }
+                    let cwd = safe_recipe_cwd(destination, &recipe.cwd)?;
+                    let mut command = std::process::Command::new(&recipe.argv[0]);
+                    command
+                        .args(&recipe.argv[1..])
+                        .current_dir(cwd)
+                        .envs(&recipe.env);
+                    let child = command.spawn()?;
+                    let capsule = raw
+                        .manifest()
+                        .capsule_id
+                        .unwrap_or(entry.snapshot_id)
+                        .to_hex();
+                    let mut processes = self.load_processes()?;
+                    processes.push(RecipeProcess {
+                        capsule,
+                        snapshot: entry.snapshot_id,
+                        pid: child.id(),
+                        argv: recipe.argv,
+                    });
+                    self.save_processes(&processes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn load_processes(&self) -> Result<Vec<RecipeProcess>> {
+        match fs::read(self.processes_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn save_processes(&self, processes: &[RecipeProcess]) -> Result<()> {
+        let path = self.processes_path();
+        fs::create_dir_all(path.parent().expect("policy parent"))?;
+        fs::write(path, serde_json::to_vec(processes)?)?;
+        Ok(())
+    }
+    fn stop_recipes(&self, capsule: &str) -> Result<Value> {
+        let mut processes = self.load_processes()?;
+        let mut stopped = Vec::new();
+        processes.retain(|process| {
+            if process.capsule == capsule {
+                #[cfg(unix)]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &process.pid.to_string()])
+                        .status();
+                }
+                stopped.push(process.pid);
+                false
+            } else {
+                true
+            }
+        });
+        self.save_processes(&processes)?;
+        Ok(json!({"capsule":capsule,"stopped":stopped}))
+    }
+    fn events(&self) -> Result<Value> {
+        let path = self.root.join("net/events.ndjson");
+        let text = fs::read_to_string(path).unwrap_or_default();
+        Ok(Value::Array(
+            text.lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        ))
+    }
+    async fn lease_status(&self, request: &Value) -> Result<Value> {
+        let capsule: Hash = required_str(request, "capsule")?.parse()?;
+        let node = self.node.lock().await;
+        let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
+        Ok(
+            json!({"capsule":capsule,"winning":cap.winning_lease(),"active":cap.active_lease(now_ms()).is_some()}),
+        )
+    }
+    async fn lease_take(&self, request: &Value) -> Result<Value> {
+        let capsule: Hash = required_str(request, "capsule")?.parse()?;
+        let mut node = self.node.lock().await;
+        let previous = node
+            .store
+            .capsules
+            .get(&capsule)
+            .and_then(|c| c.winning_lease())
+            .cloned()
+            .ok_or("capsule lacks lease")?;
+        let local = node.peer_id();
+        if !matches!(node.trust.local_role(), LocalRole::Full) {
+            node.trust.authorize_lease(local, true, now_ms())?;
+        }
+        let now = now_ms();
+        let record = LeaseRecord::new(
+            capsule,
+            local,
+            previous.epoch + 1,
+            LeaseMode::Takeover,
+            format_time(now),
+            format_time(now + 86_400_000),
+            previous.hash()?,
+            &node.store.keys.identity,
+        )?;
+        node.store
+            .accept_lease(capsule, record.clone(), &|peer, _| peer == local)?;
+        record_event_file(
+            &self.root,
+            &json!({"event":"lease-change","capsule":capsule,"lease":record}),
+        )?;
+        Ok(serde_json::to_value(record)?)
+    }
+    async fn renew_leases(&self) -> Result<()> {
+        let mut node = DeliveryNode::open(&self.root)?;
+        let local = node.peer_id();
+        let now = now_ms();
+        let candidates = node
+            .store
+            .capsules
+            .iter()
+            .filter_map(|(id, cap)| {
+                let lease = cap.winning_lease()?;
+                let expires = abra_net::parse_time(&lease.expires_at).ok()?;
+                (lease.holder == local && expires <= now + 300_000).then_some((*id, lease.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (capsule, previous) in candidates {
+            let record = LeaseRecord::new(
+                capsule,
+                local,
+                previous.epoch + 1,
+                LeaseMode::Refresh,
+                format_time(now),
+                format_time(now + 86_400_000),
+                previous.hash()?,
+                &node.store.keys.identity,
+            )?;
+            node.store
+                .accept_lease(capsule, record.clone(), &|peer, _| peer == local)?;
+            record_event_file(
+                &self.root,
+                &json!({"event":"lease-change","capsule":capsule,"lease":record}),
+            )?;
+        }
+        Ok(())
+    }
+    async fn send_control(&self, request: &Value) -> Result<Value> {
+        let peer: PeerId = required_str(request, "peer")?.parse()?;
+        let capsule: Hash = required_str(request, "capsule")?.parse()?;
+        let op = match required_str(request, "control_op")? {
+            "pause" => ControlOp::Pause,
+            "stop" => ControlOp::Stop,
+            "instruct" => ControlOp::Instruct,
+            _ => return Err("control op must be pause, stop, or instruct".into()),
+        };
+        let text = request
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let message = {
+            let node = self.node.lock().await;
+            ControlMessage::new(
+                capsule,
+                op,
+                text,
+                now_ms(),
+                rand::thread_rng().gen(),
+                &node.store.keys.identity,
+            )?
+        };
+        let mut connection = self.transport.dial(peer).await?;
+        dial_handshake(&mut connection, self.peer_id().await, "abra".into()).await?;
+        let (send, recv) = connection.control_mut();
+        write_frame(send, &message).await?;
+        let ack: ControlAck = read_frame(recv).await?;
+        if !ack.ok {
+            return Err(ack
+                .error
+                .unwrap_or_else(|| "control rejected".into())
+                .into());
+        }
+        Ok(serde_json::to_value(ack)?)
+    }
+}
+
+fn validate_destination(destination: &Path) -> Result<()> {
+    if !destination.is_absolute() {
+        return Err("destination must be absolute".into());
+    }
+    if fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("destination is a symlink".into());
+    }
+    Ok(())
+}
+
+fn safe_recipe_cwd(root: &Path, cwd: &str) -> Result<PathBuf> {
+    let relative = Path::new(cwd);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("recipe cwd escapes materialized root".into());
+    }
+    let path = root.join(relative);
+    validate_destination(&path)?;
+    Ok(path)
+}
+
+fn record_event_file(root: &Path, value: &Value) -> Result<()> {
+    use std::io::Write;
+    let path = root.join("net/events.ndjson");
+    fs::create_dir_all(path.parent().expect("event parent"))?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    Ok(())
 }
 
 fn base_manifest(node: &DeliveryNode, scope: Scope, kind: &str, title: &str) -> Manifest {

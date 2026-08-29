@@ -47,6 +47,7 @@ struct SnapshotMeta {
     received_at: String,
 }
 
+#[derive(Clone)]
 pub struct AbraStore {
     root: PathBuf,
     pub cas: BlobStore,

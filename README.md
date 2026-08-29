@@ -1,8 +1,7 @@
 Abra is infrastructure for teleportation.
 
-Abra moves files, workspaces, and app state between one user's devices and their
-cloud agents. It is pure transport and materialization: it carries bytes and
-structure, and it executes nothing.
+Abra moves typed snapshots between trusted peers. The default iroh transport is
+end-to-end encrypted over QUIC/TLS.
 
 The core principle is **carry the data, don't prescribe the experience**. A
 snapshot carries the maximal amount of structured, parsable data about what it
@@ -13,10 +12,8 @@ sync a workspace, resume a sandbox. The sender authors nothing extra.
 
 - **Snapshot** is the noun: a typed, self-describing, content-addressed bundle.
   Its manifest is always JSON — a snapshot is never an opaque blob.
-- **Teleport** is the verb: moving a snapshot within one user's device mesh over
-  an authenticated transport. (v0.1 caveat: the default TCP transport is
-  authenticated but not yet encrypted — on-wire confidentiality currently
-  requires the optional iroh transport or a private link. See DESIGN.md.)
+- **Teleport** is the verb: moving a snapshot within a trusted mesh over the
+  authenticated, encrypted iroh transport.
 - **Capsule** is a continuing thing (a workspace, a sandbox) with a history DAG
   of snapshots. A **lease** says which device is currently driving it.
 - **Scope** splits the one envelope format two ways. `full` is a new version of
@@ -83,10 +80,21 @@ Without `--yes`, leave `pair add` running, inspect `pair pending` on the ticket
 issuer, and run `pair confirm <peer-id>`. Confirmation completes the existing
 bootstrap connection; the joiner does not retry the ticket.
 
+For a scoped guest, mint explicit scopes on the full peer and redeem the token:
+
+```console
+$ TOKEN=$(target/debug/abra --root /tmp/abra-a enroll --capsule <id> --kind <kind> --ttl 1d --send --receive | head -1)
+$ target/debug/abra --root /tmp/abra-b daemon --token "$TOKEN"
+```
+
+Human-mode enrollment also prints `abra://join/<token>`. `abra join <token>`
+redeems through an already-running daemon. TCP is retained explicitly as
+`daemon --transport tcp`; it is authenticated but not encrypted.
+
 ## Status
 
-Stages 1–3 include local primitives, authenticated TCP transport in the shipped binaries,
-durable delivery, the daemon, CLI, and cross-process tests. Capability web
+Stages 1–4 include local primitives, encrypted iroh transport, scoped guests,
+receive grants, durable delivery, the daemon, CLI, and cross-process tests. Capability web
 viewers and external adapter implementations remain out of scope.
 
 ## Building

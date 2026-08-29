@@ -353,9 +353,7 @@ impl Capsule {
                 ));
             }
             let writer = m.origin.peer_id;
-            let forked = !self
-                .active_lease(now_ms)
-                .is_some_and(|l| l.holder == writer);
+            let forked = self.active_lease(now_ms).is_none_or(|l| l.holder != writer);
             return Ok(WriteResult {
                 snapshot_id: id,
                 forked,
@@ -434,11 +432,7 @@ impl Capsule {
             if op.by != w.holder || op.lease_epoch != w.epoch {
                 return Err(Error::invalid("unauthorized main move"));
             }
-            if !self
-                .snapshots
-                .get(&op.snapshot_id)
-                .is_some_and(|r| !r.orphan)
-            {
+            if self.snapshots.get(&op.snapshot_id).is_none_or(|r| r.orphan) {
                 return Err(Error::invalid("main target missing or orphan"));
             }
         } else if op.name.starts_with("fork/") {

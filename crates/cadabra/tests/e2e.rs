@@ -26,6 +26,40 @@ where
 }
 
 #[tokio::test]
+async fn auto_confirm_pairing_persists_both_trust_stores() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_id = a.peer_id().await;
+    let b_id = b.peer_id().await;
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+
+    let ticket = b.handle(json!({"op":"pair-ticket"})).await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handle(json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+
+    for (root, expected) in [(a_root.path(), b_id), (b_root.path(), a_id)] {
+        let trust: Value =
+            serde_json::from_slice(&fs::read(root.join("net/trust.json")).unwrap()).unwrap();
+        assert!(trust["peers"].get(expected.to_hex()).is_some());
+        assert!(trust["awaiting_pair_confirm"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
 async fn daemons_pair_sync_handoff_and_resume_outbox() {
     let network = LoopbackNetwork::default();
     let a_root = tempfile::tempdir().unwrap();

@@ -362,7 +362,7 @@ pub struct IrohTransport {
 #[cfg(feature = "iroh")]
 impl IrohTransport {
     pub async fn bind(secret: [u8; 32]) -> Result<Self> {
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(iroh::SecretKey::from_bytes(&secret))
             .alpns(vec![crate::ALPN.to_vec()])
             .bind()

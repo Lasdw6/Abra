@@ -21,7 +21,14 @@ fn uds_rejects_oversize_line() {
     let root = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_abra");
     let child = Command::new(binary)
-        .args(["--root", root.path().to_str().unwrap(), "daemon", "--yes"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "daemon",
+            "--yes",
+            "--transport",
+            "tcp",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -48,7 +55,14 @@ fn real_cli_round_trips_status_over_uds() {
     let root = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_abra");
     let child = Command::new(binary)
-        .args(["--root", root.path().to_str().unwrap(), "daemon", "--yes"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "daemon",
+            "--yes",
+            "--transport",
+            "tcp",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

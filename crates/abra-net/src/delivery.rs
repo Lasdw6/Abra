@@ -200,6 +200,7 @@ pub struct DeliveryNode {
     pending_ack_dir: PathBuf,
     pending_pair_dir: PathBuf,
     approved_pair_dir: PathBuf,
+    event_log: PathBuf,
 }
 impl DeliveryNode {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -216,10 +217,29 @@ impl DeliveryNode {
             pending_ack_dir: root.join("net/pending-acks"),
             pending_pair_dir: root.join("net/pending-pairs"),
             approved_pair_dir: root.join("net/approved-pairs"),
+            event_log: root.join("net/events.ndjson"),
         })
     }
     pub fn peer_id(&self) -> PeerId {
         self.store.keys.identity.peer_id()
+    }
+    /// Snapshot the immutable delivery inputs and a detached copy of outbox
+    /// state so a daemon can perform network I/O without holding its node lock.
+    pub fn outgoing_session(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            trust: self.trust.clone(),
+            outbox: self.outbox.detached(),
+            allow_agent_send: self.allow_agent_send,
+            auto_confirm_pairs: self.auto_confirm_pairs,
+            pending_pair_requests: self.pending_pair_requests.clone(),
+            approved_pair_requests: self.approved_pair_requests.clone(),
+            partial_dir: self.partial_dir.clone(),
+            pending_ack_dir: self.pending_ack_dir.clone(),
+            pending_pair_dir: self.pending_pair_dir.clone(),
+            approved_pair_dir: self.approved_pair_dir.clone(),
+            event_log: self.event_log.clone(),
+        }
     }
     pub fn approve_pair(&self, peer: PeerId) -> Result<()> {
         fs::create_dir_all(&self.approved_pair_dir)?;
@@ -312,7 +332,8 @@ impl DeliveryNode {
             let _ = fs::remove_file(p);
             return Err(Error::protocol("object hash mismatch"));
         }
-        self.store.cas.put(&b)?;
+        let staged = abra_core::cas::BlobStore::open(self.partial_dir.join(offer).join("staged"))?;
+        staged.put(&b)?;
         fs::remove_file(p)?;
         Ok(())
     }
@@ -335,6 +356,27 @@ impl DeliveryNode {
         fs::OpenOptions::new().read(true).open(&tmp)?.sync_all()?;
         fs::rename(tmp, path)?;
         fs::File::open(&self.pending_ack_dir)?.sync_all()?;
+        Ok(())
+    }
+    fn clear_pending_ack(&self, offer: &str) -> Result<()> {
+        match fs::remove_file(self.pending_ack_path(offer)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn record_event(&self, value: &serde_json::Value) -> Result<()> {
+        use std::io::Write;
+        if let Some(parent) = self.event_log.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.event_log)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
         Ok(())
     }
     pub fn pending_acks(&self) -> Result<Vec<Ack>> {
@@ -406,7 +448,7 @@ impl DeliveryNode {
                     .as_deref()
                     .map(crate::auth::parse_time)
                     .transpose()?
-                    .map_or(true, |end| now > end)
+                    .is_none_or(|end| now > end)
                 || !sender
                     .scopes
                     .as_ref()
@@ -419,7 +461,7 @@ impl DeliveryNode {
             if self
                 .trust
                 .get(&from)
-                .map_or(true, |p| p.role != crate::Role::Full)
+                .is_none_or(|p| p.role != crate::Role::Full)
             {
                 return Err(Error::authz(
                     "guest-to-guest or unknown counterparty forbidden",
@@ -442,6 +484,11 @@ impl DeliveryNode {
         connection: &mut Connection,
         now: u64,
     ) -> Result<DeliveryOutcome> {
+        if self.outbox.get(id).is_some_and(|entry| {
+            crate::auth::parse_time(&entry.next_attempt_at).is_ok_and(|at| at > now)
+        }) {
+            return Err(Error::protocol("outbox backoff active"));
+        }
         let result = self.send_offer_inner(id, connection, now, None).await;
         if let Err(error) = &result {
             let _ = self.outbox.fail_attempt(id, error.to_string(), now);
@@ -757,6 +804,12 @@ impl DeliveryNode {
                         write_frame(send, &have).await?;
                     }
                     let have_set: BTreeSet<Hash> = have.have.iter().copied().collect();
+                    let staged = abra_core::cas::BlobStore::open(
+                        self.partial_dir.join(&offer.offer_id).join("staged"),
+                    )?;
+                    for digest in &have_set {
+                        staged.put(&self.store.cas.get(digest)?)?;
+                    }
                     for _ in 0..plan
                         .objects
                         .iter()
@@ -802,9 +855,15 @@ impl DeliveryNode {
                             self.commit_partial(&offer.offer_id, header.digest)?;
                         }
                     }
-                    let actual = closure(&self.store.cas, raw.manifest())?;
-                    if actual.iter().any(|h| !self.store.cas.has(h)) {
-                        return Err(Error::protocol("incomplete verified closure"));
+                    let actual = closure(&staged, raw.manifest())?;
+                    let planned = allowed.keys().copied().collect::<BTreeSet<_>>();
+                    if actual != planned {
+                        return Err(Error::protocol(
+                            "plan differs from verified manifest closure",
+                        ));
+                    }
+                    for digest in &actual {
+                        self.store.cas.put(&staged.get(digest)?)?;
                     }
                     if raw.manifest().scope == Scope::Full {
                         let capsule_id = raw.manifest().capsule_id.expect("validated");
@@ -833,6 +892,8 @@ impl DeliveryNode {
                     self.persist_pending_ack(&ack)?;
                     let (send, _) = connection.control_mut();
                     write_frame(send, &ack).await?;
+                    self.clear_pending_ack(&ack.offer_id)?;
+                    self.record_event(&serde_json::json!({"event":"inbox-arrival","snapshot_id":ack.snapshot_id,"from":connection.peer_id(),"at":ack.received_at}))?;
                     self.clear_partials(&ack.offer_id)?;
                 }
                 "ack" => {
@@ -850,6 +911,9 @@ impl DeliveryNode {
                 "control" => {
                     let msg: crate::ControlMessage = serde_json::from_value(value)?;
                     let result = msg.verify_and_record(connection.peer_id(), &mut self.trust, now);
+                    if result.is_ok() {
+                        self.record_event(&serde_json::json!({"event":"control","from":connection.peer_id(),"message":msg}))?;
+                    }
                     let reply = crate::ControlAck {
                         message_type: "control-ack".into(),
                         nonce: msg.nonce,
@@ -892,6 +956,7 @@ impl DeliveryNode {
                         &request,
                         connection.peer_id(),
                         now,
+                        self.auto_confirm_pairs,
                         |_, _| approved,
                     );
                     let _ = fs::remove_file(&pending_path);
@@ -903,6 +968,22 @@ impl DeliveryNode {
                 "pair-confirm" => {
                     let confirm = serde_json::from_value(value)?;
                     self.trust.confirm_pair(&confirm, connection.peer_id())?;
+                }
+                "enroll-bind" => {
+                    let bind: crate::EnrollBind = serde_json::from_value(value)?;
+                    let secret = self.store.keys.identity.secret_bytes();
+                    let issuer = Identity::from_secret_bytes(&secret);
+                    let certificate =
+                        self.trust
+                            .bind_enrollment(&bind, connection.peer_id(), now, &issuer)?;
+                    let mesh = self.trust.peers().values().cloned().collect();
+                    let reply = crate::EnrollOk {
+                        message_type: "enroll-ok".into(),
+                        mesh,
+                        certificate,
+                    };
+                    let (send, _) = connection.control_mut();
+                    write_frame(send, &reply).await?;
                 }
                 _ => {
                     let error = ProtocolError {

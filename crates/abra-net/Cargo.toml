@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
-# Reserved for the iroh 1.x adapter. See DESIGN.md.
+default = ["iroh", "tcp"]
 iroh = ["dep:iroh"]
+tcp = []
 
 [dependencies]
 abra-core.workspace = true

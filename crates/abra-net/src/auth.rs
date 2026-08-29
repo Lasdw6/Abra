@@ -69,7 +69,7 @@ fn unsigned<T: Serialize>(x: &T, field: &str) -> Result<Vec<u8>> {
         .remove(field);
     Ok(canonical::to_vec(&v)?)
 }
-pub(crate) fn parse_time(s: &str) -> Result<u64> {
+pub fn parse_time(s: &str) -> Result<u64> {
     let b = s.as_bytes();
     if b.len() != 24
         || !b.is_ascii()
@@ -184,7 +184,7 @@ impl Scopes {
     }
     pub fn allows(&self, capsule: Option<Hash>, kind: &str, direction: Direction) -> bool {
         Self::list_allows(&self.kinds, kind)
-            && capsule.map_or(true, |c| Self::list_allows(&self.capsules, &c.to_hex()))
+            && capsule.is_none_or(|c| Self::list_allows(&self.capsules, &c.to_hex()))
             && match direction {
                 Direction::Send => self.send,
                 Direction::Receive => self.receive,
@@ -209,7 +209,7 @@ pub struct TrustedPeer {
     pub expires_at: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct TrustDisk {
     #[serde(default)]
     local_role: LocalRole,
@@ -223,6 +223,7 @@ struct TrustDisk {
     revocations: BTreeMap<String, RevocationRecord>,
     control_nonces: BTreeMap<String, u64>,
 }
+#[derive(Clone)]
 pub struct TrustStore {
     path: PathBuf,
     disk: TrustDisk,
@@ -276,6 +277,7 @@ impl TrustStore {
         request: &PairRequest,
         authenticated: PeerId,
         now: u64,
+        confirm_immediately: bool,
         confirm: F,
     ) -> Result<PairAccept>
     where
@@ -304,18 +306,22 @@ impl TrustStore {
         }
         self.disk.used_tickets.insert(request.ticket_id.clone());
         self.disk.pending_tickets.remove(&request.ticket_id);
-        self.disk.awaiting_pair_confirm.insert(
-            request.ticket_id.clone(),
-            TrustedPeer {
-                peer_id: request.peer_id,
-                name: request.name.clone(),
-                role: Role::Full,
-                x25519_pk: request.x25519_pk,
-                token_id: None,
-                scopes: None,
-                expires_at: None,
-            },
-        );
+        let peer = TrustedPeer {
+            peer_id: request.peer_id,
+            name: request.name.clone(),
+            role: Role::Full,
+            x25519_pk: request.x25519_pk,
+            token_id: None,
+            scopes: None,
+            expires_at: None,
+        };
+        if confirm_immediately {
+            self.disk.peers.insert(peer.peer_id, peer);
+        } else {
+            self.disk
+                .awaiting_pair_confirm
+                .insert(request.ticket_id.clone(), peer);
+        }
         self.save()?;
         Ok(PairAccept {
             message_type: "pair-accept".into(),
@@ -325,11 +331,13 @@ impl TrustStore {
         })
     }
     pub fn confirm_pair(&mut self, confirm: &PairConfirm, authenticated: PeerId) -> Result<()> {
-        let peer = self
-            .disk
-            .awaiting_pair_confirm
-            .remove(&confirm.ticket_id)
-            .ok_or_else(|| Error::authz("pair confirmation is not pending"))?;
+        let Some(peer) = self.disk.awaiting_pair_confirm.remove(&confirm.ticket_id) else {
+            return if self.disk.peers.contains_key(&authenticated) {
+                Ok(())
+            } else {
+                Err(Error::authz("pair confirmation is not pending"))
+            };
+        };
         if peer.peer_id != authenticated {
             return Err(Error::Authentication(
                 "pair confirmation differs from transport".into(),
@@ -528,7 +536,7 @@ impl TrustStore {
                 .as_deref()
                 .map(parse_time)
                 .transpose()?
-                .map_or(true, |e| now > e)
+                .is_none_or(|e| now > e)
             {
                 return Err(Error::authz("token expired"));
             }
@@ -583,7 +591,7 @@ impl TrustStore {
             .as_deref()
             .map(parse_time)
             .transpose()?
-            .map_or(true, |e| now > e)
+            .is_none_or(|e| now > e)
         {
             return Err(Error::authz("token expired"));
         }
@@ -762,6 +770,18 @@ pub struct PairConfirm {
 pub struct Intro {
     pub peer_id: PeerId,
     pub name: String,
+    #[serde(with = "hex32")]
+    pub x25519_pk: [u8; 32],
+    pub addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollOk {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub mesh: Vec<TrustedPeer>,
+    pub certificate: BindCertificate,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

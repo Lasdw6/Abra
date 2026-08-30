@@ -250,6 +250,84 @@ async fn control_inbox_reads_partial_committed_by_inbound_session() {
 }
 
 #[tokio::test]
+async fn control_lease_ops_see_capsule_committed_after_daemon_start() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+
+    let unknown = "00".repeat(32);
+    let log_error = control_call(b_root.path(), &json!({"op":"log","capsule":unknown}))
+        .await
+        .unwrap_err();
+    assert_eq!(log_error.to_string(), "unknown capsule");
+    let lease_error = control_call(
+        b_root.path(),
+        &json!({"op":"lease-status","capsule":unknown}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(lease_error.to_string(), "unknown capsule");
+
+    let ticket = control_call(b_root.path(), &json!({"op":"pair-ticket"}))
+        .await
+        .unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    control_call(a_root.path(), &json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+
+    let workspace = a_root.path().join("late-capsule");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "one").unwrap();
+    let created = control_call(
+        a_root.path(),
+        &json!({"op":"capsule-create","path":workspace}),
+    )
+    .await
+    .unwrap();
+    let capsule = created["capsule_id"].clone();
+    let snapshot = control_call(a_root.path(), &json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    control_call(
+        a_root.path(),
+        &json!({"op":"send","peer":b.peer_id().await,"snapshot_id":snapshot["snapshot_id"]}),
+    )
+    .await
+    .unwrap();
+
+    wait_for(|| async {
+        let log = control_call(b_root.path(), &json!({"op":"log","capsule":capsule})).await?;
+        (!log.as_array().unwrap().is_empty())
+            .then_some(log)
+            .ok_or_else(|| "capsule not committed".into())
+    })
+    .await;
+
+    let status = control_call(
+        b_root.path(),
+        &json!({"op":"lease-status","capsule":capsule}),
+    )
+    .await
+    .unwrap();
+    assert!(status["winning"].is_object());
+    let taken = control_call(b_root.path(), &json!({"op":"lease-take","capsule":capsule}))
+        .await
+        .unwrap();
+    assert_eq!(taken["epoch"], 2);
+    assert_eq!(taken["holder"], b.peer_id().await.to_string());
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
 async fn daemons_pair_sync_handoff_and_resume_outbox() {
     let network = LoopbackNetwork::default();
     let a_root = tempfile::tempdir().unwrap();

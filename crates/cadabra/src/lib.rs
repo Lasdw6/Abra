@@ -624,6 +624,7 @@ impl Daemon {
             .unwrap_or("workspace")
             .to_string();
         let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
         let id = random_capsule_id();
         let at = format_time(now_ms());
         let genesis = Genesis::new(
@@ -656,6 +657,7 @@ impl Daemon {
         }
         let capsule = read_capsule_id(&path)?;
         let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
         let files = snapshot_dir(&node.store.cas, &path)?;
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
         let parents = cap
@@ -718,6 +720,7 @@ impl Daemon {
     async fn send(&self, request: &Value) -> Result<Value> {
         let peer: PeerId = required_str(request, "peer")?.parse()?;
         let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
         let raw = if let Some(id) = request.get("snapshot_id").and_then(Value::as_str) {
             find_snapshot_or_capsule_head(&node, id)?
         } else if let Some(link) = request.get("link").and_then(Value::as_str) {
@@ -982,7 +985,7 @@ impl Daemon {
     }
     async fn lease_status(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
-        let node = self.node.lock().await;
+        let node = self.fresh_node()?;
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
         Ok(
             json!({"capsule":capsule,"winning":cap.winning_lease(),"active":cap.active_lease(now_ms()).is_some()}),
@@ -991,11 +994,13 @@ impl Daemon {
     async fn lease_take(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
         let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
         let previous = node
             .store
             .capsules
             .get(&capsule)
-            .and_then(|c| c.winning_lease())
+            .ok_or("unknown capsule")?
+            .winning_lease()
             .cloned()
             .ok_or("capsule lacks lease")?;
         let local = node.peer_id();
@@ -1069,7 +1074,10 @@ impl Daemon {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let message = {
-            let node = self.node.lock().await;
+            let node = self.fresh_node()?;
+            if !node.store.capsules.contains_key(&capsule) {
+                return Err("unknown capsule".into());
+            }
             ControlMessage::new(
                 capsule,
                 op,

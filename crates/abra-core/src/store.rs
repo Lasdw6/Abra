@@ -394,14 +394,6 @@ impl AbraStore {
             .ok_or_else(|| Error::invalid("genesis lacks epoch-1 grant"))?;
         let grant = leases.remove(grant_pos);
         let mut capsule = Capsule::new(genesis.clone(), grant)?;
-        for lease in leases {
-            if let Err(error) = capsule.accept_lease(lease, &|_, _| true) {
-                eprintln!(
-                    "abra-core: skipping invalid lease in {}: {error}",
-                    dir.display()
-                );
-            }
-        }
         let mut snapshots = Vec::new();
         if let Ok(entries) = fs::read_dir(dir.join("snapshots")) {
             for entry in entries.flatten() {
@@ -442,10 +434,33 @@ impl AbraStore {
                 );
             }
         }
-        for op in read_records::<LabelOp>(&dir.join("labels"))? {
+        let mut labels = read_records::<LabelOp>(&dir.join("labels"))?;
+        labels.sort_by_key(|op| (op.lease_epoch, op.seq, op.sig.to_bytes()));
+        let mut leases = leases.into_iter().peekable();
+        for op in labels {
+            while leases
+                .peek()
+                .is_some_and(|lease| lease.epoch <= op.lease_epoch)
+            {
+                let lease = leases.next().expect("peeked lease");
+                if let Err(error) = capsule.accept_lease(lease, &|_, _| true) {
+                    eprintln!(
+                        "abra-core: skipping invalid lease in {}: {error}",
+                        dir.display()
+                    );
+                }
+            }
             if let Err(error) = capsule.apply_label(op.clone(), op.by, 0) {
                 eprintln!(
                     "abra-core: skipping invalid label-op in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+        for lease in leases {
+            if let Err(error) = capsule.accept_lease(lease, &|_, _| true) {
+                eprintln!(
+                    "abra-core: skipping invalid lease in {}: {error}",
                     dir.display()
                 );
             }

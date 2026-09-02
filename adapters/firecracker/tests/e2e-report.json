@@ -1,0 +1,56 @@
+{
+  "ok": true,
+  "capsule": "5a8fd07d8b4748debd12be7e6899456b6180846d4b045016acb8d84ff268db76",
+  "native_snapshot": "0e7028573b95b5a7f209a976d86090f2528449cafe97e0c4dd752f2afc528290",
+  "timings_ms": {
+    "total": 29008,
+    "up": 4691,
+    "snapshot": 8148,
+    "native_restore": 6439
+  },
+  "native": [
+    {
+      "blob": "ee4bcc984313ebfea4bbc592e57b191998d87f87a4ad34fd80481e5ad63fdf3e",
+      "bytes": 15923,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "vmstate"
+    },
+    {
+      "blob": "f9fd4afd5852f03755f6108ae8fa94bd396241f8c92ddaac1d7ef1c926e4b8e8",
+      "bytes": 536870912,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "memory"
+    },
+    {
+      "blob": "ca73a638076d5edc99cca3ad5a8f3b259fe3d08a8dc1354e9833c191c35beda0",
+      "bytes": 2147483648,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "disk"
+    }
+  ],
+  "checks": {
+    "enrollment": true,
+    "transfer": true,
+    "native_manifest": true,
+    "process_resumed": true,
+    "portable_fallback": true
+  }
+}

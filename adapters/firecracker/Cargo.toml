@@ -1,0 +1,16 @@
+[package]
+name = "abra-fc"
+description = "Firecracker lifecycle adapter for Abra capsules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+abra-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+

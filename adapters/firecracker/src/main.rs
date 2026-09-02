@@ -1,0 +1,822 @@
+use abra_core::{
+    cas::{materialize, Hash},
+    manifest::{Fingerprint, NativeBlobRef},
+    store::AbraStore,
+};
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Parser)]
+#[command(
+    name = "abra-fc",
+    version,
+    about = "Run Abra capsules in Firecracker microVMs"
+)]
+struct Cli {
+    #[arg(long, env = "ABRA_ROOT", global = true)]
+    root: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "ABRA_FC_BINARY",
+        default_value = "firecracker",
+        global = true
+    )]
+    firecracker: PathBuf,
+    #[arg(long, env = "ABRA_FC_SSH_KEY", global = true)]
+    ssh_key: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Action,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    Up {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        rootfs: PathBuf,
+        #[arg(long)]
+        kernel: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        mem: u32,
+        #[arg(long, default_value_t = 1)]
+        vcpus: u8,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Snapshot {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        capsule: String,
+        #[arg(long)]
+        diff: bool,
+    },
+    Restore {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        capsule: String,
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+    Down {
+        #[arg(long)]
+        slot: u8,
+    },
+    Ls,
+    Fingerprint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Config {
+    kernel: PathBuf,
+    base_rootfs: PathBuf,
+    ssh_key: PathBuf,
+    mem_mib: u32,
+    vcpus: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlotState {
+    slot: u8,
+    pid: u32,
+    api_socket: PathBuf,
+    tap: String,
+    host_ip: String,
+    guest_ip: String,
+    guest_mac: String,
+    rootfs: PathBuf,
+    kernel: PathBuf,
+    mem_mib: u32,
+    vcpus: u8,
+    status: String,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let root = cli.root.unwrap_or_else(default_root);
+    match cli.command {
+        Action::Up {
+            slot,
+            rootfs,
+            kernel,
+            mem,
+            vcpus,
+            token,
+        } => {
+            let key = resolve_key(cli.ssh_key, &rootfs)?;
+            let state = up(
+                &root,
+                &cli.firecracker,
+                slot,
+                Config {
+                    kernel,
+                    base_rootfs: rootfs,
+                    ssh_key: key,
+                    mem_mib: mem,
+                    vcpus,
+                },
+                token.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        Action::Snapshot {
+            slot,
+            capsule,
+            diff,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&snapshot(
+                    &root,
+                    &cli.firecracker,
+                    slot,
+                    &capsule,
+                    diff
+                )?)?
+            );
+        }
+        Action::Restore {
+            slot,
+            capsule,
+            snapshot,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&restore(
+                    &root,
+                    &cli.firecracker,
+                    cli.ssh_key.as_deref(),
+                    slot,
+                    &capsule,
+                    snapshot.as_deref()
+                )?)?
+            );
+        }
+        Action::Down { slot } => down(&root, slot)?,
+        Action::Ls => list(&root)?,
+        Action::Fingerprint => println!(
+            "{}",
+            serde_json::to_string_pretty(&fingerprint(&cli.firecracker)?)?
+        ),
+    }
+    Ok(())
+}
+
+fn default_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into())
+        .join(".abra")
+}
+
+fn adapter_root(root: &Path) -> PathBuf {
+    root.join("firecracker")
+}
+fn slot_dir(root: &Path, slot: u8) -> PathBuf {
+    adapter_root(root).join("slots").join(slot.to_string())
+}
+fn state_path(root: &Path, slot: u8) -> PathBuf {
+    slot_dir(root, slot).join("state.json")
+}
+
+fn resolve_key(explicit: Option<PathBuf>, rootfs: &Path) -> Result<PathBuf> {
+    explicit
+        .or_else(|| rootfs.parent().map(|p| p.join("desktop_id_rsa")))
+        .filter(|p| p.is_file())
+        .ok_or_else(|| "SSH key not found; set --ssh-key or ABRA_FC_SSH_KEY".into())
+}
+
+fn network(slot: u8) -> (String, String, String, String) {
+    let tap = format!("osdtap{slot}");
+    let host = format!("172.30.{slot}.1");
+    let guest = format!("172.30.{slot}.2");
+    let mac = format!("06:00:AC:1E:{slot:02X}:02");
+    (tap, host, guest, mac)
+}
+
+fn up(root: &Path, fc: &Path, slot: u8, config: Config, token: Option<&str>) -> Result<SlotState> {
+    require_file(&config.kernel)?;
+    require_file(&config.base_rootfs)?;
+    require_file(&config.ssh_key)?;
+    let _ = down(root, slot);
+    let dir = slot_dir(root, slot);
+    fs::create_dir_all(&dir)?;
+    let rootfs = dir.join("rootfs.ext4");
+    fs::copy(&config.base_rootfs, &rootfs)?;
+    fs::create_dir_all(adapter_root(root))?;
+    fs::write(
+        adapter_root(root).join("config.json"),
+        serde_json::to_vec_pretty(&config)?,
+    )?;
+    start_vm(root, fc, slot, config, rootfs, token)
+}
+
+fn start_vm(
+    root: &Path,
+    fc: &Path,
+    slot: u8,
+    config: Config,
+    rootfs: PathBuf,
+    token: Option<&str>,
+) -> Result<SlotState> {
+    let dir = slot_dir(root, slot);
+    fs::create_dir_all(&dir)?;
+    let socket = dir.join("firecracker.sock");
+    let log = dir.join("firecracker.log");
+    let stdout = fs::File::create(dir.join("stdout.log"))?;
+    let stderr = fs::File::create(dir.join("stderr.log"))?;
+    let (tap, host_ip, guest_ip, guest_mac) = network(slot);
+    setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
+    let child = Command::new(fc)
+        .args(["--api-sock"])
+        .arg(&socket)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    wait_path(&socket, Duration::from_secs(5))?;
+    fs::File::create(&log)?;
+    api(
+        &socket,
+        "PUT",
+        "/logger",
+        &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
+    )?;
+    api(
+        &socket,
+        "PUT",
+        "/machine-config",
+        &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
+    )?;
+    let mut boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
+    if let Some(token) = token {
+        boot.push_str(" abra.token=");
+        boot.push_str(token);
+    }
+    api(
+        &socket,
+        "PUT",
+        "/boot-source",
+        &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
+    )?;
+    api(
+        &socket,
+        "PUT",
+        "/drives/rootfs",
+        &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
+    )?;
+    api(
+        &socket,
+        "PUT",
+        "/network-interfaces/net1",
+        &json!({"iface_id":"net1","guest_mac":guest_mac,"host_dev_name":tap}),
+    )?;
+    api(
+        &socket,
+        "PUT",
+        "/actions",
+        &json!({"action_type":"InstanceStart"}),
+    )?;
+    let state = SlotState {
+        slot,
+        pid: child.id(),
+        api_socket: socket,
+        tap,
+        host_ip,
+        guest_ip,
+        guest_mac,
+        rootfs,
+        kernel: config.kernel,
+        mem_mib: config.mem_mib,
+        vcpus: config.vcpus,
+        status: "running".into(),
+    };
+    write_state(root, &state)?;
+    wait_ssh(&state, &config.ssh_key, Duration::from_secs(90))?;
+    Ok(state)
+}
+
+fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Result<Value> {
+    let state = read_state(root, slot)?;
+    ensure_running(&state)?;
+    let config: Config =
+        serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
+    let _ = ssh(
+        &state,
+        &config.ssh_key,
+        "test ! -f /workspace/.abra/capsule_id || abra --root /var/lib/abra snapshot /workspace >/dev/null; sync",
+    );
+    api(
+        &state.api_socket,
+        "PATCH",
+        "/vm",
+        &json!({"state":"Paused"}),
+    )?;
+    let result = (|| {
+        let snap_dir = slot_dir(root, slot).join("snapshots").join(epoch_id());
+        fs::create_dir_all(&snap_dir)?;
+        let vmstate = snap_dir.join("vmstate");
+        let memory = snap_dir.join("memory");
+        api(
+            &state.api_socket,
+            "PUT",
+            "/snapshot/create",
+            &json!({
+                "snapshot_type": if diff { "Diff" } else { "Full" },
+                "snapshot_path": vmstate,
+                "mem_file_path": memory
+            }),
+        )?;
+        let fp = fingerprint_for_snapshot(fc, &vmstate)?;
+        fs::write(
+            adapter_root(root).join("fingerprint.json"),
+            serde_json::to_vec_pretty(&fp)?,
+        )?;
+        let response = control(
+            root,
+            &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
+            "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":state.rootfs}]}),
+        )?;
+        Ok::<Value, Box<dyn std::error::Error>>(response)
+    })();
+    let resumed = api(
+        &state.api_socket,
+        "PATCH",
+        "/vm",
+        &json!({"state":"Resumed"}),
+    );
+    if let Err(error) = resumed {
+        eprintln!("warning: failed to resume slot {slot}: {error}");
+    }
+    result
+}
+
+fn restore(
+    root: &Path,
+    fc: &Path,
+    key_override: Option<&Path>,
+    slot: u8,
+    capsule: &str,
+    requested: Option<&str>,
+) -> Result<Value> {
+    let started = Instant::now();
+    let store = AbraStore::open(root)?;
+    let capsule_id: Hash = capsule.parse()?;
+    let cap = store.capsules.get(&capsule_id).ok_or("unknown capsule")?;
+    let snapshot_id = match requested {
+        Some(id) => id.parse()?,
+        None => {
+            cap.label("main")
+                .ok_or("capsule has no main head")?
+                .snapshot_id
+        }
+    };
+    let record = cap
+        .snapshot(&snapshot_id)
+        .ok_or("snapshot not found in capsule")?;
+    let local = local_fingerprint(root, fc)?;
+    let matched = matching_native(record.raw.manifest().native.as_deref(), &local);
+    let mut config: Config =
+        serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
+    if let Some(key) = key_override {
+        config.ssh_key = key.to_path_buf();
+    }
+    if let Some((vmstate, memory, disk)) = matched {
+        let _ = down(root, slot);
+        let dir = slot_dir(root, slot);
+        fs::create_dir_all(&dir)?;
+        let vmstate_path = dir.join("restore.vmstate");
+        let memory_path = dir.join("restore.memory");
+        let disk_path = dir.join("rootfs.ext4");
+        store.cas.copy_to_file(&vmstate.blob, &vmstate_path)?;
+        store.cas.copy_to_file(&memory.blob, &memory_path)?;
+        store.cas.copy_to_file(&disk.blob, &disk_path)?;
+        let (tap, host_ip, guest_ip, guest_mac) = network(slot);
+        setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
+        let socket = dir.join("firecracker.sock");
+        let child = Command::new(fc)
+            .args(["--api-sock"])
+            .arg(&socket)
+            .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
+            .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
+            .spawn()?;
+        wait_path(&socket, Duration::from_secs(5))?;
+        api(
+            &socket,
+            "PUT",
+            "/snapshot/load",
+            &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
+            "track_dirty_pages":true,"resume_vm":false,"network_overrides":[{"iface_id":"net1","host_dev_name":tap,"guest_mac":guest_mac}]}),
+        )?;
+        api(
+            &socket,
+            "PATCH",
+            "/drives/rootfs",
+            &json!({"drive_id":"rootfs","path_on_host":disk_path}),
+        )?;
+        api(&socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
+        let state = SlotState {
+            slot,
+            pid: child.id(),
+            api_socket: socket,
+            tap,
+            host_ip,
+            guest_ip,
+            guest_mac,
+            rootfs: disk_path,
+            kernel: config.kernel.clone(),
+            mem_mib: config.mem_mib,
+            vcpus: config.vcpus,
+            status: "running".into(),
+        };
+        write_state(root, &state)?;
+        wait_ssh(&state, &config.ssh_key, Duration::from_secs(30))?;
+        return Ok(
+            json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis()}),
+        );
+    }
+    let state = up(root, fc, slot, config.clone(), None)?;
+    let temp = tempfile::tempdir()?;
+    materialize(
+        &store.cas,
+        &record.raw.manifest().files.ok_or("snapshot lacks files")?,
+        temp.path(),
+    )?;
+    rsync_guest(temp.path(), &state, &config.ssh_key, "/workspace/")?;
+    let recipes = record.raw.manifest().recipes.clone().unwrap_or_default();
+    eprintln!(
+        "recipes (data only; not executed): {}",
+        serde_json::to_string_pretty(&recipes)?
+    );
+    Ok(
+        json!({"mode":"portable-fallback","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"recipes":recipes}),
+    )
+}
+
+fn matching_native<'a>(
+    native: Option<&'a [NativeBlobRef]>,
+    fp: &Fingerprint,
+) -> Option<(&'a NativeBlobRef, &'a NativeBlobRef, &'a NativeBlobRef)> {
+    let matching: Vec<_> = native?.iter().filter(|n| &n.fingerprint == fp).collect();
+    Some((
+        matching.iter().find(|n| n.role == "vmstate")?,
+        matching.iter().find(|n| n.role == "memory")?,
+        matching.iter().find(|n| n.role == "disk")?,
+    ))
+}
+
+fn fingerprint(fc: &Path) -> Result<Fingerprint> {
+    if let Ok(fake) = std::env::var("ABRA_FC_FAKE_FINGERPRINT") {
+        return Ok(serde_json::from_str(&fake)?);
+    }
+    let output = Command::new(fc).arg("--version").output()?;
+    let version = String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .find(|x| x.starts_with('v'))
+        .ok_or("unrecognized Firecracker version")?
+        .trim_start_matches('v')
+        .to_owned();
+    let major = std::env::var("ABRA_FC_SNAPSHOT_FORMAT_MAJOR")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or_else(|| {
+            eprintln!("warning: snapshot format unknown before first snapshot; using Firecracker release major for probing");
+            version.split('.').next().unwrap_or("0").parse().unwrap_or(0)
+        });
+    Ok(Fingerprint {
+        os: "linux".into(),
+        arch: std::env::consts::ARCH.into(),
+        hypervisor: "firecracker".into(),
+        snapshot_format_major: major,
+        cpu_template: "-".into(),
+    })
+}
+
+fn local_fingerprint(root: &Path, fc: &Path) -> Result<Fingerprint> {
+    if std::env::var_os("ABRA_FC_FAKE_FINGERPRINT").is_some() {
+        return fingerprint(fc);
+    }
+    let cached = adapter_root(root).join("fingerprint.json");
+    if cached.is_file() {
+        return Ok(serde_json::from_slice(&fs::read(cached)?)?);
+    }
+    fingerprint(fc)
+}
+
+fn fingerprint_for_snapshot(fc: &Path, vmstate: &Path) -> Result<Fingerprint> {
+    let mut fp = fingerprint(fc)?;
+    let output = Command::new(fc)
+        .arg("--describe-snapshot")
+        .arg(vmstate)
+        .output()?;
+    let description = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version = description
+        .split(|character: char| character.is_whitespace() || character == '"' || character == ':')
+        .map(|word| word.trim_start_matches('v').trim_matches(','))
+        .find(|word| {
+            let parts: Vec<_> = word.split('.').collect();
+            parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok())
+        })
+        .ok_or_else(|| format!("could not parse snapshot data version from: {description}"))?;
+    fp.snapshot_format_major = version.split('.').next().unwrap().parse()?;
+    Ok(fp)
+}
+
+fn api(socket: &Path, method: &str, endpoint: &str, body: &Value) -> Result<()> {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--write-out",
+            "\n%{http_code}",
+            "--unix-socket",
+        ])
+        .arg(socket)
+        .args([
+            "-X",
+            method,
+            "-H",
+            "Content-Type: application/json",
+            "--data",
+        ])
+        .arg(serde_json::to_string(body)?)
+        .arg(format!("http://localhost{endpoint}"))
+        .output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (response, status) = text.rsplit_once('\n').unwrap_or((&text, "000"));
+    if !output.status.success() || !status.starts_with('2') {
+        return Err(
+            format!("Firecracker {method} {endpoint} failed HTTP {status}: {response}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn setup_network(tap: &str, host: &str, guest: &str, mac: &str) -> Result<()> {
+    if !Command::new("ip")
+        .args(["link", "show", "dev", tap])
+        .status()?
+        .success()
+    {
+        run("sudo", &["ip", "tuntap", "add", "dev", tap, "mode", "tap"])?;
+    }
+    let _ = Command::new("sudo")
+        .args(["ip", "addr", "flush", "dev", tap, "scope", "global"])
+        .status();
+    run(
+        "sudo",
+        &["ip", "addr", "add", &format!("{host}/30"), "dev", tap],
+    )?;
+    run("sudo", &["ip", "link", "set", "dev", tap, "up"])?;
+    run(
+        "sudo",
+        &[
+            "ip",
+            "neigh",
+            "replace",
+            guest,
+            "lladdr",
+            mac,
+            "dev",
+            tap,
+            "nud",
+            "permanent",
+        ],
+    )?;
+    run("sudo", &["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+    if !Command::new("sudo")
+        .args([
+            "iptables",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            "172.30.0.0/16",
+            "-j",
+            "MASQUERADE",
+        ])
+        .status()?
+        .success()
+    {
+        run(
+            "sudo",
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                "172.30.0.0/16",
+                "-j",
+                "MASQUERADE",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn down(root: &Path, slot: u8) -> Result<()> {
+    if let Ok(mut state) = read_state(root, slot) {
+        if state.pid != 0 {
+            let _ = Command::new("kill").arg(state.pid.to_string()).status();
+            for _ in 0..20 {
+                if !pid_alive(state.pid) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if pid_alive(state.pid) {
+                let _ = Command::new("kill")
+                    .args(["-9", &state.pid.to_string()])
+                    .status();
+            }
+        }
+        let _ = Command::new("sudo")
+            .args(["ip", "link", "del", &state.tap])
+            .status();
+        let _ = fs::remove_file(&state.api_socket);
+        state.status = "stopped".into();
+        state.pid = 0;
+        write_state(root, &state)?;
+    }
+    Ok(())
+}
+
+fn list(root: &Path) -> Result<()> {
+    let dir = adapter_root(root).join("slots");
+    let mut states = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(bytes) = fs::read(entry.path().join("state.json")) {
+                if let Ok(mut state) = serde_json::from_slice::<SlotState>(&bytes) {
+                    if state.pid != 0 && !pid_alive(state.pid) {
+                        state.status = "stale".into();
+                    }
+                    states.push(state);
+                }
+            }
+        }
+    }
+    states.sort_by_key(|s| s.slot);
+    println!("{}", serde_json::to_string_pretty(&states)?);
+    Ok(())
+}
+
+fn ssh(state: &SlotState, key: &Path, command: &str) -> Result<()> {
+    let status = Command::new("ssh")
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=2",
+            "-i",
+        ])
+        .arg(key)
+        .arg(format!("root@{}", state.guest_ip))
+        .arg(command)
+        .status()?;
+    if !status.success() {
+        return Err(format!("guest SSH command failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn wait_ssh(state: &SlotState, key: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if ssh(state, key, "true").is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "guest SSH at {} was not ready after {}s",
+        state.guest_ip,
+        timeout.as_secs()
+    )
+    .into())
+}
+
+fn rsync_guest(source: &Path, state: &SlotState, key: &Path, destination: &str) -> Result<()> {
+    ssh(state, key, &format!("mkdir -p {destination}"))?;
+    let status = Command::new("scp")
+        .args([
+            "-q",
+            "-r",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-i",
+        ])
+        .arg(key)
+        .arg(format!("{}/.", source.display()))
+        .arg(format!("root@{}:{destination}", state.guest_ip))
+        .status()?;
+    if !status.success() {
+        return Err("scp to guest failed".into());
+    }
+    Ok(())
+}
+
+fn control(root: &Path, request: &Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(root.join("cadabra.sock"))?;
+    serde_json::to_writer(&mut stream, request)?;
+    stream.write_all(b"\n")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let response: Value = serde_json::from_str(&line)?;
+    if response.get("ok") == Some(&Value::Bool(true)) {
+        return Ok(response["result"].clone());
+    }
+    Err(response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("cadabra control error")
+        .to_owned()
+        .into())
+}
+
+fn write_state(root: &Path, state: &SlotState) -> Result<()> {
+    fs::create_dir_all(slot_dir(root, state.slot))?;
+    fs::write(
+        state_path(root, state.slot),
+        serde_json::to_vec_pretty(state)?,
+    )?;
+    Ok(())
+}
+fn read_state(root: &Path, slot: u8) -> Result<SlotState> {
+    Ok(serde_json::from_slice(&fs::read(state_path(root, slot))?)?)
+}
+fn ensure_running(state: &SlotState) -> Result<()> {
+    if state.pid != 0 && pid_alive(state.pid) {
+        Ok(())
+    } else {
+        Err("slot is not running".into())
+    }
+}
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+fn wait_path(path: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("timed out waiting for {}", path.display()).into())
+}
+fn require_file(path: &Path) -> Result<()> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(format!("missing file: {}", path.display()).into())
+    }
+}
+fn epoch_id() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+fn run(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} {:?} failed: {status}", args).into())
+    }
+}

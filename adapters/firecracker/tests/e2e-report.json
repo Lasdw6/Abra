@@ -1,16 +1,16 @@
 {
   "ok": true,
-  "capsule": "141ab66aec7922e3ad028e8033df5df6edb351e8c5d1111d16ff7542b23376ba",
-  "native_snapshot": "aa58825934250745611e2c42b7e9db760c0f4e7f422478025336d157f5afeb31",
+  "capsule": "1ee21a8e6439b7fa6acba29e5a74b0f9d3f2d3163f5eef13b01da2a5a403385b",
+  "native_snapshot": "4a87513c2bcd5bd58d156b4802b6d0793807807381005f680ae713799d9ceb37",
   "timings_ms": {
-    "total": 30580,
-    "up": 6558,
-    "snapshot": 6246,
-    "native_restore": 6693
+    "total": 35935,
+    "up": 6620,
+    "snapshot": 6220,
+    "native_restore": 6736
   },
   "native": [
     {
-      "blob": "8964d79c53358130e00cb4766557be5f9fa590a56fcc7c179965d6a014081227",
+      "blob": "88041bf7974541af972119625ff383494f71f931503b07fe4ac7f0350b3a7b12",
       "bytes": 14647,
       "fingerprint": {
         "arch": "x86_64",
@@ -23,7 +23,7 @@
       "role": "vmstate"
     },
     {
-      "blob": "a589b4dd80e7b3f7c8eb6d94d5f8dd3e6249e5336f46562d99b98e57168b5270",
+      "blob": "0c68ccb0fbd8650e647a9af0131b6be610eaa445a290e98f89512fc2644d307e",
       "bytes": 536870912,
       "fingerprint": {
         "arch": "x86_64",
@@ -36,7 +36,7 @@
       "role": "memory"
     },
     {
-      "blob": "e9fe9a1a6e2bcf75cc5a5616468a3ebf84747f9635ca8a2074983368e2191365",
+      "blob": "b006a01f41e7f21aece86b21a75ccb8aa883a86477fbb18110d4697ad2ea622d",
       "bytes": 2147483648,
       "fingerprint": {
         "arch": "x86_64",

@@ -28,13 +28,31 @@ cleanup() {
 trap cleanup EXIT
 
 mount -o loop,nodev,nosuid "$ROOTFS" "$MOUNT_DIR"
-while IFS= read -r -d '' link; do
-  target="$(readlink "$link")"
-  if [[ "$target" == /* || "/$target/" == *"/../"* ]]; then
-    echo "refusing escaping symlink in rootfs: ${link#"$MOUNT_DIR"/} -> $target" >&2
-    exit 1
-  fi
-done < <(find "$MOUNT_DIR" -xdev -type l -print0)
+# The host kernel resolves symlinks inside the mounted image against the HOST
+# root, so any symlink on a path we write to could redirect the write outside
+# the image. Absolute symlinks are normal inside a guest rootfs (e.g.
+# usr/lib64/ld-linux-x86-64.so.2 -> /lib/...), so we do not reject the image;
+# we refuse to write through any symlink component on our own destinations.
+safe_dest() {
+  local rel="${1#"$MOUNT_DIR"/}" cur="$MOUNT_DIR" part
+  IFS=/ read -r -a parts <<<"$rel"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" || "$part" == "." ]] && continue
+    [[ "$part" == ".." ]] && { echo "refusing '..' in destination: $rel" >&2; exit 1; }
+    cur="$cur/$part"
+    if [[ -L "$cur" ]]; then
+      echo "refusing to write through symlink in rootfs destination: ${cur#"$MOUNT_DIR"/} -> $(readlink "$cur")" >&2
+      exit 1
+    fi
+  done
+}
+for dest in usr/local/bin/abra usr/local/bin/cadabra usr/local/libexec/abra-observer \
+            usr/local/libexec/abra-start-guest var/lib/abra workspace etc/abra \
+            etc/systemd/system/cadabra.service etc/systemd/system/abra-observer.service \
+            etc/systemd/system/multi-user.target.wants/cadabra.service \
+            etc/systemd/system/multi-user.target.wants/abra-observer.service; do
+  safe_dest "$MOUNT_DIR/$dest"
+done
 install -D -m 0755 "$ABRA_BIN" "$MOUNT_DIR/usr/local/bin/abra"
 install -D -m 0755 "$CADABRA_BIN" "$MOUNT_DIR/usr/local/bin/cadabra"
 install -D -m 0755 "$SCRIPT_DIR/observer.py" "$MOUNT_DIR/usr/local/libexec/abra-observer"

@@ -66,6 +66,18 @@ INITIAL="$("$ABRA" --root "$RUN_ROOT" --json snapshot "$WORKSPACE")"
 CAPSULE="$(jq -r .capsule_id <<<"$INITIAL")"
 TOKEN="$("$ABRA" --root "$RUN_ROOT" --json enroll --capsule "$CAPSULE" --kind dev.abra.workspace --ttl 1h --send --receive | jq -r .token)"
 
+# Guest binaries must be STATIC (musl): the guest rootfs (jammy, glibc 2.35)
+# cannot run host-glibc builds, and a stale image silently breaks enrollment
+# when token/protocol formats change. Rebuild both per run unless disabled.
+if [[ "${ABRA_FC_E2E_REBUILD_IMAGE:-1}" == "1" ]]; then
+  (cd "$REPO_ROOT" && cargo build --release --target x86_64-unknown-linux-musl -p abra-cli -p cadabra >/dev/null)
+  MUSL="$REPO_ROOT/target/x86_64-unknown-linux-musl/release"
+  BASE_ROOTFS="${FIRECRACKER_BASE_ROOTFS:-$ARTIFACTS/rootfs-headless-base.ext4}"
+  ROOTFS="$RUN_ROOT/rootfs-headless-abra.ext4"
+  cp -f "$BASE_ROOTFS" "$ROOTFS"
+  bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+fi
+
 UP_STARTED="$(now_ms)"
 "$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" up --slot 0 --rootfs "$ROOTFS" --kernel "$KERNEL" --mem 512 --vcpus 1 --token "$TOKEN" >"$RUN_ROOT/up.json"
 UP_MS="$(( $(now_ms) - UP_STARTED ))"

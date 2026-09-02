@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { run, parseArgs } from '../lib/cli.js';
 import { loadBundle } from '../lib/util.js';
+import { rm } from 'node:fs/promises';
+import path from 'node:path';
 
 const argv = process.argv.slice(2);
 const { positionals, flags } = parseArgs(argv);
@@ -9,12 +11,14 @@ if (positionals[0] !== 'sync') {
   process.exitCode = 1;
 } else {
   const endpoint = String(flags.endpoint || process.env.BROWSER_USE_API_URL || 'http://127.0.0.1:8787').replace(/\/$/, '');
-  const out = flags.out || `browser-session-${Date.now()}`;
+  const out = path.resolve(flags.out || path.join(flags['staging-root'] || '.abra-browser-profiles/staging', `browser-session-${Date.now()}`));
   try {
     await run(['export', '--from', 'local', ...(flags.profile ? ['--profile', flags.profile] : []), ...(flags['include-domains'] ? ['--include-domains', flags['include-domains']] : []), ...(flags['exclude-domains'] ? ['--exclude-domains', flags['exclude-domains']] : []), '--out', out]);
     const { manifest } = await loadBundle(out);
-    const response = await fetch(`${endpoint}/api/v4/profiles/${flags['cloud-profile-id']}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bundlePath: out, cookieDomains: manifest.domains.map(d => d.domain) }) });
+    const secret=flags.secret||process.env.ABRA_BROWSER_FACADE_SECRET;if(!secret)throw new Error('--secret or ABRA_BROWSER_FACADE_SECRET is required');
+    const response = await fetch(`${endpoint}/api/v4/profiles/${flags['cloud-profile-id']}`, { method: 'PATCH', headers: { 'content-type': 'application/json',authorization:`Bearer ${secret}` }, body: JSON.stringify({ bundlePath: out, cookieDomains: manifest.domains.map(d => d.domain) }) });
     if (!response.ok) throw new Error(`profile API returned ${response.status}`);
     console.log(JSON.stringify(await response.json()));
   } catch (error) { console.error(`profile-use: ${error.message}`); process.exitCode = 1; }
+  finally { await rm(out,{recursive:true,force:true}); }
 }

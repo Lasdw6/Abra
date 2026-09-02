@@ -4,12 +4,12 @@ export class CDP {
   constructor(url) { this.url = url; this.id = 0; this.pending = new Map(); this.listeners = new Map(); }
   async connect() {
     this.ws = new WebSocket(this.url);
-    await new Promise((resolve, reject) => { this.ws.onopen = resolve; this.ws.onerror = () => reject(new Error(`cannot connect to CDP at ${this.url}`)); });
+    await new Promise((resolve, reject) => { this.ws.onopen = resolve; this.ws.onerror = () => reject(new Error('cannot connect to CDP destination')); });
     this.ws.onmessage = event => {
       const msg = JSON.parse(String(event.data));
       if (msg.id) {
         const pending = this.pending.get(msg.id); this.pending.delete(msg.id);
-        if (msg.error) pending?.reject(new Error(`${msg.error.message}${msg.error.data ? `: ${msg.error.data}` : ''}`)); else pending?.resolve(msg.result);
+        if (msg.error) pending?.reject(new Error(msg.error.message || 'CDP command failed')); else pending?.resolve(msg.result);
       } else {
         for (const fn of this.listeners.get(msg.method) || []) fn(msg.params || {}, msg.sessionId);
       }
@@ -40,7 +40,7 @@ export async function attachPage(cdp, targetId) {
 
 export async function evalValue(cdp, sessionId, expression, awaitPromise = true) {
   const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true, userGesture: true }, sessionId);
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+  if (result.exceptionDetails) throw new Error('browser evaluation failed');
   return result.result.value;
 }
 

@@ -1,152 +1,124 @@
-import { createHash, generateKeyPairSync, sign, verify } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
+import { chmod, mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { domainToASCII } from 'node:url';
+import { isIP } from 'node:net';
 
 export const KIND = 'dev.abra.browser-session.v1';
+export const RECEIPT_KIND = 'dev.abra.browser-session.receipt.v1';
+const SIGNING_PREFIX = 'abra-browser-session-v1';
+
+export function dataDir() {
+  return path.resolve(process.env.ABRA_BROWSER_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'Abra', 'browser-session'));
+}
 
 export function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
   return JSON.stringify(value);
 }
+export function sha256(value) { return createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : canonical(value)).digest('hex'); }
 
-export function sha256(value) {
-  return createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : canonical(value)).digest('hex');
+async function privateDir(dir) { await mkdir(dir, { recursive: true, mode: 0o700 }); await chmod(dir, 0o700); }
+export async function writePrivate(file, bytes) {
+  await privateDir(path.dirname(file));
+  const handle = await open(file, 'w', 0o600);
+  try { await handle.writeFile(bytes); await handle.chmod(0o600); } finally { await handle.close(); }
 }
-
-export function signObject(object, domain = 'browser-session-manifest') {
-  const unsigned = structuredClone(object);
-  delete unsigned.signature;
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const payload = Buffer.from(`abra-browser-session-v1\0${domain}\0${canonical(unsigned)}`);
-  return {
-    algorithm: 'Ed25519',
-    domain,
-    public_key: publicKey.export({ type: 'spki', format: 'der' }).toString('base64url'),
-    value: sign(null, payload, privateKey).toString('base64url')
-  };
-}
-
-export function verifyObject(object) {
-  const unsigned = structuredClone(object);
-  const signature = unsigned.signature;
-  delete unsigned.signature;
-  if (!signature || signature.algorithm !== 'Ed25519') return false;
-  const payload = Buffer.from(`abra-browser-session-v1\0${signature.domain}\0${canonical(unsigned)}`);
-  return verify(null, payload, { key: Buffer.from(signature.public_key, 'base64url'), type: 'spki', format: 'der' }, Buffer.from(signature.value, 'base64url'));
-}
-
-export function parseList(value) {
-  return value ? [...new Set(value.split(',').map(v => v.trim().toLowerCase()).filter(Boolean))] : [];
-}
-
-export function cookieDomain(cookie) {
-  return String(cookie.domain || '').replace(/^\./, '').toLowerCase();
-}
-
-export function domainMatches(host, rule) {
-  host = host.toLowerCase().replace(/^\./, '');
-  rule = rule.toLowerCase().replace(/^\./, '');
-  return host === rule || host.endsWith(`.${rule}`);
-}
-
-export function allowedDomain(host, includes = [], excludes = []) {
-  return (!includes.length || includes.some(r => domainMatches(host, r))) && !excludes.some(r => domainMatches(host, r));
-}
-
-export function filterState(state, includes = [], excludes = []) {
-  const originAllowed = origin => {
-    try { return allowedDomain(new URL(origin).hostname, includes, excludes); } catch { return false; }
-  };
-  return {
-    ...state,
-    cookies: (state.cookies || []).filter(c => allowedDomain(cookieDomain(c), includes, excludes)),
-    origins: (state.origins || []).filter(o => originAllowed(o.origin)),
-    tabs: (state.tabs || []).filter(t => originAllowed(t.url))
-  };
-}
-
+export async function writeJson(file, value) { await writePrivate(file, `${JSON.stringify(value, null, 2)}\n`); }
 export async function readJson(file) { return JSON.parse(await readFile(file, 'utf8')); }
-export async function writeJson(file, value) { await writeFile(file, `${JSON.stringify(value, null, 2)}\n`); }
 
-export async function loadBundle(dir) {
-  const manifest = await readJson(path.join(dir, 'manifest.json'));
+export async function signingIdentity(root = dataDir()) {
+  const keys = path.join(root, 'keys'), privateFile = path.join(keys, 'ed25519-private.pem'), publicFile = path.join(keys, 'ed25519-public.der');
+  await privateDir(keys);
+  try {
+    const publicDer = await readFile(publicFile);
+    return { privateKey: createPrivateKey(await readFile(privateFile, 'utf8')), publicDer, fingerprint: sha256(publicDer) };
+  } catch {
+    const pair = generateKeyPairSync('ed25519');
+    const privatePem = pair.privateKey.export({ type: 'pkcs8', format: 'pem' });
+    const publicDer = pair.publicKey.export({ type: 'spki', format: 'der' });
+    const suffix = `${process.pid}-${Date.now()}`;
+    const tmpPrivate = `${privateFile}.${suffix}`, tmpPublic = `${publicFile}.${suffix}`;
+    await writePrivate(tmpPrivate, privatePem); await writePrivate(tmpPublic, publicDer);
+    try { await rename(tmpPrivate, privateFile); await rename(tmpPublic, publicFile); }
+    catch { /* another process may have won initialization */ }
+    const storedDer = await readFile(publicFile);
+    return { privateKey: createPrivateKey(await readFile(privateFile, 'utf8')), publicDer: storedDer, fingerprint: sha256(storedDer) };
+  }
+}
+
+export function signObject(object, identity, domain) {
+  if (!identity?.privateKey || !identity?.publicDer) throw new Error('a persistent signing identity is required');
+  const unsigned = structuredClone(object); delete unsigned.signature;
+  const payload = Buffer.from(`${SIGNING_PREFIX}\0${domain}\0${canonical(unsigned)}`);
+  return { algorithm: 'Ed25519', domain, public_key: identity.publicDer.toString('base64url'), fingerprint: identity.fingerprint, value: sign(null, payload, identity.privateKey).toString('base64url') };
+}
+export function verifyObject(object, { domain, publicKey, fingerprint } = {}) {
+  const unsigned = structuredClone(object), signature = unsigned.signature; delete unsigned.signature;
+  if (!signature || signature.algorithm !== 'Ed25519' || signature.domain !== domain) return false;
+  const der = publicKey || Buffer.from(signature.public_key || '', 'base64url');
+  if (!der.length || signature.fingerprint !== sha256(der) || (fingerprint && fingerprint !== signature.fingerprint)) return false;
+  try { return verify(null, Buffer.from(`${SIGNING_PREFIX}\0${domain}\0${canonical(unsigned)}`), createPublicKey({ key: der, type: 'spki', format: 'der' }), Buffer.from(signature.value, 'base64url')); } catch { return false; }
+}
+
+export function parseList(value) { return value ? [...new Set(value.split(',').map(normalizeHost).filter(Boolean))] : []; }
+export function normalizeHost(host) { return domainToASCII(String(host || '').trim().replace(/^\.+/, '').toLowerCase()).toLowerCase(); }
+export function cookieDomain(cookie) { try { return cookie.domain ? normalizeHost(cookie.domain) : normalizeHost(new URL(cookie.url).hostname); } catch { return ''; } }
+export function domainMatches(host, rule) { host = normalizeHost(host); rule = normalizeHost(rule); return Boolean(host && rule && (host === rule || host.endsWith(`.${rule}`))); }
+export function allowedDomain(host, includes = [], excludes = []) { return (!includes.length || includes.some(r => domainMatches(host, r))) && !excludes.some(r => domainMatches(host, r)); }
+const MULTIPART_SUFFIXES = new Set(['co.uk','org.uk','ac.uk','gov.uk','com.au','net.au','org.au','co.jp','co.nz','com.br','com.cn','com.sg','co.in','github.io']);
+export function isPublicSuffix(host) { const h = normalizeHost(host), labels = h.split('.'); if (h === 'localhost' || isIP(h)) return false; return labels.length < 2 || MULTIPART_SUFFIXES.has(h); }
+function cookieAllowed(cookie, includes, excludes) {
+  const host = cookieDomain(cookie);
+  if (!host || (cookie.domain && isPublicSuffix(host))) return false;
+  if (cookie.domain && cookie.url) { try { if (!domainMatches(normalizeHost(new URL(cookie.url).hostname), host)) return false; } catch { return false; } }
+  if (!allowedDomain(host, includes, excludes)) return false;
+  // A Domain cookie applies to every subdomain, so a denied descendant makes it unsafe.
+  if (cookie.domain && excludes.some(denied => domainMatches(denied, host))) return false;
+  return true;
+}
+export function filterState(state, includes = [], excludes = []) {
+  includes = includes.map(normalizeHost); excludes = excludes.map(normalizeHost);
+  const originAllowed = origin => { try { const h = normalizeHost(new URL(origin).hostname); return !isPublicSuffix(h) && allowedDomain(h, includes, excludes); } catch { return false; } };
+  return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
+}
+
+export async function loadBundle(dir, options = {}) {
+  const manifest = await loadManifest(dir, options);
   const state = await readJson(path.join(dir, 'state.json'));
-  if (manifest.kind !== KIND) throw new Error(`unsupported bundle kind: ${manifest.kind}`);
-  if (!verifyObject(manifest)) throw new Error('manifest signature is invalid');
   if (manifest.state_sha256 !== sha256(state)) throw new Error('state.json does not match manifest');
   if (manifest.storage_state_sha256 !== sha256(await readFile(path.join(dir, 'storage_state.json')))) throw new Error('storage_state.json does not match manifest');
   return { manifest, state };
 }
-
-export async function saveBundle(dir, state, metadata = {}) {
-  await mkdir(dir, { recursive: true });
-  const storageState = metadata.storageState || toStorageState(state);
-  await writeJson(path.join(dir, 'state.json'), state);
-  if (metadata.storageStateRaw !== undefined) await writeFile(path.join(dir, 'storage_state.json'), metadata.storageStateRaw);
-  else await writeJson(path.join(dir, 'storage_state.json'), storageState);
-  const manifest = buildManifest(state, metadata);
-  manifest.state_sha256 = sha256(state);
-  manifest.storage_state_sha256 = sha256(await readFile(path.join(dir, 'storage_state.json')));
-  manifest.signature = signObject(manifest);
-  await writeJson(path.join(dir, 'manifest.json'), manifest);
+export async function loadManifest(dir, options = {}) {
+  const manifest = await readJson(path.join(dir, 'manifest.json'));
+  if (manifest.kind !== KIND || manifest.version !== 1) throw new Error('unsupported browser-session bundle version');
+  if (!verifyObject(manifest, { domain: 'browser-session-manifest' })) throw new Error('manifest signature is invalid');
+  if (options.trustSender && manifest.signature.fingerprint !== options.trustSender) throw new Error(`sender key is not trusted (fingerprint ${manifest.signature.fingerprint})`);
   return manifest;
 }
-
+export async function saveBundle(dir, state, metadata = {}) {
+  await privateDir(dir);
+  const storageState = metadata.storageState || toStorageState(state);
+  await writeJson(path.join(dir, 'state.json'), state);
+  await writePrivate(path.join(dir, 'storage_state.json'), metadata.storageStateRaw !== undefined ? metadata.storageStateRaw : `${JSON.stringify(storageState, null, 2)}\n`);
+  const manifest = buildManifest(state, metadata);
+  manifest.state_sha256 = sha256(state); manifest.storage_state_sha256 = sha256(await readFile(path.join(dir, 'storage_state.json')));
+  const identity = metadata.identity || await signingIdentity();
+  manifest.signature = signObject(manifest, identity, 'browser-session-manifest');
+  await writeJson(path.join(dir, 'manifest.json'), manifest); return manifest;
+}
 export function toStorageState(state) {
-  return {
-    cookies: (state.cookies || []).map(({ name, value, domain, path = '/', expires = -1, httpOnly = false, secure = false, sameSite = 'Lax' }) => ({ name, value, domain, path, expires, httpOnly, secure, sameSite })),
-    origins: (state.origins || []).map(o => ({ origin: o.origin, localStorage: o.localStorage || [] }))
-  };
+  return { cookies: (state.cookies || []).map(c => Object.fromEntries(['name','value','domain','path','expires','httpOnly','secure','sameSite','partitionKey'].filter(k => c[k] !== undefined).map(k => [k,c[k]]))), origins: (state.origins || []).map(o => ({ origin:o.origin, localStorage:o.localStorage || [] })) };
 }
-
-const DBSC_DOMAINS = ['accounts.google.com', 'google.com', 'googleapis.com', 'workspace.google.com'];
-
-function dbscReasons(domain, cookies) {
-  const reasons = [];
-  if (DBSC_DOMAINS.some(d => domainMatches(domain, d))) reasons.push('known DBSC-capable domain');
-  if (cookies.some(c => c.secure && c.httpOnly && /(^__Host-|bound|device|session|sid)/i.test(c.name))) reasons.push('Secure+HttpOnly session-name attribute hint');
-  return reasons;
+const DBSC_DOMAINS = ['accounts.google.com','google.com','googleapis.com','workspace.google.com'];
+function dbscReasons(domain,cookies) { const r=[]; if(DBSC_DOMAINS.some(d=>domainMatches(domain,d)))r.push('known DBSC-capable domain'); if(cookies.some(c=>c.secure&&c.httpOnly&&/(^__Host-|^(bound|device|session|sid)([-_.]|$))/i.test(c.name)))r.push('Secure+HttpOnly session-name attribute hint'); return r; }
+function safeTabUrl(value) { try { const u=new URL(value); u.search=''; u.hash=''; return u.href; } catch { return ''; } }
+export function buildManifest(state, metadata={}) {
+  const groups=new Map(); for(const c of state.cookies||[]){const d=cookieDomain(c);if(!groups.has(d))groups.set(d,[]);groups.get(d).push(c);}
+  const domains=[...groups].sort(([a],[b])=>a.localeCompare(b)).map(([domain,cookies])=>({domain,cookie_count:cookies.length,http_only_count:cookies.filter(c=>c.httpOnly).length,secure_count:cookies.filter(c=>c.secure).length}));
+  return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]}),cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
 }
-
-export function buildManifest(state, metadata = {}) {
-  const groups = new Map();
-  for (const cookie of state.cookies || []) {
-    const domain = cookieDomain(cookie);
-    if (!groups.has(domain)) groups.set(domain, []);
-    groups.get(domain).push(cookie);
-  }
-  const domains = [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([domain, cookies]) => ({
-    domain,
-    cookie_count: cookies.length,
-    http_only_count: cookies.filter(c => c.httpOnly).length,
-    secure_count: cookies.filter(c => c.secure).length
-  }));
-  const nonTeleportable = [...groups].flatMap(([domain, cookies]) => {
-    const reasons = dbscReasons(domain, cookies);
-    return reasons.length ? [{ domain, reasons, heuristic: true }] : [];
-  });
-  const origins = (state.origins || []).map(o => ({
-    origin: o.origin,
-    local_storage: Boolean(o.localStorage?.length),
-    session_storage: Boolean(o.sessionStorage?.length),
-    indexed_db: Boolean(o.indexedDB?.databases?.length)
-  }));
-  return {
-    kind: KIND,
-    version: 1,
-    capture_time: metadata.captureTime || new Date().toISOString(),
-    source_browser: metadata.sourceBrowser || 'Chrome via CDP',
-    source: metadata.source || 'cdp',
-    policy: metadata.policy || { include_domains: [], exclude_domains: [] },
-    domains,
-    origins,
-    tabs: (state.tabs || []).map(({ url, title }) => ({ url, title })),
-    total_size: Buffer.byteLength(JSON.stringify(state)),
-    non_teleportable: nonTeleportable,
-    cookie_flags_preserved: ['HttpOnly', 'Secure', 'SameSite', 'priority', 'sameParty', 'sourceScheme', 'sourcePort', 'partitionKey'],
-    provenance: metadata.provenance || { capture: 'direct-cdp', reexportable: true }
-  };
-}
-
-export function receiptPath(bundleDir) { return path.join(bundleDir, `receipt-${Date.now()}.json`); }
+export async function assertPrivateFile(file) { const mode=(await stat(file)).mode & 0o777; return mode === 0o600; }

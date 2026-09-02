@@ -1,4 +1,4 @@
-import { cp, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { cp, lstat, mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -35,11 +35,11 @@ function cookieForCdp(cookie) {
   return Object.fromEntries(allowed.filter(k => cookie[k] !== undefined).map(k => [k, cookie[k]]));
 }
 
-export async function capture(wsUrl, policy = {}) {
+export async function capture(wsUrl, policy = {}, options = {}) {
   const cdp = await new CDP(wsUrl).connect();
   try {
-    const cookies = (await cdp.send('Storage.getCookies')).cookies;
-    const targets = (await cdp.send('Target.getTargets')).targetInfos.filter(t => t.type === 'page' && /^https?:/.test(t.url));
+    const cookies = (await cdp.send('Storage.getCookies', options.browserContextId ? { browserContextId: options.browserContextId } : {})).cookies;
+    const targets = (await cdp.send('Target.getTargets')).targetInfos.filter(t => t.type === 'page' && /^https?:/.test(t.url) && (!options.browserContextId || t.browserContextId === options.browserContextId));
     const origins = new Map();
     const tabs = [];
     for (const target of targets) {
@@ -94,15 +94,16 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
     }
     // Re-apply the filtered cookie set to targets/contexts created during this live import operation.
     await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
-    const off = cdp.on('Target.attachedToTarget', async () => {
+    const off = cdp.on('Target.attachedToTarget', async params => {
+      if (params.targetInfo?.browserContextId !== browserContextId) return;
       if (filtered.cookies.length) await cdp.send('Storage.setCookies', { cookies: filtered.cookies.map(cookieForCdp), browserContextId }).catch(() => {});
     });
     if (options.watchMs) await delay(options.watchMs);
     off();
+    await cdp.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     return {
       kind: 'dev.abra.browser-session.receipt.v1',
       installed_at: new Date().toISOString(),
-      cdp_url: wsUrl,
       browser_context_id: browserContextId,
       cookies: filtered.cookies.map(c => ({ name: c.name, domain: c.domain, path: c.path || '/', partitionKey: c.partitionKey })),
       origins: filtered.origins.map(o => o.origin),
@@ -114,41 +115,65 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
   } finally { cdp.close(); }
 }
 
-export async function revoke(receipt) {
-  const cdp = await new CDP(receipt.cdp_url).connect();
+export async function revoke(wsUrl, browserContextId, origins = []) {
+  const cdp = await new CDP(wsUrl).connect();
   try {
-    // An isolated context is the revocation boundary; disposal atomically removes its cookies and storage.
-    await cdp.send('Target.disposeBrowserContext', { browserContextId: receipt.browser_context_id });
-    if (receipt.local_chrome?.pid) { try { process.kill(receipt.local_chrome.pid, 'SIGTERM'); } catch { /* already stopped */ } }
-    if (receipt.local_chrome?.profile_copy?.startsWith(os.tmpdir() + path.sep)) await rm(receipt.local_chrome.profile_copy, { recursive: true, force: true });
-    return { revoked_at: new Date().toISOString(), browser_context_id: receipt.browser_context_id, cleared_origins: receipt.origins };
+    await cdp.send('Target.disposeBrowserContext', { browserContextId });
+    return { revoked_at: new Date().toISOString(), browser_context_id: browserContextId, cleared_origins: origins };
   } finally { cdp.close(); }
 }
 
-export async function launchLocalChrome(profile) {
+async function rejectSymlinks(root) {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const file = path.join(root, entry.name), info = await lstat(file);
+    if (info.isSymbolicLink()) throw new Error(`refusing Chrome profile containing symlink: ${entry.name}`);
+    if (info.isDirectory()) await rejectSymlinks(file);
+  }
+}
+
+async function waitForExit(child, timeoutMs = 5000) {
+  if (child.exitCode !== null) return;
+  await Promise.race([new Promise(resolve => child.once('exit', resolve)), delay(timeoutMs)]);
+}
+
+export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
   const sourceRoot = path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
   const profileName = profile || 'Default';
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-profile-'));
-  await mkdir(path.join(tempRoot, profileName), { recursive: true });
-  await cp(path.join(sourceRoot, profileName), path.join(tempRoot, profileName), { recursive: true });
-  await cp(path.join(sourceRoot, 'Local State'), path.join(tempRoot, 'Local State')).catch(() => {});
+  const tempRoot = root || await mkdtemp(path.join(os.tmpdir(), fresh ? 'abra-browser-import-' : 'abra-browser-export-'));
+  await mkdir(tempRoot, { recursive: true, mode: 0o700 });
   let child;
   try {
-    child = spawn(CHROME, [`--user-data-dir=${tempRoot}`, `--profile-directory=${profileName}`, '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
+    if (!fresh) {
+      await rejectSymlinks(path.join(sourceRoot, profileName));
+      await mkdir(path.join(tempRoot, profileName), { recursive: true, mode: 0o700 });
+      await cp(path.join(sourceRoot, profileName), path.join(tempRoot, profileName), { recursive: true, dereference: false });
+      await cp(path.join(sourceRoot, 'Local State'), path.join(tempRoot, 'Local State'), { dereference: false }).catch(() => {});
+    }
+    child = spawn(CHROME, [`--user-data-dir=${tempRoot}`, ...(fresh ? [] : [`--profile-directory=${profileName}`]), '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
     let port;
     for (let i = 0; i < 200; i++) {
       try { port = Number((await readFile(path.join(tempRoot, 'DevToolsActivePort'), 'utf8')).split('\n')[0]); break; } catch { await delay(50); }
     }
-    if (!port) throw new Error('Chrome did not expose a debugging port for the copied profile');
+    if (!port) throw new Error('Chrome did not expose a debugging port');
     return { wsUrl: await browserWebSocketFromPort(port), child, tempRoot };
   } catch (error) {
     child?.kill('SIGTERM');
-    throw new Error(`copied-profile CDP capture failed (${error.message}); SQLite/Keychain fallback is unavailable because Node has no SQLite API and no reliable sqlite3 CLI is bundled`);
+    await waitForExit(child || { exitCode: 0 });
+    await rm(tempRoot, { recursive: true, force: true });
+    throw new Error(`${fresh ? 'isolated import' : 'copied-profile capture'} failed; SQLite/Keychain fallback is unavailable`);
   }
 }
 
 export async function withLocalChrome(profile, fn) {
   const local = await launchLocalChrome(profile);
+  let cleaning=false;
+  const cleanup=async()=>{if(cleaning)return;cleaning=true;local.child.kill('SIGTERM');await waitForExit(local.child);await rm(local.tempRoot,{recursive:true,force:true});};
+  const interrupted=()=>{cleanup().finally(()=>process.exit(130));};
+  process.once('SIGINT',interrupted);process.once('SIGTERM',interrupted);
   try { return await fn(local.wsUrl); }
-  finally { local.child.kill('SIGTERM'); }
+  finally { process.off('SIGINT',interrupted);process.off('SIGTERM',interrupted);await cleanup(); }
+}
+
+export async function stopLocalChrome(local) {
+  local.child.kill('SIGTERM'); await waitForExit(local.child); await rm(local.tempRoot, { recursive: true, force: true });
 }

@@ -651,23 +651,25 @@ or equal to any public key.
 
 ```
 day = floor(unix_seconds_utc / 86400)              // decimal ASCII, no leading zeros
-tag = HMAC-SHA256(key = relay_key, msg = "abra-relay-v1" || 0x00 || day)
+tag = HMAC-SHA256(key = relay_key, msg = "abra-relay-tag-v1" || 0x00 || i64be(day))
 ```
 
 Recipients poll tags for {day−1, day, day+1}. The relay indexes only tags; it
 cannot compute them (the key is secret), read payloads, or correlate across days.
 Within-day correlation of a single recipient's envelopes is accepted and stated.
 
-**Envelopes** (binary): `ABRAREL1` (control pack: `magic[8] || tag[32] ||
-u64be expires_at || u32be ct_len || ciphertext`, ct ≤ 16 MiB) and `ABRABL1\0`
-(one object per envelope, u64be ct_len; the plaintext is `kind u8 || digest[32]
-|| raw bytes` — the digest is never exposed to the relay). TTL sender-chosen:
-default 72h, max 7d; relay deletes at expiry.
+**Relay item:** canonical JSON `{version:1,tag:<hex>,expires_at:<unix-ms>,sealed:<base64url>}`,
+at most 16 MiB. TTL is sender-chosen, defaults to 72h, is at most 30d, and the
+relay deletes expired items. The tag and expiry are routing metadata; everything
+Abra-specific is inside `sealed`.
 
-**Sealing:** libsodium sealed box to the recipient's **X25519 key from §7**
-(`crypto_box_curve25519xchacha20poly1305_seal` layout: `eph_pk[32] || ct`).
-No Ed25519→X25519 derivation anywhere. `ABRAREL1` plaintext is a CJSON
-`relay-pack {type, v:1, from, offer:{...}, objects?:[...small only...]}`.
+**Sealing:** generate an ephemeral X25519 keypair and DH with the recipient's
+X25519 public key from §7. Derive the AES-256-GCM key as SHA-256 of
+`"abra-relay-seal-v1" || 0x00 || shared_secret || ephemeral_public || recipient_public`.
+Use a fresh random 12-byte nonce and AAD `ABRAREL1 || ephemeral_public ||
+recipient_public`. The sealed bytes are `AAD || nonce || ciphertext-and-tag`.
+No Ed25519→X25519 derivation occurs. HTTP endpoints are `POST /v1/enqueue`,
+`POST /v1/poll`, and `DELETE /v1/item/<id>` and require a deploy bearer secret.
 
 **Acks:** recipients ack directly p2p when possible, else deposit an `ABRAREL1`
 ack pack to the sender's tag. Independently of relays, every receiver MUST keep a
@@ -700,7 +702,7 @@ application/octet-stream`). The compact form
 ### 9.2 Hosted blob
 
 ```
-magic[8]="ABRACAP1" || alg u8 (1=XChaCha20-Poly1305) || nonce[24] ||
+magic[8]="ABRACAP1" || alg u8 (2=AES-256-GCM) || nonce[12] ||
 u64be expires_at || u64be ct_len || ciphertext
 AAD = magic || alg || nonce || expires_at
 ```
@@ -727,7 +729,8 @@ is advisory; deletion is the enforcement). Revocation = delete or replace with
 
 `kind` (text), `title`, origin short-id/name, `created_at` (localized),
 `summary?`, `link?` (as anchor), `thumbnail?`. Static JS; no backend; needs only
-CJSON, BLAKE3, Ed25519, XChaCha20-Poly1305. MUST NOT send `k` anywhere, MUST NOT
+CJSON, BLAKE3, Ed25519, AES-256-GCM. Invalid or unavailable signatures leave
+links, thumbnails, and downloads inert. MUST NOT send `k` anywhere, MUST NOT
 execute recipes or native blobs, MUST NOT derive deep links beyond
 `manifest.link` (derivation belongs to consumers).
 
@@ -822,8 +825,7 @@ turn.
 
 ## 13. Open questions (deliberate)
 
-1. Relay HTTP endpoints and relay-operator rate limiting (envelope bytes are
-   pinned; the HTTP shell is v-next).
+1. Relay-operator rate limiting beyond the deployment bearer secret.
 2. Tree metadata extensions (xattrs, non-UTF-8 names) without breaking
    portability.
 3. Durable control delivery (v0.1 control is live-only).
@@ -840,6 +842,9 @@ turn.
   replaces XChaCha20-Poly1305 for capability links only because browsers expose
   AES-GCM, but not XChaCha20, through WebCrypto. Fresh per-link keys prevent
   nonce reuse in normal operation. Mesh and relay cryptography are unchanged.
+- Relay discovery-key erratum: each device has an independent random 32-byte
+  relay discovery key shared through pairing/enrollment records. Relay sealing
+  uses the ephemeral-X25519 and AES-256-GCM construction pinned in §8.
 - Fleet-profile clarification: guest-to-guest delivery is authorization policy,
   not a protocol change. `personal` forbids it. `fleet` permits it only when the
   sender's send scope and recipient's receive scope both cover the exact kind

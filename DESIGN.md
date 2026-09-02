@@ -13,10 +13,10 @@ iroh endpoint id cannot diverge. The workspace MSRV is Rust 1.91. Pairing
 tickets and enrollment-token intro records carry the complete serialized iroh
 `EndpointAddr`: endpoint id and direct UDP addresses.
 
-The shipped `presets::Minimal` endpoint has no discovery, relay, port mapping,
-or Abra relay configuration. It therefore needs directly usable addresses
-(normally the same LAN or manual routing). Relay and configurable discovery
-support are future work. The historical Stage-2 authenticated but unencrypted
+The shipped `presets::Minimal` endpoint has no iroh discovery, relay, or port
+mapping. It therefore needs directly usable addresses for direct delivery.
+Abra's optional blind HTTP relay is a separate sealed store-and-forward path.
+The historical Stage-2 authenticated but unencrypted
 TCP transport remains an explicit `--transport tcp` loopback-only test mode;
 it is not an inter-device fallback.
 
@@ -209,8 +209,9 @@ these learns a hash and a ciphertext and nothing else — the same blind-relay
 property the transport layer has.
 
 The build-free static viewer decrypts with WebCrypto and verifies Ed25519 where
-the browser supports it. Older browsers show an explicit unverified badge while
-still rendering the floor card. `abra link serve` is a local development host;
+the browser supports it. Older browsers show an explicit unverified badge and
+an inert floor card: links, thumbnails, and downloads require verification.
+Verification proves self-consistency, not mesh identity. `abra link serve` is a local development host;
 production hosting is any HTTPS object origin with CORS, optionally reached
 through the uploader command hook.
 
@@ -236,8 +237,8 @@ arrive" rather than "it worked when both were awake".
 
 ### Direct p2p in v1
 
-Direct encrypted connections between the user's devices are the only shipped
-iroh path. Configurable discovery and blind relays are future work.
+Direct encrypted connections remain the preferred path. The optional
+`abra-relay` service stores recipient-sealed envelopes under rotating HMAC tags.
 
 ### Adapters are separate executables
 

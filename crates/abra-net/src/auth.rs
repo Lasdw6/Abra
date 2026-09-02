@@ -823,6 +823,8 @@ pub struct Intro {
     pub name: String,
     #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
+    #[serde(with = "hex32")]
+    pub relay_discovery_key: [u8; 32],
     pub addresses: Vec<String>,
 }
 
@@ -833,6 +835,7 @@ pub struct EnrollOk {
     pub message_type: String,
     pub mesh: Vec<EnrollMeshPeer>,
     pub certificate: BindCertificate,
+    pub mesh_profile: MeshProfile,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -841,6 +844,11 @@ pub struct EnrollMeshPeer {
     pub peer_id: PeerId,
     pub name: String,
     pub role: Role,
+    #[serde(with = "hex32")]
+    pub x25519_pk: [u8; 32],
+    pub token_id: Option<String>,
+    pub scopes: Option<Scopes>,
+    pub expires_at: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -941,6 +949,8 @@ pub struct EnrollBind {
     pub name: Option<String>,
     #[serde(with = "hex32")]
     pub x25519_pk: [u8; 32],
+    #[serde(with = "hex32")]
+    pub relay_discovery_key: [u8; 32],
     pub sig: Signature,
 }
 impl EnrollBind {
@@ -948,6 +958,7 @@ impl EnrollBind {
         token: EnrollmentToken,
         name: Option<String>,
         x25519_pk: [u8; 32],
+        relay_discovery_key: [u8; 32],
         guest: &Identity,
     ) -> Result<Self> {
         if token.audience.is_some_and(|p| p != guest.peer_id()) {
@@ -966,6 +977,7 @@ impl EnrollBind {
             guest_peer_id: guest.peer_id(),
             name,
             x25519_pk,
+            relay_discovery_key,
             sig,
         })
     }

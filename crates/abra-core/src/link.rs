@@ -20,6 +20,9 @@ pub const MAGIC: &[u8; 8] = b"ABRACAP1";
 pub const REVOKED_MAGIC: &[u8; 8] = b"ABRACAPX";
 pub const ALG_AES_256_GCM: u8 = 2;
 const HEADER_LEN: usize = 8 + 1 + 12 + 8 + 8;
+/// Hard ceiling for an encrypted capability, including its header. This keeps
+/// hostile links from forcing an unbounded allocation during decrypt/import.
+pub const MAX_CAPABILITY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,6 +59,12 @@ pub struct MintRecord {
     /// Deliberately fragment-free: the bearer key is never persisted.
     pub url: String,
     pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciphertext_hash: Option<Hash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke_command: Option<String>,
     pub sig: Signature,
 }
 
@@ -161,6 +170,9 @@ pub fn mint(
         mode,
         url: public_url,
         revoked: false,
+        ciphertext_hash: None,
+        local_path: None,
+        revoke_command: None,
         sig: Signature::from_bytes([0; 64]),
     };
     record.resign(&store.keys.identity)?;
@@ -168,6 +180,9 @@ pub fn mint(
 }
 
 pub fn open(blob: &[u8], key: &[u8; 32], now_ms: u64) -> Result<CapabilityPack> {
+    if blob.len() > MAX_CAPABILITY_BYTES {
+        return Err(Error::invalid("capability blob exceeds 64 MiB limit"));
+    }
     if blob.starts_with(REVOKED_MAGIC) {
         return Err(Error::invalid("capability link was revoked"));
     }
@@ -178,8 +193,10 @@ pub fn open(blob: &[u8], key: &[u8; 32], now_ms: u64) -> Result<CapabilityPack> 
     if now_ms > expires {
         return Err(Error::invalid("capability link expired"));
     }
-    let ct_len = u64::from_be_bytes(blob[29..37].try_into().expect("header checked")) as usize;
-    if blob.len() != HEADER_LEN + ct_len {
+    let ct_len_u64 = u64::from_be_bytes(blob[29..37].try_into().expect("header checked"));
+    let ct_len = usize::try_from(ct_len_u64)
+        .map_err(|_| Error::invalid("capability ciphertext length overflows platform"))?;
+    if ct_len > MAX_CAPABILITY_BYTES - HEADER_LEN || blob.len() != HEADER_LEN + ct_len {
         return Err(Error::invalid("invalid capability ciphertext length"));
     }
     let plaintext = Aes256Gcm::new_from_slice(key)
@@ -274,7 +291,11 @@ pub fn revoke_record(store: &AbraStore, id: &str) -> Result<MintRecord> {
     record.revoked = true;
     record.resign(&store.keys.identity)?;
     save_record(store, &record)?;
-    if let Some(path) = record.url.strip_prefix("file://") {
+    if let Some(path) = record
+        .local_path
+        .as_deref()
+        .or_else(|| record.url.strip_prefix("file://"))
+    {
         let path = Path::new(path);
         if path.exists() {
             atomic_write(path, REVOKED_MAGIC)?;

@@ -39,6 +39,7 @@ name = "abra-net"
 version = "0.1.0"
 dependencies = [
  "abra-core",
+ "aes-gcm",
  "async-trait",
  "blake3",
  "data-encoding",
@@ -48,8 +49,23 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "abra-relay"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 

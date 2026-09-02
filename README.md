@@ -86,9 +86,10 @@ $ target/debug/abra link serve ./shared --listen 127.0.0.1:8080
 ```
 
 `--upload-command 'command {file} {hash} {url}'` provides the pluggable uploader
-hook; pair it with `--url https://objects.example/...`. The command receives no
+hook; remote uploads require a paired `--revoke-command` using the same
+placeholders. Pair it with `--url https://objects.example/...`. Neither command receives a
 bearer key. `link list` stores only fragment-free URLs, and `link revoke <id>`
-tombstones locally hosted ciphertext.
+tombstones local ciphertext and invokes the recorded remote tombstone hook.
 
 Without `--yes`, leave `pair add` running, inspect `pair pending` on the ticket
 issuer, and run `pair confirm <peer-id>`. Confirmation completes the existing
@@ -104,16 +105,17 @@ $ target/debug/abra --root /tmp/abra-b daemon --token "$TOKEN"
 Human-mode enrollment also prints `abra://join/<token>`. `abra join <token>`
 redeems through an already-running daemon. TCP is retained explicitly as
 `daemon --transport tcp`; it is loopback-only, authenticated, and not encrypted.
-The default iroh transport uses direct addresses only: discovery, relays, port
-mapping, and general cross-NAT reachability are not shipped in v1. Recipes and
+The default iroh transport uses direct addresses. The optional `abra-relay`
+binary provides blind sealed store-and-forward delivery primitives. Recipes and
 control messages are carried/surfaced as data; Abra does not execute them.
 
 ## Status
 
 Stages 1–4 include local primitives, encrypted iroh transport, scoped guests,
 receive grants, durable delivery, the daemon, CLI, and cross-process tests. A
-static capability-link viewer ships in `viewer/`; external adapter execution and
-blind relay hosting remain deferred.
+static capability-link viewer ships in `viewer/`; Cadabra runs external adapters,
+the reference folder adapter lives under `adapters/`, and `abra-relay` provides
+the minimal self-hosted relay service.
 
 ## Building
 

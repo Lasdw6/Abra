@@ -1,5 +1,6 @@
 //! Library-first Abra daemon and its newline-delimited JSON control API.
 #![forbid(unsafe_code)]
+pub mod adapters;
 
 use abra_core::{
     capsule::{random_capsule_id, Genesis, LabelOp, LeaseMode, LeaseRecord},
@@ -161,6 +162,7 @@ impl Daemon {
                 token.clone(),
                 Some("guest".into()),
                 node.store.keys.x25519_public(),
+                node.store.keys.relay_discovery_key,
                 &node.store.keys.identity,
             )?
         };
@@ -184,8 +186,20 @@ impl Daemon {
             scopes: None,
             expires_at: None,
         })?;
-        // Guest trust is issuer-device-local in v1. Mesh rows are informational
-        // and intentionally omit the key material required to install trust.
+        for peer in ok.mesh {
+            if peer.peer_id != node.peer_id() {
+                node.trust.insert(TrustedPeer {
+                    peer_id: peer.peer_id,
+                    name: peer.name,
+                    role: peer.role,
+                    x25519_pk: peer.x25519_pk,
+                    token_id: peer.token_id,
+                    scopes: peer.scopes,
+                    expires_at: peer.expires_at,
+                })?;
+            }
+        }
+        node.trust.set_mesh_profile(ok.mesh_profile)?;
         node.trust.set_local_role(LocalRole::Guest {
             token: Box::new(token.clone()),
         })?;
@@ -275,19 +289,19 @@ impl Daemon {
                 }
             }
         }));
-        let daemon = Arc::clone(self);
-        let mut stop = self.shutdown.subscribe();
-        tasks.push(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop.changed() => break,
-                    incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
-                        let daemon = Arc::clone(&daemon);
-                        let sessions = Arc::clone(&sessions);
-                        tokio::spawn(async move {
-                            let Ok(_permit) = sessions.try_acquire_owned() else {
-                                return;
-                            };
+        // Multiple accept workers ensure transport wrapping/authentication never
+        // serializes the listener. Each handshake already has a transport-level
+        // timeout, and the session semaphore bounds total work.
+        for _ in 0..4 {
+            let daemon = Arc::clone(self);
+            let sessions = Arc::clone(&sessions);
+            let mut stop = self.shutdown.subscribe();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => break,
+                        incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
+                            let Ok(_permit) = sessions.clone().acquire_owned().await else { break; };
                             match DeliveryNode::open(&daemon.root) {
                                 Ok(mut node) => {
                                     node.auto_confirm_pairs = daemon.yes;
@@ -299,11 +313,11 @@ impl Daemon {
                                 }
                                 Err(error) => eprintln!("cadabra: session store error: {error}"),
                             }
-                        });
+                        }
                     }
                 }
-            }
-        }));
+            }));
+        }
         let daemon = Arc::clone(self);
         let mut stop = self.shutdown.subscribe();
         tasks.push(tokio::spawn(async move {
@@ -501,7 +515,7 @@ impl Daemon {
                 let ticket = PairTicket::mint(
                     string_or(&request, "name", "device"),
                     node.store.keys.x25519_public(),
-                    None,
+                    Some(node.store.keys.relay_discovery_key),
                     self.transport.local_addresses(),
                     now_ms(),
                     600_000,
@@ -532,6 +546,21 @@ impl Daemon {
             }
             "snapshot" => self.snapshot(&request).await,
             "send" => self.send(&request).await,
+            "adapters-list" => {
+                let registry = adapters::AdapterRegistry::discover(&self.root)?;
+                Ok(serde_json::to_value(registry.list())?)
+            }
+            "adapters-add" => {
+                adapters::AdapterRegistry::add(
+                    &self.root,
+                    Path::new(required_str(&request, "dir")?),
+                )?;
+                Ok(json!({"added":required_str(&request, "dir")?}))
+            }
+            "adapters-remove" => {
+                adapters::AdapterRegistry::remove(&self.root, required_str(&request, "name")?)?;
+                Ok(json!({"removed":required_str(&request, "name")?}))
+            }
             "inbox" => self.inbox().await,
             "accept" => self.accept(&request).await,
             "log" => self.log(&request).await,
@@ -604,7 +633,7 @@ impl Daemon {
                 ticket.ticket_id.clone(),
                 "device".into(),
                 node.store.keys.x25519_public(),
-                None,
+                Some(node.store.keys.relay_discovery_key),
                 nonce,
                 &node.store.keys.identity,
             )?;
@@ -733,9 +762,39 @@ impl Daemon {
 
     async fn send(&self, request: &Value) -> Result<Value> {
         let peer: PeerId = required_str(request, "peer")?.parse()?;
+        let adapter_export = if let Some(kind) = request.get("kind").and_then(Value::as_str) {
+            Some((
+                kind.to_owned(),
+                adapters::AdapterRegistry::discover(&self.root)?
+                    .export(kind, required_str(request, "source")?, &self.root, None)
+                    .await?,
+            ))
+        } else {
+            None
+        };
         let mut node = self.node.lock().await;
         node.store = abra_core::store::AbraStore::open(&self.root)?;
-        let raw = if let Some(id) = request.get("snapshot_id").and_then(Value::as_str) {
+        let raw = if let Some((kind, export)) = adapter_export {
+            let floor = export.floor;
+            let title = floor
+                .as_ref()
+                .and_then(|value| value.title.clone())
+                .unwrap_or_else(|| kind.clone());
+            let mut manifest = base_manifest(&node, Scope::Partial, &kind, &title);
+            manifest.payload = export
+                .payload
+                .as_object()
+                .cloned()
+                .ok_or("adapter payload must be an object")?;
+            manifest.summary = floor.as_ref().and_then(|value| value.summary.clone());
+            manifest.link = floor.and_then(|value| value.link);
+            if let Some(path) = export.files_path {
+                manifest.files = Some(snapshot_dir(&node.store.cas, &path)?);
+            }
+            manifest.origin.adapter = Some(kind.clone());
+            manifest.sign(&node.store.keys.identity)?;
+            RawManifest::parse(manifest.to_canonical_bytes()?)?
+        } else if let Some(id) = request.get("snapshot_id").and_then(Value::as_str) {
             find_snapshot_or_capsule_head(&node, id)?
         } else if let Some(link) = request.get("link").and_then(Value::as_str) {
             let title = request.get("title").and_then(Value::as_str).unwrap_or(link);
@@ -788,6 +847,21 @@ impl Daemon {
                 materialize(&node.store.cas, &files, destination)?;
             }
             materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
+            let registry = adapters::AdapterRegistry::discover(&self.root)?;
+            if registry
+                .for_kind(&raw.manifest().kind)
+                .is_some_and(|adapter| adapter.manifest.verbs.iter().any(|verb| verb == "import"))
+            {
+                registry
+                    .import(
+                        &raw.manifest().kind,
+                        Value::Object(raw.manifest().payload.clone()),
+                        raw.manifest().files.map(|_| destination),
+                        destination,
+                        None,
+                    )
+                    .await?;
+            }
             node.store.mark_inbox_read(id)?;
         } else {
             let raw = find_snapshot(&node, &id.to_hex())?;
@@ -897,6 +971,7 @@ impl Daemon {
                 peer_id: node.peer_id(),
                 name: "device".into(),
                 x25519_pk: node.store.keys.x25519_public(),
+                relay_discovery_key: node.store.keys.relay_discovery_key,
                 addresses: self.transport.local_addresses(),
             }],
             None,

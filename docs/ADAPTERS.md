@@ -10,11 +10,17 @@ never selects snapshot ids or origins and never supplies recipes.
 An `abra-adapter.json` beside the executable contains:
 
 ```json
-{"spec":"abra-adapter/1","name":"com.example.browser","version":"1.0.0","kinds":["com.example.session"],"verbs":["export","import","watch"]}
+{"spec":"abra-adapter/1","name":"com.example.browser","version":"1.0.0","kinds":["com.example.session"],"verbs":["export","import","watch"],"executable":"browser-adapter"}
 ```
 
 Two adapters claiming a kind are a configuration error requiring explicit user
 selection.
+
+Cadabra discovers `<root>/adapters/*/abra-adapter.json`; `abra adapters add
+<dir>`, `list`, and `remove <name>` manage additional absolute directories.
+`executable` is relative to the manifest directory and cannot escape it. It may
+be omitted when the executable filename exactly equals `name`, which keeps the
+browser-session manifest shape loadable.
 
 Every request contains `protocol:"abra-adapter/1"`, a hex `request_id`, and a
 `verb`. Every response repeats `request_id` and has either `ok:true` plus result
@@ -45,6 +51,7 @@ per operation. Export/import time out after ten minutes. Cancellation sends
 Cadabra's built-in workspace export/import and handoff handling are the
 reference behavior for this contract; they are not external adapter processes.
 
-The runner is not linked into the current daemon build. Until it lands,
-`abra send --kind --source` and automatic adapter import are unavailable rather
-than silently emulated.
+The runner is implemented in Cadabra. `abra send <peer> --kind <kind> --source
+<path-or-uri>` exports into daemon-owned staging before signing and enqueueing;
+`abra accept` invokes a registered importer after verified materialization. The
+reference conformance adapter is `adapters/reference-folder/`.

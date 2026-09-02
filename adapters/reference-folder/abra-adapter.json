@@ -1,0 +1,1 @@
+{"spec":"abra-adapter/1","name":"dev.abra.reference-folder","version":"1.0.0","kinds":["dev.abra.folder"],"verbs":["export","import","watch"],"executable":"reference-folder.py"}

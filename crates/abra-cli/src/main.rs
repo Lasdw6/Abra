@@ -91,6 +91,17 @@ enum Command {
         #[command(subcommand)]
         command: LinkCommand,
     },
+    Adapters {
+        #[command(subcommand)]
+        command: AdapterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdapterCommand {
+    List,
+    Add { dir: PathBuf },
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +122,10 @@ enum LinkCommand {
         /// Shell command template with {file}, {hash}, and {url} placeholders.
         #[arg(long)]
         upload_command: Option<String>,
+        /// Required companion hook for remotely uploaded ciphertext. Receives
+        /// the same {file}, {hash}, and {url} placeholders at revoke time.
+        #[arg(long, requires = "upload_command")]
+        revoke_command: Option<String>,
         /// Static viewer origin. When set, emits the fragment-only viewer form.
         #[arg(long)]
         viewer: Option<String>,
@@ -199,6 +214,10 @@ struct SendArgs {
     path: Option<PathBuf>,
     #[arg(long)]
     capsule: Option<String>,
+    #[arg(long, requires = "source")]
+    kind: Option<String>,
+    #[arg(long, requires = "kind")]
+    source: Option<String>,
 }
 
 #[derive(Args)]
@@ -296,7 +315,7 @@ async fn main() -> cadabra::Result<()> {
         }
         Command::Send(args) => {
             let path = args.path.map(std::fs::canonicalize).transpose()?;
-            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule})
+            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule,"kind":args.kind,"source":args.source})
         }
         Command::Inbox => json!({"op":"inbox"}),
         Command::Accept { id, to } => {
@@ -348,6 +367,13 @@ async fn main() -> cadabra::Result<()> {
         Command::Mesh {
             command: MeshCommand::Profile { profile },
         } => json!({"op":"mesh-profile","profile":profile}),
+        Command::Adapters { command } => match command {
+            AdapterCommand::List => json!({"op":"adapters-list"}),
+            AdapterCommand::Add { dir } => {
+                json!({"op":"adapters-add","dir":fs::canonicalize(dir)?})
+            }
+            AdapterCommand::Remove { name } => json!({"op":"adapters-remove","name":name}),
+        },
         Command::Watch => unreachable!(),
         Command::Link { .. } => unreachable!(),
         Command::Daemon { .. } => unreachable!(),
@@ -385,6 +411,15 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
         link::{self, LinkMode},
     };
     use data_encoding::BASE64URL_NOPAD;
+    if matches!(
+        &command,
+        LinkCommand::Mint { .. } | LinkCommand::Serve { .. }
+    ) {
+        let trust = abra_net::TrustStore::open(root)?;
+        if !matches!(trust.local_role(), abra_net::LocalRole::Full) {
+            return Err("guest devices may not mint or host capability links".into());
+        }
+    }
     match command {
         LinkCommand::Mint {
             snapshot,
@@ -394,6 +429,7 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
             out,
             url,
             upload_command,
+            revoke_command,
             viewer,
         } => {
             let store = abra_core::store::AbraStore::open(root)?;
@@ -413,6 +449,9 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
                 std::env::current_dir()?.join(&provisional)
             };
             let public_url = url.unwrap_or_else(|| format!("file://{}", absolute.display()));
+            if !public_url.starts_with("file://") && revoke_command.is_none() {
+                return Err("remote uploads require --revoke-command so revocation can tombstone the hosted blob".into());
+            }
             let minted = link::mint(
                 &store,
                 &raw,
@@ -453,6 +492,9 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
             }
             let mut record = minted.record;
             record.url = actual_url.clone();
+            record.ciphertext_hash = Some(blob_hash);
+            record.local_path = Some(blob_path.to_string_lossy().into_owned());
+            record.revoke_command = revoke_command;
             record.resign(&store.keys.identity)?;
             link::save_record(&store, &record)?;
             let key = BASE64URL_NOPAD.encode(&minted.key);
@@ -498,6 +540,24 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
         LinkCommand::Revoke { id } => {
             let store = abra_core::store::AbraStore::open(root)?;
             let record = link::revoke_record(&store, &id)?;
+            if !record.url.starts_with("file://") {
+                let template = record.revoke_command.as_deref().ok_or(
+                    "remote capability has no revoke hook; hosted ciphertext was not revoked",
+                )?;
+                let file = record.local_path.as_deref().unwrap_or("");
+                let hash = record
+                    .ciphertext_hash
+                    .map(|h| h.to_hex())
+                    .unwrap_or_default();
+                let command = template
+                    .replace("{file}", file)
+                    .replace("{hash}", &hash)
+                    .replace("{url}", &record.url);
+                let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
+                if !status.success() {
+                    return Err("remote revoke command failed".into());
+                }
+            }
             if json_output {
                 println!("{}", serde_json::to_string(&record)?);
             } else {
@@ -614,16 +674,28 @@ async fn serve_links(dir: &Path, listen: &str) -> cadabra::Result<()> {
             } else {
                 root.join(path)
             };
-            match tokio::fs::read(file).await {
+            let resolved = tokio::fs::canonicalize(&file).await;
+            if resolved.as_ref().is_ok_and(|p| !p.starts_with(&root)) {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                return;
+            }
+            let Ok(file) = resolved else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 0\r\n\r\n").await;
+                return;
+            };
+            match tokio::fs::read(&file).await {
                 Ok(bytes) => {
-                    let content_type = if path.ends_with(".html") {
+                    let content_type = if file.extension().and_then(|x| x.to_str()) == Some("html")
+                    {
                         "text/html; charset=utf-8"
-                    } else if path.ends_with(".js") {
+                    } else if file.extension().and_then(|x| x.to_str()) == Some("js") {
                         "text/javascript; charset=utf-8"
                     } else {
                         "application/octet-stream"
                     };
-                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nX-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
                     let _ = stream.write_all(header.as_bytes()).await;
                     let _ = stream.write_all(&bytes).await;
                 }

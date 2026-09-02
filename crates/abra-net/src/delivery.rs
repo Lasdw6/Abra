@@ -779,17 +779,25 @@ impl DeliveryNode {
                 total_size: object.bytes,
                 offset,
             };
-            let remaining = object.bytes - offset;
-            let take = remaining.min(budget);
-            let mut stream = Vec::with_capacity(ObjectHeader::LEN + take as usize);
-            stream.extend_from_slice(&header.encode());
-            stream.extend_from_slice(&bytes[offset as usize..(offset + take) as usize]);
-            connection.open_uni(stream).await?;
+            let mut position = offset;
             stats.resumed_bytes += offset;
-            stats.bytes_transferred += take;
-            budget -= take;
-            if take < remaining {
-                return Ok(DeliveryOutcome::Interrupted { stats });
+            while position < object.bytes {
+                const STREAM_CHUNK: u64 = 1024 * 1024;
+                let take = (object.bytes - position).min(budget).min(STREAM_CHUNK);
+                if take == 0 {
+                    return Ok(DeliveryOutcome::Interrupted { stats });
+                }
+                let chunk_header = ObjectHeader {
+                    offset: position,
+                    ..header
+                };
+                let mut stream = Vec::with_capacity(ObjectHeader::LEN + take as usize);
+                stream.extend_from_slice(&chunk_header.encode());
+                stream.extend_from_slice(&bytes[position as usize..(position + take) as usize]);
+                connection.open_uni(stream).await?;
+                stats.bytes_transferred += take;
+                budget -= take;
+                position += take;
             }
             stats.objects_transferred += 1;
         }
@@ -1175,17 +1183,25 @@ impl DeliveryNode {
                         .trust
                         .peers()
                         .values()
-                        .filter(|peer| peer.role == crate::Role::Full)
+                        .filter(|peer| {
+                            peer.role == crate::Role::Full
+                                || self.trust.mesh_profile() == crate::MeshProfile::Fleet
+                        })
                         .map(|peer| crate::EnrollMeshPeer {
                             peer_id: peer.peer_id,
                             name: peer.name.clone(),
                             role: peer.role.clone(),
+                            x25519_pk: peer.x25519_pk,
+                            token_id: peer.token_id.clone(),
+                            scopes: peer.scopes.clone(),
+                            expires_at: peer.expires_at.clone(),
                         })
                         .collect();
                     let reply = crate::EnrollOk {
                         message_type: "enroll-ok".into(),
                         mesh,
                         certificate,
+                        mesh_profile: self.trust.mesh_profile(),
                     };
                     let (send, _) = connection.control_mut();
                     write_frame(send, &reply).await?;

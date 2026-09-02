@@ -27,6 +27,7 @@ Operations and request fields:
 | `capsule-create` | `path` | capsule id |
 | `snapshot` | `path`, `label?` | capsule and snapshot ids |
 | `send` | `peer` and one of `snapshot_id`, `path`, or `link`; `title?`, `note?` | durable outbox id |
+| `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | adapter registrations |
 | `inbox` | — | partial floor cards and read state |
 | `accept` | `id`, `to` | materializes files, if any, and marks inbox items read |
 | `log` | `capsule?` | capsule snapshot history |

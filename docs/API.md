@@ -26,7 +26,8 @@ Operations and request fields:
 | `peers` | — | trusted peer records |
 | `capsule-create` | `path` | capsule id |
 | `snapshot` | `path`, `label?` | capsule and snapshot ids |
-| `native-attach` | `capsule`, `fingerprint`, `artifacts[{role,path}]` | signed child snapshot and native refs (adapter API) |
+| `native-attach` | `capsule`, `parent_snapshot`, `snapshot_type:"Full"`, `fingerprint`, `artifact_root`, `artifacts[{role,path}]` | signed child snapshot and exactly `vmstate,memory,disk` refs; paths must remain under `artifact_root` (adapter API) |
+
 | `send` | `peer` and one of `snapshot_id`, `path`, or `link`; `title?`, `note?` | durable outbox id |
 | `inbox` | — | partial floor cards and read state |
 | `accept` | `id`, `to` | materializes files, if any, and marks inbox items read |
@@ -60,3 +61,8 @@ transported and materialized as data but never executed by Abra. Control
 messages are surfaced through `events`/`watch`; acting on them belongs to the
 receiving application. Guest enrollment and revocation are issuer-device-local
 in v1.
+
+Native refs are an optional cache. Receivers compare every fingerprint field
+against a live probe and fall back to the portable file tree and recipe data
+after any mismatch or native load/readiness failure. `native-attach` is local
+device authority and its socket must remain `0600` inside a `0700` directory.

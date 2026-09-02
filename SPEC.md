@@ -120,12 +120,16 @@ not, and this is stated rather than hidden. `ports`: sorted unique integers
 ```json
 {"role":"memory","blob":"<blob id>","bytes":2147483648,
  "fingerprint":{"os":"linux","arch":"x86_64","hypervisor":"firecracker",
-                "snapshot_format_major":11,"cpu_template":"-"}}
+                "snapshot_format_major":11,"cpu_template":"-",
+                "cpu_identity":"vendor=GenuineIntel;family=6;model=85;stepping=7"}}
 ```
 
 `role`: `[a-z][a-z0-9._-]{0,63}` (`memory`, `vmstate`, `disk`, ...). Fingerprint
 fields are required strings (`snapshot_format_major` is an integer ≥ 0;
-`cpu_template` is `"-"` when none). A receiver MUST use the blob only if **every**
+`cpu_template` is `"-"` when none; `cpu_identity` is required). For the
+Firecracker adapter, the exact fingerprint string format is
+`linux/<arch>/firecracker/<snapshot-format-major>/<cpu-template-or-dash>/vendor=<vendor>;family=<family>;model=<model>;stepping=<stepping>`.
+A receiver MUST compute this from the live host and use the blob only if **every**
 fingerprint field equals its local value; otherwise it skips the blob without
 failing the import. Native blobs are stored byte-for-byte unchanged (e.g.
 Firecracker memory + vmstate files) and are an evictable optimization — **never the

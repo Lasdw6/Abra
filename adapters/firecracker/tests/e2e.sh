@@ -20,6 +20,11 @@ cleanup() {
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 1 >/dev/null 2>&1 || true
   [[ -z "$HOST_PID" ]] || kill "$HOST_PID" 2>/dev/null || true
+  for tap in osdtap0 osdtap1; do sudo ip link del "$tap" >/dev/null 2>&1 || true; done
+  while read -r pid; do
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "$RUN_ROOT" && sudo kill "$pid" 2>/dev/null || true
+  done < <(pgrep -x firecracker 2>/dev/null || true)
 }
 trap cleanup EXIT
 
@@ -65,6 +70,9 @@ UP_STARTED="$(now_ms)"
 "$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" up --slot 0 --rootfs "$ROOTFS" --kernel "$KERNEL" --mem 512 --vcpus 1 --token "$TOKEN" >"$RUN_ROOT/up.json"
 UP_MS="$(( $(now_ms) - UP_STARTED ))"
 GUEST_PEER="$(guest 'abra --root /var/lib/abra --json status' | jq -r .peer_id)"
+guest "test \"\$(stat -c '%U:%G:%a' /etc/abra/token)\" = root:root:600; ! grep -Fq 'abra.token=' /proc/cmdline"
+! grep -FR -- "$TOKEN" "$RUN_ROOT/up.json" "$RUN_ROOT/firecracker/slots/0/firecracker.log" \
+  "$RUN_ROOT/firecracker/slots/0/stdout.log" "$RUN_ROOT/firecracker/slots/0/stderr.log"
 wait_until "guest enrollment visible on host" host_has_peer
 
 "$ABRA" --root "$RUN_ROOT" send "$GUEST_PEER" --capsule "$CAPSULE" >/dev/null
@@ -72,6 +80,9 @@ wait_until "capsule delivered to guest" guest_has_capsule
 tar -C "$WORKSPACE" -cf - . | guest 'mkdir -p /workspace && tar -C /workspace -xf -'
 guest "mkdir -p /workspace/.abra; printf '%s' '$CAPSULE' > /workspace/.abra/capsule_id; printf 'native-marker\n' > /workspace/native-marker.txt; cd /workspace; nohup python3 -m http.server 8123 >/tmp/abra-marker.log 2>&1 &"
 sleep 3
+MARKER_PID="$(guest "pgrep -f '[p]ython3 -m http.server 8123' | head -n1")"
+MARKER_START="$(guest "awk '{print \$22}' /proc/$MARKER_PID/stat")"
+guest "test -n '$MARKER_PID'; test -n '$MARKER_START'; curl -sf http://127.0.0.1:8123/native-marker.txt | grep -qx native-marker"
 GUEST_SNAPSHOT="$(guest 'abra --root /var/lib/abra --json snapshot /workspace' | jq -r .snapshot_id)"
 guest "abra --root /var/lib/abra send '$HOST_PEER' --capsule '$GUEST_SNAPSHOT' >/dev/null"
 wait_until "guest snapshot received by host" host_has_snapshot
@@ -84,19 +95,29 @@ MANIFEST="$RUN_ROOT/capsules/$CAPSULE/snapshots/$NATIVE_SNAPSHOT.cjson"
 jq -e '.native | length == 3 and all(.fingerprint.hypervisor == "firecracker")' "$MANIFEST" >/dev/null
 
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
+printf '%s\n' '{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":999,"cpu_template":"-","cpu_identity":"lying-cache"}' > "$RUN_ROOT/firecracker/fingerprint.json"
 RESTORE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" restore --slot 0 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT")"
 RESTORE_MS="$(jq -r .restore_ms <<<"$RESTORE_RESULT")"
-guest 'test -f /workspace/native-marker.txt; pgrep -f "python3 -m http.server 8123" >/dev/null'
+[[ "$(jq -r .mode <<<"$RESTORE_RESULT")" == native ]]
+guest "test -f /workspace/native-marker.txt; test -r /proc/$MARKER_PID/stat; test \"\$(awk '{print \$22}' /proc/$MARKER_PID/stat)\" = '$MARKER_START'"
+curl -sf --noproxy '*' http://172.30.0.2:8123/native-marker.txt | grep -qx native-marker
 
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
-FAKE='{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":999,"cpu_template":"-"}'
+FAKE='{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":999,"cpu_template":"-","cpu_identity":"fake"}'
 FALLBACK_RESULT="$(ABRA_FC_FAKE_FINGERPRINT="$FAKE" "$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" restore --slot 1 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT")"
 [[ "$(jq -r .mode <<<"$FALLBACK_RESULT")" == portable-fallback ]]
 ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 test -f /workspace/native-marker.txt
+ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 "! pgrep -f '[p]ython3 -m http.server 8123' >/dev/null"
+
+"$ABRA_FC" --root "$RUN_ROOT" down --slot 1
+cleanup
+[[ -z "$(pgrep -x firecracker 2>/dev/null || true)" ]]
+! ip link show osdtap0 >/dev/null 2>&1
+! ip link show osdtap1 >/dev/null 2>&1
 
 jq -n \
   --arg capsule "$CAPSULE" --arg snapshot "$NATIVE_SNAPSHOT" \
   --argjson total_ms "$(( $(now_ms) - STARTED ))" --argjson up_ms "$UP_MS" \
   --argjson snapshot_ms "$SNAPSHOT_MS" --argjson restore_ms "$RESTORE_MS" \
   --argjson native "$(jq -c .native "$MANIFEST")" \
-  '{ok:true,capsule:$capsule,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{enrollment:true,transfer:true,native_manifest:true,process_resumed:true,portable_fallback:true}}' | tee "$REPORT"
+  '{ok:true,capsule:$capsule,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,zero_firecracker_processes:true,zero_taps:true}}' | tee "$REPORT"

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${ABRA_INSTALL_PRIVATE_NS:-0} != 1 ]]; then
+  exec env ABRA_INSTALL_PRIVATE_NS=1 unshare --mount --propagation private -- "$0" "$@"
+fi
+
 if [[ $# -lt 2 || $# -gt 3 ]]; then
   echo "usage: sudo $0 ROOTFS_EXT4 ABRA_BIN [CADABRA_BIN]" >&2
   exit 2
@@ -16,12 +20,21 @@ CADABRA_BIN="$(realpath "${3:-$2}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_DIR="$(mktemp -d)"
 cleanup() {
-  mountpoint -q "$MOUNT_DIR" && umount "$MOUNT_DIR"
+  if mountpoint -q "$MOUNT_DIR"; then
+    umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+  fi
   rmdir "$MOUNT_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-mount -o loop "$ROOTFS" "$MOUNT_DIR"
+mount -o loop,nodev,nosuid "$ROOTFS" "$MOUNT_DIR"
+while IFS= read -r -d '' link; do
+  target="$(readlink "$link")"
+  if [[ "$target" == /* || "/$target/" == *"/../"* ]]; then
+    echo "refusing escaping symlink in rootfs: ${link#"$MOUNT_DIR"/} -> $target" >&2
+    exit 1
+  fi
+done < <(find "$MOUNT_DIR" -xdev -type l -print0)
 install -D -m 0755 "$ABRA_BIN" "$MOUNT_DIR/usr/local/bin/abra"
 install -D -m 0755 "$CADABRA_BIN" "$MOUNT_DIR/usr/local/bin/cadabra"
 install -D -m 0755 "$SCRIPT_DIR/observer.py" "$MOUNT_DIR/usr/local/libexec/abra-observer"
@@ -64,4 +77,3 @@ ln -sfn /etc/systemd/system/cadabra.service "$MOUNT_DIR/etc/systemd/system/multi
 ln -sfn /etc/systemd/system/abra-observer.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/abra-observer.service"
 sync
 echo "installed Abra guest payload into $ROOTFS"
-

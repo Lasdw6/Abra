@@ -10,6 +10,7 @@ import struct
 import time
 
 ENV_KEYS = {"NODE_ENV", "PORT", "HOST", "RUST_LOG", "PYTHONPATH", "VIRTUAL_ENV"}
+MAX_ARGV_BYTES = 64 * 1024
 
 
 def listen_inodes():
@@ -42,13 +43,19 @@ def recipe(pid, workspace, inode_ports):
     try:
         cwd = pathlib.Path(os.readlink(base / "cwd")).resolve()
         relative = cwd.relative_to(workspace)
-        argv = [x.decode("utf-8") for x in (base / "cmdline").read_bytes().split(b"\0") if x]
+        raw_argv = (base / "cmdline").read_bytes()
+        if len(raw_argv) > MAX_ARGV_BYTES:
+            return None
+        argv = [x.decode("utf-8", "replace") for x in raw_argv.split(b"\0") if x]
         environ = {}
         for item in (base / "environ").read_bytes().split(b"\0"):
             if b"=" not in item:
                 continue
             key, value = item.split(b"=", 1)
-            key, value = key.decode("utf-8"), value.decode("utf-8")
+            try:
+                key, value = key.decode("utf-8"), value.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
             if key in ENV_KEYS or key.startswith("ABRA_RECIPE_"):
                 environ[key] = value
         # Everything after the closing ')' is stable even when comm contains spaces.
@@ -106,4 +113,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

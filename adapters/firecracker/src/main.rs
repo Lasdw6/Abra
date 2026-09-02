@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -93,6 +93,8 @@ struct Config {
 struct SlotState {
     slot: u8,
     pid: u32,
+    #[serde(default)]
+    pid_starttime: u64,
     api_socket: PathBuf,
     tap: String,
     host_ip: String,
@@ -194,10 +196,14 @@ fn state_path(root: &Path, slot: u8) -> PathBuf {
 }
 
 fn resolve_key(explicit: Option<PathBuf>, rootfs: &Path) -> Result<PathBuf> {
-    explicit
-        .or_else(|| rootfs.parent().map(|p| p.join("desktop_id_rsa")))
+    let key = explicit
         .filter(|p| p.is_file())
-        .ok_or_else(|| "SSH key not found; set --ssh-key or ABRA_FC_SSH_KEY".into())
+        .ok_or("SSH key not found; set --ssh-key or ABRA_FC_SSH_KEY")?;
+    if key.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(format!("SSH key must have mode 0600: {}", key.display()).into());
+    }
+    let _ = rootfs;
+    Ok(key)
 }
 
 fn network(slot: u8) -> (String, String, String, String) {
@@ -217,12 +223,16 @@ fn up(root: &Path, fc: &Path, slot: u8, config: Config, token: Option<&str>) -> 
     fs::create_dir_all(&dir)?;
     let rootfs = dir.join("rootfs.ext4");
     fs::copy(&config.base_rootfs, &rootfs)?;
+    if let Some(token) = token {
+        validate_token(token)?;
+        inject_token(&rootfs, token)?;
+    }
     fs::create_dir_all(adapter_root(root))?;
     fs::write(
         adapter_root(root).join("config.json"),
         serde_json::to_vec_pretty(&config)?,
     )?;
-    start_vm(root, fc, slot, config, rootfs, token)
+    start_vm(root, fc, slot, config, rootfs)
 }
 
 fn start_vm(
@@ -231,68 +241,79 @@ fn start_vm(
     slot: u8,
     config: Config,
     rootfs: PathBuf,
-    token: Option<&str>,
 ) -> Result<SlotState> {
     let dir = slot_dir(root, slot);
     fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let socket = dir.join("firecracker.sock");
     let log = dir.join("firecracker.log");
     let stdout = fs::File::create(dir.join("stdout.log"))?;
     let stderr = fs::File::create(dir.join("stderr.log"))?;
     let (tap, host_ip, guest_ip, guest_mac) = network(slot);
     setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
-    let child = Command::new(fc)
+    let mut child = Command::new(fc)
         .args(["--api-sock"])
         .arg(&socket)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()?;
-    wait_path(&socket, Duration::from_secs(5))?;
-    fs::File::create(&log)?;
-    api(
-        &socket,
-        "PUT",
-        "/logger",
-        &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
-    )?;
-    api(
-        &socket,
-        "PUT",
-        "/machine-config",
-        &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
-    )?;
-    let mut boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
-    if let Some(token) = token {
-        boot.push_str(" abra.token=");
-        boot.push_str(token);
+    if let Err(error) = wait_path(&socket, Duration::from_secs(5)) {
+        cleanup_child(&mut child);
+        teardown_network(&tap);
+        return Err(error);
     }
-    api(
-        &socket,
-        "PUT",
-        "/boot-source",
-        &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
-    )?;
-    api(
-        &socket,
-        "PUT",
-        "/drives/rootfs",
-        &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
-    )?;
-    api(
-        &socket,
-        "PUT",
-        "/network-interfaces/net1",
-        &json!({"iface_id":"net1","guest_mac":guest_mac,"host_dev_name":tap}),
-    )?;
-    api(
-        &socket,
-        "PUT",
-        "/actions",
-        &json!({"action_type":"InstanceStart"}),
-    )?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let configured = (|| -> Result<()> {
+        fs::File::create(&log)?;
+        api(
+            &socket,
+            "PUT",
+            "/logger",
+            &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
+        )?;
+        api(
+            &socket,
+            "PUT",
+            "/machine-config",
+            &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
+        )?;
+        let boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
+        api(
+            &socket,
+            "PUT",
+            "/boot-source",
+            &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
+        )?;
+        api(
+            &socket,
+            "PUT",
+            "/drives/rootfs",
+            &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
+        )?;
+        api(
+            &socket,
+            "PUT",
+            "/network-interfaces/net1",
+            &json!({"iface_id":"net1","guest_mac":guest_mac,"host_dev_name":tap}),
+        )?;
+        api(
+            &socket,
+            "PUT",
+            "/actions",
+            &json!({"action_type":"InstanceStart"}),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = configured {
+        cleanup_child(&mut child);
+        teardown_network(&tap);
+        let _ = fs::remove_file(&socket);
+        return Err(error);
+    }
     let state = SlotState {
         slot,
         pid: child.id(),
+        pid_starttime: proc_starttime(child.id()).unwrap_or(0),
         api_socket: socket,
         tap,
         host_ip,
@@ -305,20 +326,74 @@ fn start_vm(
         status: "running".into(),
     };
     write_state(root, &state)?;
-    wait_ssh(&state, &config.ssh_key, Duration::from_secs(90))?;
+    if let Err(error) = wait_ssh(&state, &config.ssh_key, Duration::from_secs(90)) {
+        cleanup_child(&mut child);
+        teardown_network(&state.tap);
+        let _ = fs::remove_file(&state.api_socket);
+        return Err(error);
+    }
     Ok(state)
 }
 
 fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Result<Value> {
+    if diff {
+        return Err(
+            "differential snapshots are unsupported until chained restore is implemented".into(),
+        );
+    }
     let state = read_state(root, slot)?;
     ensure_running(&state)?;
     let config: Config =
         serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
-    let _ = ssh(
+    let portable = ssh_output(
         &state,
         &config.ssh_key,
-        "test ! -f /workspace/.abra/capsule_id || abra --root /var/lib/abra snapshot /workspace >/dev/null; sync",
-    );
+        "abra --root /var/lib/abra --json snapshot /workspace; sync",
+    )?;
+    let portable: Value = serde_json::from_str(&portable)?;
+    let portable_snapshot = portable
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or("guest snapshot response lacks snapshot_id")?;
+    let host_status = Command::new(std::env::current_exe()?.with_file_name("abra"))
+        .args([
+            "--root",
+            root.to_str().ok_or("non-UTF8 root")?,
+            "--json",
+            "status",
+        ])
+        .output()?;
+    if !host_status.status.success() {
+        return Err("could not determine host Abra peer id".into());
+    }
+    let host_status: Value = serde_json::from_slice(&host_status.stdout)?;
+    let host_peer = host_status
+        .get("peer_id")
+        .and_then(Value::as_str)
+        .ok_or("host status lacks peer_id")?;
+    ssh(&state, &config.ssh_key,
+        &format!("abra --root /var/lib/abra send '{host_peer}' --capsule '{portable_snapshot}' >/dev/null"))?;
+    let portable_hash: Hash = portable_snapshot.parse()?;
+    let receive_started = Instant::now();
+    while receive_started.elapsed() < Duration::from_secs(30) {
+        if AbraStore::open(root)?
+            .capsules
+            .get(&capsule.parse()?)
+            .and_then(|cap| cap.snapshot(&portable_hash))
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    if AbraStore::open(root)?
+        .capsules
+        .get(&capsule.parse()?)
+        .and_then(|cap| cap.snapshot(&portable_hash))
+        .is_none()
+    {
+        return Err("portable guest snapshot was not received before native capture".into());
+    }
     api(
         &state.api_socket,
         "PATCH",
@@ -335,7 +410,7 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Resu
             "PUT",
             "/snapshot/create",
             &json!({
-                "snapshot_type": if diff { "Diff" } else { "Full" },
+                "snapshot_type": "Full",
                 "snapshot_path": vmstate,
                 "mem_file_path": memory
             }),
@@ -348,6 +423,7 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Resu
         let response = control(
             root,
             &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
+            "parent_snapshot":portable_snapshot,"snapshot_type":"Full","artifact_root":slot_dir(root, slot),
             "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":state.rootfs}]}),
         )?;
         Ok::<Value, Box<dyn std::error::Error>>(response)
@@ -395,58 +471,87 @@ fn restore(
         config.ssh_key = key.to_path_buf();
     }
     if let Some((vmstate, memory, disk)) = matched {
-        let _ = down(root, slot);
-        let dir = slot_dir(root, slot);
-        fs::create_dir_all(&dir)?;
-        let vmstate_path = dir.join("restore.vmstate");
-        let memory_path = dir.join("restore.memory");
-        let disk_path = dir.join("rootfs.ext4");
-        store.cas.copy_to_file(&vmstate.blob, &vmstate_path)?;
-        store.cas.copy_to_file(&memory.blob, &memory_path)?;
-        store.cas.copy_to_file(&disk.blob, &disk_path)?;
-        let (tap, host_ip, guest_ip, guest_mac) = network(slot);
-        setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
-        let socket = dir.join("firecracker.sock");
-        let child = Command::new(fc)
-            .args(["--api-sock"])
-            .arg(&socket)
-            .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
-            .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
-            .spawn()?;
-        wait_path(&socket, Duration::from_secs(5))?;
-        api(
-            &socket,
-            "PUT",
-            "/snapshot/load",
-            &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
+        let native_attempt = (|| -> Result<Value> {
+            let _ = down(root, slot);
+            let dir = slot_dir(root, slot);
+            fs::create_dir_all(&dir)?;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            let vmstate_path = dir.join("restore.vmstate");
+            let memory_path = dir.join("restore.memory");
+            let disk_path = dir.join("rootfs.ext4");
+            store.cas.copy_to_file(&vmstate.blob, &vmstate_path)?;
+            store.cas.copy_to_file(&memory.blob, &memory_path)?;
+            store.cas.copy_to_file(&disk.blob, &disk_path)?;
+            let (tap, host_ip, guest_ip, guest_mac) = network(slot);
+            setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
+            let socket = dir.join("firecracker.sock");
+            let mut child = Command::new(fc)
+                .args(["--api-sock"])
+                .arg(&socket)
+                .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
+                .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
+                .spawn()?;
+            if let Err(error) = wait_path(&socket, Duration::from_secs(5)) {
+                cleanup_child(&mut child);
+                teardown_network(&tap);
+                return Err(error);
+            }
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+            let configured = (|| -> Result<()> {
+                api(
+                    &socket,
+                    "PUT",
+                    "/snapshot/load",
+                    &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
             "track_dirty_pages":true,"resume_vm":false,"network_overrides":[{"iface_id":"net1","host_dev_name":tap,"guest_mac":guest_mac}]}),
-        )?;
-        api(
-            &socket,
-            "PATCH",
-            "/drives/rootfs",
-            &json!({"drive_id":"rootfs","path_on_host":disk_path}),
-        )?;
-        api(&socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
-        let state = SlotState {
-            slot,
-            pid: child.id(),
-            api_socket: socket,
-            tap,
-            host_ip,
-            guest_ip,
-            guest_mac,
-            rootfs: disk_path,
-            kernel: config.kernel.clone(),
-            mem_mib: config.mem_mib,
-            vcpus: config.vcpus,
-            status: "running".into(),
-        };
-        write_state(root, &state)?;
-        wait_ssh(&state, &config.ssh_key, Duration::from_secs(30))?;
-        return Ok(
-            json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis()}),
-        );
+                )?;
+                api(
+                    &socket,
+                    "PATCH",
+                    "/drives/rootfs",
+                    &json!({"drive_id":"rootfs","path_on_host":disk_path}),
+                )?;
+                api(&socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
+                Ok(())
+            })();
+            if let Err(error) = configured {
+                cleanup_child(&mut child);
+                teardown_network(&tap);
+                let _ = fs::remove_file(&socket);
+                return Err(error);
+            }
+            let state = SlotState {
+                slot,
+                pid: child.id(),
+                pid_starttime: proc_starttime(child.id()).unwrap_or(0),
+                api_socket: socket,
+                tap,
+                host_ip,
+                guest_ip,
+                guest_mac,
+                rootfs: disk_path,
+                kernel: config.kernel.clone(),
+                mem_mib: config.mem_mib,
+                vcpus: config.vcpus,
+                status: "running".into(),
+            };
+            write_state(root, &state)?;
+            if let Err(error) = wait_ssh(&state, &config.ssh_key, Duration::from_secs(30)) {
+                cleanup_child(&mut child);
+                teardown_network(&state.tap);
+                return Err(error);
+            }
+            Ok(
+                json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis()}),
+            )
+        })();
+        match native_attempt {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                eprintln!("native restore unavailable; using portable fallback: {error}");
+                let _ = down(root, slot);
+            }
+        }
     }
     let state = up(root, fc, slot, config.clone(), None)?;
     let temp = tempfile::tempdir()?;
@@ -489,31 +594,35 @@ fn fingerprint(fc: &Path) -> Result<Fingerprint> {
         .ok_or("unrecognized Firecracker version")?
         .trim_start_matches('v')
         .to_owned();
-    let major = std::env::var("ABRA_FC_SNAPSHOT_FORMAT_MAJOR")
-        .ok()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or_else(|| {
-            eprintln!("warning: snapshot format unknown before first snapshot; using Firecracker release major for probing");
-            version.split('.').next().unwrap_or("0").parse().unwrap_or(0)
-        });
+    let major = if let Ok(value) = std::env::var("ABRA_FC_SNAPSHOT_FORMAT_MAJOR") {
+        value.parse()?
+    } else {
+        let output = Command::new(fc).arg("--snapshot-version").output()?;
+        if !output.status.success() {
+            return Err("Firecracker --snapshot-version failed".into());
+        }
+        let text = String::from_utf8(output.stdout)?;
+        text.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .ok_or("unrecognized Firecracker snapshot version")?
+            .parse()?
+    };
+    let _ = version;
     Ok(Fingerprint {
         os: "linux".into(),
         arch: std::env::consts::ARCH.into(),
         hypervisor: "firecracker".into(),
         snapshot_format_major: major,
-        cpu_template: "-".into(),
+        cpu_template: std::env::var("ABRA_FC_CPU_TEMPLATE").unwrap_or_else(|_| "-".into()),
+        cpu_identity: live_cpu_identity()?,
     })
 }
 
-fn local_fingerprint(root: &Path, fc: &Path) -> Result<Fingerprint> {
-    if std::env::var_os("ABRA_FC_FAKE_FINGERPRINT").is_some() {
-        return fingerprint(fc);
-    }
-    let cached = adapter_root(root).join("fingerprint.json");
-    if cached.is_file() {
-        return Ok(serde_json::from_slice(&fs::read(cached)?)?);
-    }
+fn local_fingerprint(_root: &Path, fc: &Path) -> Result<Fingerprint> {
+    // Always probe the live receiver. fingerprint.json describes a capture and
+    // must never be trusted as receiver identity.
     fingerprint(fc)
 }
 
@@ -523,12 +632,15 @@ fn fingerprint_for_snapshot(fc: &Path, vmstate: &Path) -> Result<Fingerprint> {
         .arg("--describe-snapshot")
         .arg(vmstate)
         .output()?;
-    let description = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let version = description
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let description = format!("{}\n{}", stdout, String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(format!("Firecracker could not describe snapshot: {description}").into());
+    }
+    // Firecracker 1.16 prints only `v<snapshot-data-version>` on stdout.
+    // Parse that dedicated command output, never stderr/release banner text.
+    let data_version = stdout.trim();
+    let version = data_version
         .split(|character: char| character.is_whitespace() || character == '"' || character == ':')
         .map(|word| word.trim_start_matches('v').trim_matches(','))
         .find(|word| {
@@ -540,11 +652,35 @@ fn fingerprint_for_snapshot(fc: &Path, vmstate: &Path) -> Result<Fingerprint> {
     Ok(fp)
 }
 
+fn live_cpu_identity() -> Result<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo")?;
+    let field = |name: &str| {
+        cpuinfo
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| "unknown".into())
+    };
+    Ok(format!(
+        "vendor={};family={};model={};stepping={}",
+        field("vendor_id"),
+        field("cpu family"),
+        field("model"),
+        field("stepping")
+    ))
+}
+
 fn api(socket: &Path, method: &str, endpoint: &str, body: &Value) -> Result<()> {
     let output = Command::new("curl")
         .args([
             "--silent",
             "--show-error",
+            "--noproxy",
+            "*",
+            "--config",
+            "/dev/null",
             "--write-out",
             "\n%{http_code}",
             "--unix-socket",
@@ -637,7 +773,7 @@ fn setup_network(tap: &str, host: &str, guest: &str, mac: &str) -> Result<()> {
 
 fn down(root: &Path, slot: u8) -> Result<()> {
     if let Ok(mut state) = read_state(root, slot) {
-        if state.pid != 0 {
+        if state.pid != 0 && process_matches(&state) {
             let _ = Command::new("kill").arg(state.pid.to_string()).status();
             for _ in 0..20 {
                 if !pid_alive(state.pid) {
@@ -659,6 +795,7 @@ fn down(root: &Path, slot: u8) -> Result<()> {
         state.pid = 0;
         write_state(root, &state)?;
     }
+    cleanup_global_network_if_idle(root);
     Ok(())
 }
 
@@ -703,6 +840,30 @@ fn ssh(state: &SlotState, key: &Path, command: &str) -> Result<()> {
         return Err(format!("guest SSH command failed with {status}").into());
     }
     Ok(())
+}
+
+fn ssh_output(state: &SlotState, key: &Path, command: &str) -> Result<String> {
+    let output = Command::new("ssh")
+        .args([
+            "-q",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=2",
+            "-i",
+        ])
+        .arg(key)
+        .arg(format!("root@{}", state.guest_ip))
+        .arg(command)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("guest SSH command failed with {}", output.status).into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn wait_ssh(state: &SlotState, key: &Path, timeout: Duration) -> Result<()> {
@@ -784,6 +945,113 @@ fn pid_alive(pid: u32) -> bool {
         .args(["-0", &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success())
+}
+fn proc_starttime(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+fn process_matches(state: &SlotState) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{}/comm", state.pid)).unwrap_or_default();
+    (comm.trim() == "firecracker" || comm.trim() == "jailer")
+        && state.pid_starttime != 0
+        && proc_starttime(state.pid) == Some(state.pid_starttime)
+}
+fn cleanup_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+fn teardown_network(tap: &str) {
+    let _ = Command::new("sudo")
+        .args(["ip", "link", "del", tap])
+        .status();
+}
+fn cleanup_global_network_if_idle(root: &Path) {
+    let any_running = fs::read_dir(adapter_root(root).join("slots"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read(e.path().join("state.json")).ok())
+        .filter_map(|b| serde_json::from_slice::<SlotState>(&b).ok())
+        .any(|s| s.pid != 0 && process_matches(&s));
+    if !any_running {
+        let _ = Command::new("sudo")
+            .args([
+                "iptables",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                "172.30.0.0/16",
+                "-j",
+                "MASQUERADE",
+            ])
+            .status();
+    }
+}
+fn validate_token(token: &str) -> Result<()> {
+    let suffix = token
+        .strip_prefix("abra-enroll/1/")
+        .ok_or("invalid enrollment token format")?;
+    if suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("invalid enrollment token format".into());
+    }
+    Ok(())
+}
+fn inject_token(rootfs: &Path, token: &str) -> Result<()> {
+    let mount = tempfile::tempdir()?;
+    run(
+        "sudo",
+        &[
+            "mount",
+            "-o",
+            "loop,nodev,nosuid",
+            rootfs.to_str().ok_or("non-UTF8 rootfs path")?,
+            mount.path().to_str().ok_or("non-UTF8 mount path")?,
+        ],
+    )?;
+    let result = (|| -> Result<()> {
+        for component in [mount.path().join("etc"), mount.path().join("etc/abra")] {
+            if let Ok(meta) = fs::symlink_metadata(&component) {
+                if meta.file_type().is_symlink() {
+                    return Err(
+                        format!("refusing symlinked guest path: {}", component.display()).into(),
+                    );
+                }
+            }
+        }
+        let etc = mount.path().join("etc/abra");
+        fs::create_dir_all(&etc)?;
+        let path = etc.join("token");
+        fs::write(&path, token.as_bytes())?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err("guest token path is not a regular file".into());
+        }
+        Ok(())
+    })();
+    let unmounted = Command::new("sudo")
+        .args(["umount", mount.path().to_str().unwrap()])
+        .status()?
+        .success();
+    if !unmounted {
+        let _ = Command::new("sudo")
+            .args(["umount", "-l", mount.path().to_str().unwrap()])
+            .status();
+    }
+    result
 }
 fn wait_path(path: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();

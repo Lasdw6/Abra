@@ -736,6 +736,11 @@ impl Daemon {
 
     async fn native_attach(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
+        let head: Hash = required_str(request, "parent_snapshot")?.parse()?;
+        if required_str(request, "snapshot_type")? != "Full" {
+            return Err("native-attach only accepts standalone Full snapshots".into());
+        }
+        let artifact_root = fs::canonicalize(required_str(request, "artifact_root")?)?;
         let fingerprint: Fingerprint = serde_json::from_value(
             request
                 .get("fingerprint")
@@ -748,19 +753,15 @@ impl Daemon {
             .ok_or("request lacks artifacts")?;
         let mut node = self.node.lock().await;
         node.store = abra_core::store::AbraStore::open(&self.root)?;
-        // The newest DAG tip can be a guest-authored fork that cannot move the
-        // main label. Native capture adopts that exact portable state.
-        let head = node
+        if node
             .store
             .capsules
             .get(&capsule)
-            .and_then(|cap| {
-                cap.snapshots()
-                    .iter()
-                    .max_by(|a, b| a.1.received_at.cmp(&b.1.received_at))
-                    .map(|(id, _)| *id)
-            })
-            .ok_or("capsule has no snapshots")?;
+            .and_then(|cap| cap.snapshot(&head))
+            .is_none()
+        {
+            return Err("explicit portable parent is not present in capsule".into());
+        }
         let mut manifest = node.store.capsules[&capsule]
             .snapshot(&head)
             .ok_or("head snapshot missing")?
@@ -768,6 +769,7 @@ impl Daemon {
             .manifest()
             .clone();
         let mut native = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
         for artifact in artifacts {
             let role = artifact
                 .get("role")
@@ -777,6 +779,13 @@ impl Daemon {
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or("artifact lacks path")?;
+            if !matches!(role, "vmstate" | "memory" | "disk") || !seen.insert(role) {
+                return Err(format!("invalid or duplicate native artifact role: {role}").into());
+            }
+            let path = fs::canonicalize(path)?;
+            if !path.starts_with(&artifact_root) || !path.is_file() {
+                return Err("native artifact path escapes the declared slot directory".into());
+            }
             let (blob, bytes) = node.store.cas.put_file(path)?;
             native.push(NativeBlobRef {
                 role: role.into(),
@@ -784,6 +793,9 @@ impl Daemon {
                 bytes,
                 fingerprint: fingerprint.clone(),
             });
+        }
+        if seen.len() != 3 {
+            return Err("native artifacts must contain exactly vmstate, memory, and disk".into());
         }
         manifest.parents = Some(vec![head]);
         manifest.created_at = format_time(now_ms());
@@ -797,20 +809,31 @@ impl Daemon {
         let result = node
             .store
             .receive_full(raw, format_time(now_ms()), now_ms(), None)?;
-        let cap = &node.store.capsules[&capsule];
-        let lease = cap.winning_lease().ok_or("capsule lacks lease")?;
-        let seq = cap.label("main").map_or(1, |label| label.seq + 1);
-        let op = LabelOp::new(
-            capsule,
-            seq,
-            "main".into(),
-            result.snapshot_id,
-            lease.epoch,
-            format_time(now_ms()),
-            &node.store.keys.identity,
-        )?;
-        let caller = node.peer_id();
-        node.store.apply_label(op, caller, now_ms())?;
+        if result.forked {
+            let identity = node.store.keys.identity.clone();
+            node.store.record_fork_label(
+                capsule,
+                result.snapshot_id,
+                format_time(now_ms()),
+                &identity,
+                now_ms(),
+            )?;
+        } else {
+            let cap = &node.store.capsules[&capsule];
+            let lease = cap.winning_lease().ok_or("capsule lacks lease")?;
+            let seq = cap.label("main").map_or(1, |label| label.seq + 1);
+            let op = LabelOp::new(
+                capsule,
+                seq,
+                "main".into(),
+                result.snapshot_id,
+                lease.epoch,
+                format_time(now_ms()),
+                &node.store.keys.identity,
+            )?;
+            let caller = node.peer_id();
+            node.store.apply_label(op, caller, now_ms())?;
+        }
         Ok(json!({"capsule_id":capsule,"snapshot_id":result.snapshot_id,"native":native}))
     }
 

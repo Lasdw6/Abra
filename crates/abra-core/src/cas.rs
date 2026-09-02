@@ -330,6 +330,10 @@ impl BlobStore {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
         fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
+        let shard = dest.parent().expect("CAS object has shard directory");
+        fs::File::open(shard)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(shard, e))?;
         Ok((hash, bytes))
     }
 
@@ -346,7 +350,21 @@ impl BlobStore {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        fs::copy(&source, destination).map_err(|e| Error::io(destination, e))
+        let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
+        let bytes = fs::copy(&source, &temporary).map_err(|e| Error::io(&temporary, e))?;
+        fs::File::open(&temporary)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(&temporary, e))?;
+        if hash_file(&temporary)? != *hash {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::corrupt("blob", "copied blob failed verification"));
+        }
+        fs::rename(&temporary, destination).map_err(|e| Error::io(destination, e))?;
+        let parent = destination.parent().expect("destination has parent");
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(parent, e))?;
+        Ok(bytes)
     }
 
     /// Read a blob back.

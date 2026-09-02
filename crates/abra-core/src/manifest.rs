@@ -81,6 +81,9 @@ pub struct Fingerprint {
     pub hypervisor: String,
     pub snapshot_format_major: u64,
     pub cpu_template: String,
+    /// Stable live-host CPU identity: vendor/family/model/stepping.
+    #[serde(default)]
+    pub cpu_identity: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

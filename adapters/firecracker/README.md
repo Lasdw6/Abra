@@ -19,8 +19,10 @@ sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
 ```
 
 The installer adds `cadabra.service`, an observer, `/workspace`, and the two
-binaries. The service reads `abra.token=` from the kernel command line, falling
-back to `/etc/abra/token`, and starts `cadabra --root /var/lib/abra --token ...`.
+binaries. Before boot, the adapter injects the enrollment token into the private
+per-slot disk as root-owned `/etc/abra/token` mode `0600`. The service reads only
+that file. Tokens never appear in kernel arguments, adapter JSON, or Firecracker
+configuration/logs; `/proc/cmdline` is treated as public.
 The observer derives recipes from `/proc` (argv, workspace-relative cwd, a small
 environment allowlist, listening TCP ports, and start time) and atomically writes
 `/workspace/.abra/recipes.json`. Cadabra validates and embeds those recipes when
@@ -39,12 +41,21 @@ abra-fc restore --slot 0 --capsule "$CAPSULE_ID"
 abra-fc ls
 ```
 
-State lives under `$ABRA_ROOT/firecracker/slots/N`: PID, API socket, TAP and IP
+State lives under `$ABRA_ROOT/firecracker/slots/N` (mode `0700`): PID plus
+process start time, API socket (mode `0600`), TAP and IP
 identity, logs, the per-slot rootfs, and materialized restore files. Network
 setup is idempotent: `osdtapN`, host `172.30.N.1/30`, guest `172.30.N.2`, MAC
 `06:00:AC:1E:NN:02`, a permanent neighbor entry, IP forwarding, and one
 `172.30.0.0/16` MASQUERADE rule. `down` terminates only the recorded PID and
-removes only that slot's TAP; artifacts remain inspectable.
+removes only that slot's TAP; artifacts remain inspectable. When the final slot
+stops, the adapter removes its MASQUERADE rule. Guests otherwise have routed
+internet egress; deployments requiring restricted egress must install an
+explicit FORWARD allowlist and metadata-service deny rules.
+
+Firecracker's jailer is required for multi-tenant or untrusted guests. The slot
+directory and socket permissions are defense in depth, not a substitute for
+the jailer's uid/gid drop, chroot, cgroups, and seccomp. Unjailed operation is
+suitable only for a dedicated trusted test host.
 
 The cold-boot API sequence is `PUT /logger`, `PUT /machine-config` (dirty-page
 tracking enabled), `PUT /boot-source`, `PUT /drives/rootfs`,
@@ -63,13 +74,16 @@ not buffered in memory.
 ## Fingerprint and portability
 
 The string form is conceptually
-`linux/<arch>/firecracker/<snapshot-format-major>/<cpu-template-or-dash>`; the
+`linux/<arch>/firecracker/<snapshot-format-major>/<cpu-template-or-dash>/<cpu-identity>`;
+`cpu-identity` is exactly
+`vendor=<vendor_id>;family=<family>;model=<model>;stepping=<stepping>`. The
 manifest stores its structured equivalent. After creation, `abra-fc` runs
 `firecracker --describe-snapshot VMSTATE` and uses the major component of the
 independent snapshot data-format version—not the Firecracker release number.
-The remaining values come from the host architecture and configured CPU
-template (`-` currently means none). A cached local fingerprint is compared
-field-for-field at restore. `ABRA_FC_FAKE_FINGERPRINT` exists solely to exercise
+The remaining values come from the live host architecture, `/proc/cpuinfo`, and
+configured `ABRA_FC_CPU_TEMPLATE` (`-` means none). Restore always computes a
+fresh receiver fingerprint; capture-time `fingerprint.json` is never receiver
+identity. `ABRA_FC_FAKE_FINGERPRINT` exists solely to exercise
 the mismatch path.
 
 Native restore is honestly same-host/same-CPU-model with no CPU template.
@@ -79,7 +93,8 @@ not enable it by default because it changes the guest CPU contract. Custom
 `/cpu-config` probing and UFFD/CAS paging are deferred Tier 2 work. Tier 1 is
 cold boot, full/diff capture, File-backed native restore, and portable fallback.
 
-On mismatch or missing native roles, a fresh base image is booted, the selected
+On mismatch, missing native roles, snapshot-load error, resume error, or guest
+readiness timeout, the partial VM is torn down and a fresh base image is booted, the selected
 snapshot's file tree is materialized into `/workspace`, and recipes are printed
 without execution. Native blobs are never treated as source of truth.
 
@@ -88,4 +103,3 @@ slot, inject an enrollment token, call the same Firecracker endpoints listed
 above, and persist the resulting Abra snapshot id. Run the real-host proof with
 `adapters/firecracker/tests/e2e.sh`; it writes `e2e-report.json` with cold boot,
 capture, native restore, and total timings.
-

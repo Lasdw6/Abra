@@ -6,7 +6,7 @@ use abra_core::{
     capsule::{random_capsule_id, Genesis, LabelOp, LeaseMode, LeaseRecord},
     cas::{materialize, snapshot_dir, EntryMode, Hash, Tree, TreeEntry},
     identity::{PeerId, Signature},
-    manifest::{Manifest, Origin, RawManifest, Scope},
+    manifest::{Fingerprint, Manifest, NativeBlobRef, Origin, RawManifest, Recipe, Scope},
     now_ms,
 };
 #[cfg(feature = "iroh")]
@@ -545,6 +545,7 @@ impl Daemon {
                     .await
             }
             "snapshot" => self.snapshot(&request).await,
+            "native-attach" => self.native_attach(&request).await,
             "send" => self.send(&request).await,
             "adapters-list" => {
                 let registry = adapters::AdapterRegistry::discover(&self.root)?;
@@ -728,6 +729,11 @@ impl Daemon {
         manifest.capsule_id = Some(capsule);
         manifest.parents = Some(parents);
         manifest.files = Some(files);
+        let recipes_path = path.join(".abra/recipes.json");
+        if recipes_path.is_file() {
+            let recipes: Vec<Recipe> = serde_json::from_slice(&fs::read(&recipes_path)?)?;
+            manifest.recipes = Some(recipes);
+        }
         manifest.payload = payload;
         if let Some(label) = request.get("label").and_then(Value::as_str) {
             manifest.labels = Some(vec![abra_core::manifest::Label {
@@ -740,24 +746,138 @@ impl Daemon {
         let result = node
             .store
             .receive_full(raw, format_time(now_ms()), now_ms(), None)?;
-        let lease = node.store.capsules[&capsule]
-            .winning_lease()
-            .ok_or("capsule lacks lease")?;
-        let seq = node.store.capsules[&capsule]
-            .label("main")
-            .map_or(1, |x| x.seq + 1);
-        let op = LabelOp::new(
-            capsule,
-            seq,
-            "main".into(),
-            result.snapshot_id,
-            lease.epoch,
-            format_time(now_ms()),
-            &node.store.keys.identity,
-        )?;
-        let caller = node.peer_id();
-        node.store.apply_label(op, caller, now_ms())?;
+        if result.forked {
+            let identity = node.store.keys.identity.clone();
+            node.store.record_fork_label(
+                capsule,
+                result.snapshot_id,
+                format_time(now_ms()),
+                &identity,
+                now_ms(),
+            )?;
+        } else {
+            let lease = node.store.capsules[&capsule]
+                .winning_lease()
+                .ok_or("capsule lacks lease")?;
+            let seq = node.store.capsules[&capsule]
+                .label("main")
+                .map_or(1, |x| x.seq + 1);
+            let op = LabelOp::new(
+                capsule,
+                seq,
+                "main".into(),
+                result.snapshot_id,
+                lease.epoch,
+                format_time(now_ms()),
+                &node.store.keys.identity,
+            )?;
+            let caller = node.peer_id();
+            node.store.apply_label(op, caller, now_ms())?;
+        }
         Ok(json!({"capsule_id":capsule,"snapshot_id":result.snapshot_id,"forked":result.forked}))
+    }
+
+    async fn native_attach(&self, request: &Value) -> Result<Value> {
+        let capsule: Hash = required_str(request, "capsule")?.parse()?;
+        let head: Hash = required_str(request, "parent_snapshot")?.parse()?;
+        if required_str(request, "snapshot_type")? != "Full" {
+            return Err("native-attach only accepts standalone Full snapshots".into());
+        }
+        let artifact_root = fs::canonicalize(required_str(request, "artifact_root")?)?;
+        let fingerprint: Fingerprint = serde_json::from_value(
+            request
+                .get("fingerprint")
+                .cloned()
+                .ok_or("request lacks fingerprint")?,
+        )?;
+        let artifacts = request
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .ok_or("request lacks artifacts")?;
+        let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
+        if node
+            .store
+            .capsules
+            .get(&capsule)
+            .and_then(|cap| cap.snapshot(&head))
+            .is_none()
+        {
+            return Err("explicit portable parent is not present in capsule".into());
+        }
+        let mut manifest = node.store.capsules[&capsule]
+            .snapshot(&head)
+            .ok_or("head snapshot missing")?
+            .raw
+            .manifest()
+            .clone();
+        let mut native = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for artifact in artifacts {
+            let role = artifact
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or("artifact lacks role")?;
+            let path = artifact
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("artifact lacks path")?;
+            if !matches!(role, "vmstate" | "memory" | "disk") || !seen.insert(role) {
+                return Err(format!("invalid or duplicate native artifact role: {role}").into());
+            }
+            let path = fs::canonicalize(path)?;
+            if !path.starts_with(&artifact_root) || !path.is_file() {
+                return Err("native artifact path escapes the declared slot directory".into());
+            }
+            let (blob, bytes) = node.store.cas.put_file(path)?;
+            native.push(NativeBlobRef {
+                role: role.into(),
+                blob,
+                bytes,
+                fingerprint: fingerprint.clone(),
+            });
+        }
+        if seen.len() != 3 {
+            return Err("native artifacts must contain exactly vmstate, memory, and disk".into());
+        }
+        manifest.parents = Some(vec![head]);
+        manifest.created_at = format_time(now_ms());
+        manifest.origin.peer_id = node.peer_id();
+        manifest.origin.name = Some("device".into());
+        manifest.origin.adapter = Some("firecracker".into());
+        manifest.labels = None;
+        manifest.native = Some(native.clone());
+        manifest.sign(&node.store.keys.identity)?;
+        let raw = RawManifest::parse(manifest.to_canonical_bytes()?)?;
+        let result = node
+            .store
+            .receive_full(raw, format_time(now_ms()), now_ms(), None)?;
+        if result.forked {
+            let identity = node.store.keys.identity.clone();
+            node.store.record_fork_label(
+                capsule,
+                result.snapshot_id,
+                format_time(now_ms()),
+                &identity,
+                now_ms(),
+            )?;
+        } else {
+            let cap = &node.store.capsules[&capsule];
+            let lease = cap.winning_lease().ok_or("capsule lacks lease")?;
+            let seq = cap.label("main").map_or(1, |label| label.seq + 1);
+            let op = LabelOp::new(
+                capsule,
+                seq,
+                "main".into(),
+                result.snapshot_id,
+                lease.epoch,
+                format_time(now_ms()),
+                &node.store.keys.identity,
+            )?;
+            let caller = node.peer_id();
+            node.store.apply_label(op, caller, now_ms())?;
+        }
+        Ok(json!({"capsule_id":capsule,"snapshot_id":result.snapshot_id,"native":native}))
     }
 
     async fn send(&self, request: &Value) -> Result<Value> {

@@ -26,6 +26,8 @@ Operations and request fields:
 | `peers` | — | trusted peer records |
 | `capsule-create` | `path` | capsule id |
 | `snapshot` | `path`, `label?` | capsule and snapshot ids |
+| `native-attach` | `capsule`, `parent_snapshot`, `snapshot_type:"Full"`, `fingerprint`, `artifact_root`, `artifacts[{role,path}]` | signed child snapshot and exactly `vmstate,memory,disk` refs; paths must remain under `artifact_root` (adapter API) |
+
 | `send` | `peer` and one of `snapshot_id`, `path`, or `link`; `title?`, `note?` | durable outbox id |
 | `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | adapter registrations |
 | `inbox` | — | partial floor cards and read state |
@@ -65,3 +67,8 @@ in v1.
 
 `log` results are guaranteed to be topologically ordered: every locally known
 parent appears before its children, with deterministic snapshot-id sibling order.
+
+Native refs are an optional cache. Receivers compare every fingerprint field
+against a live probe and fall back to the portable file tree and recipe data
+after any mismatch or native load/readiness failure. `native-attach` is local
+device authority and its socket must remain `0600` inside a `0700` directory.

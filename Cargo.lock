@@ -35,6 +35,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "abra-fc"
+version = "0.1.0"
+dependencies = [
+ "abra-core",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "abra-net"
 version = "0.1.0"
 dependencies = [

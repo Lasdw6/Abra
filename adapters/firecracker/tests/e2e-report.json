@@ -1,0 +1,67 @@
+{
+  "ok": true,
+  "capsule": "141ab66aec7922e3ad028e8033df5df6edb351e8c5d1111d16ff7542b23376ba",
+  "native_snapshot": "aa58825934250745611e2c42b7e9db760c0f4e7f422478025336d157f5afeb31",
+  "timings_ms": {
+    "total": 30580,
+    "up": 6558,
+    "snapshot": 6246,
+    "native_restore": 6693
+  },
+  "native": [
+    {
+      "blob": "8964d79c53358130e00cb4766557be5f9fa590a56fcc7c179965d6a014081227",
+      "bytes": 14647,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_identity": "vendor=GenuineIntel;family=6;model=143;stepping=8",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "vmstate"
+    },
+    {
+      "blob": "a589b4dd80e7b3f7c8eb6d94d5f8dd3e6249e5336f46562d99b98e57168b5270",
+      "bytes": 536870912,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_identity": "vendor=GenuineIntel;family=6;model=143;stepping=8",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "memory"
+    },
+    {
+      "blob": "e9fe9a1a6e2bcf75cc5a5616468a3ebf84747f9635ca8a2074983368e2191365",
+      "bytes": 2147483648,
+      "fingerprint": {
+        "arch": "x86_64",
+        "cpu_identity": "vendor=GenuineIntel;family=6;model=143;stepping=8",
+        "cpu_template": "-",
+        "hypervisor": "firecracker",
+        "os": "linux",
+        "snapshot_format_major": 10
+      },
+      "role": "disk"
+    }
+  ],
+  "checks": {
+    "token_file_root_0600": true,
+    "token_absent_from_cmdline_and_logs": true,
+    "enrollment": true,
+    "transfer": true,
+    "native_manifest": true,
+    "cached_fingerprint_ignored": true,
+    "same_pid": true,
+    "same_starttime": true,
+    "http_after_resume": true,
+    "portable_fallback": true,
+    "fallback_marker_process_absent": true,
+    "zero_firecracker_processes": true,
+    "zero_taps": true
+  }
+}

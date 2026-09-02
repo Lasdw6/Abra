@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -300,8 +300,71 @@ impl BlobStore {
     /// Store the contents of a file.
     pub fn put_file(&self, path: impl AsRef<Path>) -> Result<(Hash, u64)> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-        Ok((self.put(&bytes)?, bytes.len() as u64))
+        let mut source = fs::File::open(path).map_err(|e| Error::io(path, e))?;
+        let tmp = self
+            .tmp_dir()
+            .join(format!("import.{}", rand::random::<u64>()));
+        let mut output = fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = source.read(&mut buffer).map_err(|e| Error::io(path, e))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .map_err(|e| Error::io(&tmp, e))?;
+            bytes += read as u64;
+        }
+        output.sync_all().map_err(|e| Error::io(&tmp, e))?;
+        let hash = Hash::from_bytes(*hasher.finalize().as_bytes());
+        let dest = self.path_for(&hash);
+        if dest.is_file() && hash_file(&dest)? == hash {
+            fs::remove_file(&tmp).map_err(|e| Error::io(&tmp, e))?;
+            return Ok((hash, bytes));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
+        let shard = dest.parent().expect("CAS object has shard directory");
+        fs::File::open(shard)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(shard, e))?;
+        Ok((hash, bytes))
+    }
+
+    /// Verify and stream a blob to a file without holding it all in memory.
+    pub fn copy_to_file(&self, hash: &Hash, destination: impl AsRef<Path>) -> Result<u64> {
+        let source = self.path_for(hash);
+        if hash_file(&source)? != *hash {
+            return Err(Error::corrupt(
+                "blob",
+                format!("content of {hash} does not hash to its name"),
+            ));
+        }
+        let destination = destination.as_ref();
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
+        let bytes = fs::copy(&source, &temporary).map_err(|e| Error::io(&temporary, e))?;
+        fs::File::open(&temporary)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(&temporary, e))?;
+        if hash_file(&temporary)? != *hash {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::corrupt("blob", "copied blob failed verification"));
+        }
+        fs::rename(&temporary, destination).map_err(|e| Error::io(destination, e))?;
+        let parent = destination.parent().expect("destination has parent");
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(parent, e))?;
+        Ok(bytes)
     }
 
     /// Read a blob back.
@@ -332,6 +395,20 @@ impl BlobStore {
     pub fn get_tree(&self, hash: &Hash) -> Result<Tree> {
         Tree::decode(&self.get(hash)?)
     }
+}
+
+fn hash_file(path: &Path) -> Result<Hash> {
+    let mut file = fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| Error::io(path, e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// Walk `dir`, storing every file as a blob and every directory as a tree.

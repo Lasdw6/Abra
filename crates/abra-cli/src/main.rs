@@ -1,7 +1,12 @@
 use cadabra::{control_call, Daemon};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::Arc,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -52,6 +57,7 @@ enum Command {
         #[arg(long)]
         capsule: Option<String>,
     },
+    Capsules,
     Outbox,
     Cancel {
         id: String,
@@ -77,6 +83,57 @@ enum Command {
     },
     Control(ControlArgs),
     Watch,
+    Mesh {
+        #[command(subcommand)]
+        command: MeshCommand,
+    },
+    Link {
+        #[command(subcommand)]
+        command: LinkCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LinkCommand {
+    Mint {
+        snapshot: String,
+        #[arg(long, value_parser = parse_duration, default_value = "7d")]
+        ttl: u64,
+        #[arg(long, conflicts_with = "full")]
+        floor_only: bool,
+        #[arg(long)]
+        full: bool,
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+        /// Public ciphertext URL after upload (defaults to the local file URL).
+        #[arg(long)]
+        url: Option<String>,
+        /// Shell command template with {file}, {hash}, and {url} placeholders.
+        #[arg(long)]
+        upload_command: Option<String>,
+        /// Static viewer origin. When set, emits the fragment-only viewer form.
+        #[arg(long)]
+        viewer: Option<String>,
+    },
+    List,
+    Revoke {
+        id: String,
+    },
+    Open {
+        url: String,
+        #[arg(long, default_value = ".")]
+        to: PathBuf,
+    },
+    Serve {
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeshCommand {
+    Profile { profile: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -184,6 +241,9 @@ fn default_root() -> PathBuf {
 async fn main() -> cadabra::Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(default_root);
+    if let Command::Link { command } = cli.command {
+        return run_link(&root, command, cli.json).await;
+    }
     if let Command::Daemon {
         yes,
         transport,
@@ -248,6 +308,7 @@ async fn main() -> cadabra::Result<()> {
             json!({"op":"accept","id":id,"to":absolute})
         }
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
+        Command::Capsules => json!({"op":"capsules"}),
         Command::Outbox => json!({"op":"outbox"}),
         Command::Cancel { id } => json!({"op":"cancel","id":id}),
         Command::Enroll(args) => {
@@ -284,7 +345,11 @@ async fn main() -> cadabra::Result<()> {
         Command::Control(args) => {
             json!({"op":"control","peer":args.peer,"capsule":args.capsule,"control_op":args.op,"text":args.text})
         }
+        Command::Mesh {
+            command: MeshCommand::Profile { profile },
+        } => json!({"op":"mesh-profile","profile":profile}),
         Command::Watch => unreachable!(),
+        Command::Link { .. } => unreachable!(),
         Command::Daemon { .. } => unreachable!(),
     };
     let result = control_call(root, &request).await?;
@@ -312,6 +377,262 @@ async fn main() -> cadabra::Result<()> {
         print_human(&result);
     }
     Ok(())
+}
+
+async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadabra::Result<()> {
+    use abra_core::{
+        cas::Hash,
+        link::{self, LinkMode},
+    };
+    use data_encoding::BASE64URL_NOPAD;
+    match command {
+        LinkCommand::Mint {
+            snapshot,
+            ttl,
+            floor_only: _,
+            full,
+            out,
+            url,
+            upload_command,
+            viewer,
+        } => {
+            let store = abra_core::store::AbraStore::open(root)?;
+            let id: Hash = snapshot.parse()?;
+            let raw = link::find_snapshot(&store, id)?;
+            fs::create_dir_all(&out)?;
+            let expires_ms = abra_core::now_ms()
+                .checked_add(ttl)
+                .ok_or("expiry overflow")?;
+            if ttl > 30 * 86_400_000 {
+                return Err("link TTL exceeds 30 days".into());
+            }
+            let provisional = out.join(format!("{id}.abracap"));
+            let absolute = if provisional.is_absolute() {
+                provisional.clone()
+            } else {
+                std::env::current_dir()?.join(&provisional)
+            };
+            let public_url = url.unwrap_or_else(|| format!("file://{}", absolute.display()));
+            let minted = link::mint(
+                &store,
+                &raw,
+                expires_ms,
+                abra_net::format_time(expires_ms),
+                if full {
+                    LinkMode::Full
+                } else {
+                    LinkMode::Floor
+                },
+                public_url.clone(),
+            )?;
+            let blob_hash = Hash::of(&minted.blob);
+            let blob_path = out.join(format!("{blob_hash}.abracap"));
+            fs::write(&blob_path, &minted.blob)?;
+            let actual_url = if minted.record.url.starts_with("file://") {
+                format!(
+                    "file://{}",
+                    if blob_path.is_absolute() {
+                        blob_path.clone()
+                    } else {
+                        std::env::current_dir()?.join(&blob_path)
+                    }
+                    .display()
+                )
+            } else {
+                minted.record.url.clone()
+            };
+            if let Some(template) = upload_command {
+                let command = template
+                    .replace("{file}", &blob_path.to_string_lossy())
+                    .replace("{hash}", &blob_hash.to_hex())
+                    .replace("{url}", &actual_url);
+                let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
+                if !status.success() {
+                    return Err("uploader command failed".into());
+                }
+            }
+            let mut record = minted.record;
+            record.url = actual_url.clone();
+            record.resign(&store.keys.identity)?;
+            link::save_record(&store, &record)?;
+            let key = BASE64URL_NOPAD.encode(&minted.key);
+            let share_url = if let Some(viewer) = viewer {
+                format!(
+                    "{}#v=1&u={}&k={}",
+                    viewer.trim_end_matches('#'),
+                    BASE64URL_NOPAD.encode(actual_url.as_bytes()),
+                    key
+                )
+            } else {
+                format!("{actual_url}#{key}")
+            };
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &json!({"link_id":record.link_id,"url":share_url,"expires_at":record.expires_at,"mode":record.mode})
+                    )?
+                );
+            } else {
+                println!("{share_url}");
+            }
+        }
+        LinkCommand::List => {
+            let store = abra_core::store::AbraStore::open(root)?;
+            let records = link::list_records(&store)?;
+            if json_output {
+                println!("{}", serde_json::to_string(&records)?);
+            } else {
+                for record in records {
+                    println!(
+                        "{}\t{}\t{:?}\t{}\t{}",
+                        record.link_id,
+                        record.snapshot_id,
+                        record.mode,
+                        record.expires_at,
+                        if record.revoked { "revoked" } else { "active" }
+                    );
+                }
+            }
+        }
+        LinkCommand::Revoke { id } => {
+            let store = abra_core::store::AbraStore::open(root)?;
+            let record = link::revoke_record(&store, &id)?;
+            if json_output {
+                println!("{}", serde_json::to_string(&record)?);
+            } else {
+                println!("revoked {}", record.link_id);
+            }
+        }
+        LinkCommand::Open { url, to } => {
+            let (ciphertext_url, key) = parse_capability_url(&url)?;
+            let blob = fetch_capability(&ciphertext_url).await?;
+            let pack = link::open(&blob, &key, abra_core::now_ms())?;
+            let store = abra_core::store::AbraStore::open(root)?;
+            let raw = link::import(&pack, &store, &to)?;
+            println!(
+                "{}",
+                if json_output {
+                    serde_json::to_string(&json!({"snapshot_id":raw.snapshot_id(),"to":to}))?
+                } else {
+                    format!("opened {} into {}", raw.snapshot_id(), to.display())
+                }
+            );
+        }
+        LinkCommand::Serve { dir, listen } => serve_links(&dir, &listen).await?,
+    }
+    Ok(())
+}
+
+fn parse_capability_url(url: &str) -> cadabra::Result<(String, [u8; 32])> {
+    use data_encoding::BASE64URL_NOPAD;
+    let (base, fragment) = url
+        .split_once('#')
+        .ok_or("capability URL lacks key fragment")?;
+    let (ciphertext_url, encoded_key) =
+        if fragment.starts_with("v=1&") || fragment.starts_with("u=") {
+            let fields = fragment
+                .split('&')
+                .filter_map(|field| field.split_once('='))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let encoded_url = fields.get("u").ok_or("viewer URL lacks u fragment")?;
+            let decoded_url = BASE64URL_NOPAD
+                .decode(encoded_url.as_bytes())
+                .map_err(|_| "invalid ciphertext URL encoding")?;
+            (
+                String::from_utf8(decoded_url)?,
+                *fields.get("k").ok_or("viewer URL lacks k fragment")?,
+            )
+        } else {
+            (base.to_owned(), fragment)
+        };
+    let decoded = BASE64URL_NOPAD
+        .decode(encoded_key.as_bytes())
+        .map_err(|_| "invalid capability key")?;
+    let key: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| "capability key must be 32 bytes")?;
+    Ok((ciphertext_url, key))
+}
+
+async fn fetch_capability(url: &str) -> cadabra::Result<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return Ok(tokio::fs::read(path).await?);
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("capability ciphertext URL must use file, http, or https".into());
+    }
+    let output = tokio::process::Command::new("curl")
+        .args(["--fail", "--silent", "--show-error", "--location", url])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "ciphertext fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(output.stdout)
+}
+
+async fn serve_links(dir: &Path, listen: &str) -> cadabra::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = fs::canonicalize(dir)?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    println!(
+        "serving {} on http://{}",
+        root.display(),
+        listener.local_addr()?
+    );
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let root = root.clone();
+        tokio::spawn(async move {
+            let mut request = vec![0; 8192];
+            let Ok(count) = stream.read(&mut request).await else {
+                return;
+            };
+            let first = String::from_utf8_lossy(&request[..count])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let path = first
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .trim_start_matches('/');
+            if path.contains("..") || path.contains('\\') {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                return;
+            }
+            let file = if path.is_empty() {
+                root.join("index.html")
+            } else {
+                root.join(path)
+            };
+            match tokio::fs::read(file).await {
+                Ok(bytes) => {
+                    let content_type = if path.ends_with(".html") {
+                        "text/html; charset=utf-8"
+                    } else if path.ends_with(".js") {
+                        "text/javascript; charset=utf-8"
+                    } else {
+                        "application/octet-stream"
+                    };
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&bytes).await;
+                }
+                Err(_) => {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n").await;
+                }
+            }
+        });
+    }
 }
 
 async fn wait_for_shutdown() -> std::io::Result<()> {

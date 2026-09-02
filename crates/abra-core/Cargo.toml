@@ -17,6 +17,8 @@ thiserror.workspace = true
 hex.workspace = true
 libc.workspace = true
 x25519-dalek.workspace = true
+data-encoding.workspace = true
+aes-gcm.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

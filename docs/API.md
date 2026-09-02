@@ -30,6 +30,8 @@ Operations and request fields:
 | `inbox` | — | partial floor cards and read state |
 | `accept` | `id`, `to` | materializes files, if any, and marks inbox items read |
 | `log` | `capsule?` | capsule snapshot history |
+| `capsules` | — | capsule ids, kinds, titles, and current main/fork heads |
+| `mesh-profile` | `profile?` (`personal` or `fleet`) | read or update authorization profile |
 | `enroll-mint` | `capsules`, `kinds`, `ttl_ms`, `send`, `receive` | encoded enrollment token |
 | `enroll-join` | `token` | persisted guest role and effective scopes |
 | `revoke` | `token_id` | revocation confirmation |
@@ -59,3 +61,6 @@ transported and materialized as data but never executed by Abra. Control
 messages are surfaced through `events`/`watch`; acting on them belongs to the
 receiving application. Guest enrollment and revocation are issuer-device-local
 in v1.
+
+`log` results are guaranteed to be topologically ordered: every locally known
+parent appears before its children, with deterministic snapshot-id sibling order.

@@ -58,6 +58,39 @@ fn signed_manifest(scope: Scope) -> (Identity, Manifest) {
 }
 
 #[test]
+fn capability_link_roundtrip_expiry_wrong_key_and_revoke() {
+    use abra_core::{
+        link::{self, LinkMode},
+        store::AbraStore,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = AbraStore::open(temp.path()).unwrap();
+    let (_, manifest) = signed_manifest(Scope::Partial);
+    let raw = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+    let snapshot_id = store
+        .receive_partial(raw, "peer".into(), "2026-08-28T13:00:00.000Z".into())
+        .unwrap();
+    let raw = link::find_snapshot(&store, snapshot_id).unwrap();
+    let minted = link::mint(
+        &store,
+        &raw,
+        2_000,
+        "1970-01-01T00:00:02.000Z".into(),
+        LinkMode::Floor,
+        "file:///tmp/link.abracap".into(),
+    )
+    .unwrap();
+    let opened = link::open(&minted.blob, &minted.key, 1_000).unwrap();
+    assert_eq!(opened.snapshot_id, snapshot_id);
+    assert!(link::open(&minted.blob, &[9; 32], 1_000).is_err());
+    assert!(link::open(&minted.blob, &minted.key, 2_001).is_err());
+    link::save_record(&store, &minted.record).unwrap();
+    let revoked = link::revoke_record(&store, &minted.record.link_id).unwrap();
+    assert!(revoked.revoked);
+    assert_eq!(link::list_records(&store).unwrap().len(), 1);
+}
+
+#[test]
 fn signed_main_move_to_non_descendant_is_rejected() {
     let creator = Identity::from_secret_bytes(&[44; 32]);
     let capsule_id = Hash::from_bytes([45; 32]);

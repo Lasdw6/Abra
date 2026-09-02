@@ -44,3 +44,7 @@ per operation. Export/import time out after ten minutes. Cancellation sends
 
 Cadabra's built-in workspace export/import and handoff handling are the
 reference behavior for this contract; they are not external adapter processes.
+
+The runner is not linked into the current daemon build. Until it lands,
+`abra send --kind --source` and automatic adapter import are unavailable rather
+than silently emulated.

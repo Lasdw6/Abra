@@ -76,6 +76,20 @@ Then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
 `inbox` shows partial handoffs and `accept <id> --to <empty-path>` materializes
 them; full capsule snapshots appear in `log` and can also be accepted by id.
 
+Mint a zero-install capability link for any stored snapshot and serve the blob
+plus static viewer locally (use an HTTPS+CORS object host in production):
+
+```console
+$ target/debug/abra --root /tmp/abra-a link mint <snapshot-id> --ttl 7d --full --out ./shared --viewer http://127.0.0.1:8080/viewer/
+$ cp -R viewer ./shared/viewer
+$ target/debug/abra link serve ./shared --listen 127.0.0.1:8080
+```
+
+`--upload-command 'command {file} {hash} {url}'` provides the pluggable uploader
+hook; pair it with `--url https://objects.example/...`. The command receives no
+bearer key. `link list` stores only fragment-free URLs, and `link revoke <id>`
+tombstones locally hosted ciphertext.
+
 Without `--yes`, leave `pair add` running, inspect `pair pending` on the ticket
 issuer, and run `pair confirm <peer-id>`. Confirmation completes the existing
 bootstrap connection; the joiner does not retry the ticket.
@@ -97,8 +111,9 @@ control messages are carried/surfaced as data; Abra does not execute them.
 ## Status
 
 Stages 1–4 include local primitives, encrypted iroh transport, scoped guests,
-receive grants, durable delivery, the daemon, CLI, and cross-process tests. Capability web
-viewers and external adapter implementations remain out of scope.
+receive grants, durable delivery, the daemon, CLI, and cross-process tests. A
+static capability-link viewer ships in `viewer/`; external adapter execution and
+blind relay hosting remain deferred.
 
 ## Building
 

@@ -204,11 +204,22 @@ https://<host>/s/<blob-hash>#<base64url key>
 
 The key lives in the **fragment**, which browsers never send to the server. The
 payload behind the hash is the encrypted bundle: manifest plus referenced
-blobs, sealed with a fresh symmetric key (XChaCha20-Poly1305). A host serving
+blobs, sealed with a fresh symmetric key (AES-256-GCM, per the SPEC erratum). A host serving
 these learns a hash and a ciphertext and nothing else — the same blind-relay
 property the transport layer has.
 
-_Phase 1 ships the model plus seal/open and mint/parse. No HTTP._
+The build-free static viewer decrypts with WebCrypto and verifies Ed25519 where
+the browser supports it. Older browsers show an explicit unverified badge while
+still rendering the floor card. `abra link serve` is a local development host;
+production hosting is any HTTPS object origin with CORS, optionally reached
+through the uploader command hook.
+
+### Mesh authorization profile
+
+`mesh.profile` defaults to `personal`, preserving the one-user policy. `fleet`
+allows scoped guest-to-guest delivery only when both enrollment scopes authorize
+the kind/capsule and opposite directions. This is daemon authorization policy;
+it changes no manifest, handshake, offer, or acknowledgement bytes.
 
 ## 11. Later phases
 

@@ -21,6 +21,7 @@ pub mod capsule;
 pub mod cas;
 pub mod error;
 pub mod identity;
+pub mod link;
 pub mod manifest;
 pub mod store;
 mod util;

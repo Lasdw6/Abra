@@ -21,8 +21,9 @@ abra-core.workspace = true
 abra-net = { path = "../abra-net", default-features = false }
 cadabra = { path = "../cadabra", default-features = false }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["net", "process", "signal"] }
 clap.workspace = true
+data-encoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

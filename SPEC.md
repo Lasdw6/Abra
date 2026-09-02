@@ -834,6 +834,17 @@ turn.
 
 ### Errata applied
 
+- Capability-link crypto erratum: hosted blobs use AES-256-GCM (`alg=2`) with a
+  fresh random 32-byte key and 12-byte nonce per link. AAD is `ABRACAP1 || alg
+  || nonce || u64be(expires_at)`; `u64be(ct_len) || ciphertext` follows. This
+  replaces XChaCha20-Poly1305 for capability links only because browsers expose
+  AES-GCM, but not XChaCha20, through WebCrypto. Fresh per-link keys prevent
+  nonce reuse in normal operation. Mesh and relay cryptography are unchanged.
+- Fleet-profile clarification: guest-to-guest delivery is authorization policy,
+  not a protocol change. `personal` forbids it. `fleet` permits it only when the
+  sender's send scope and recipient's receive scope both cover the exact kind
+  and capsule. Guests still cannot pair, mint enrollment, or send control.
+
 - Stage-1 review erratum: label-op records require a signed `by` peer id so they
   remain independently verifiable after persistence, gossip, or relay.
 - Stage-1 review clarification: v0.1 materialization requires a nonexistent or

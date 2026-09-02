@@ -473,6 +473,7 @@ impl Daemon {
                 | "policy-revoke"
                 | "control"
                 | "lease-take"
+                | "mesh-profile"
         ) && !matches!(self.node.lock().await.trust.local_role(), LocalRole::Full)
         {
             return Err("operation requires a full device; this daemon is a guest".into());
@@ -534,6 +535,19 @@ impl Daemon {
             "inbox" => self.inbox().await,
             "accept" => self.accept(&request).await,
             "log" => self.log(&request).await,
+            "capsules" => self.capsules().await,
+            "mesh-profile" => {
+                let mut node = self.node.lock().await;
+                if let Some(profile) = request.get("profile").and_then(Value::as_str) {
+                    let profile = match profile {
+                        "personal" => abra_net::MeshProfile::Personal,
+                        "fleet" => abra_net::MeshProfile::Fleet,
+                        _ => return Err("mesh profile must be personal or fleet".into()),
+                    };
+                    node.trust.set_mesh_profile(profile)?;
+                }
+                Ok(json!({"profile":node.trust.mesh_profile()}))
+            }
             "enroll-mint" => self.enroll(&request).await,
             "enroll-join" => self.join(required_str(&request, "token")?).await,
             "revoke" => {
@@ -805,8 +819,41 @@ impl Daemon {
             None => return Err("capsule is required when store has multiple capsules".into()),
         };
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
-        let rows = cap.snapshots().iter().map(|(id, r)| json!({"snapshot_id":id,"received_at":r.received_at,"orphan":r.orphan,"title":r.raw.manifest().title,"parents":r.raw.manifest().parents})).collect::<Vec<_>>();
+        let mut pending = cap.snapshots().iter().collect::<BTreeMap<_, _>>();
+        let mut ordered = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let ready = pending
+                .iter()
+                .filter(|(_, record)| {
+                    record
+                        .raw
+                        .manifest()
+                        .parents
+                        .as_ref()
+                        .is_none_or(|parents| {
+                            parents.iter().all(|parent| !pending.contains_key(parent))
+                        })
+                })
+                .map(|(id, _)| **id)
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                return Err("capsule history contains a cycle".into());
+            }
+            for id in ready {
+                let record = pending.remove(&id).expect("ready snapshot is pending");
+                ordered.push((id, record));
+            }
+        }
+        let rows = ordered.into_iter().map(|(id, r)| json!({"snapshot_id":id,"received_at":r.received_at,"orphan":r.orphan,"title":r.raw.manifest().title,"parents":r.raw.manifest().parents})).collect::<Vec<_>>();
         Ok(Value::Array(rows))
+    }
+
+    async fn capsules(&self) -> Result<Value> {
+        let node = self.fresh_node()?;
+        Ok(Value::Array(node.store.capsules.iter().map(|(id, capsule)| {
+            let heads = capsule.labels().values().filter(|label| label.name == "main" || label.name.starts_with("fork/")).map(|label| label.snapshot_id).collect::<Vec<_>>();
+            json!({"capsule_id":id,"kind":capsule.genesis.kind,"title":capsule.genesis.title,"heads":heads})
+        }).collect()))
     }
 
     async fn enroll(&self, request: &Value) -> Result<Value> {

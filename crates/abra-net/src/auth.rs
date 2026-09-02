@@ -150,6 +150,14 @@ pub enum Role {
     Guest,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshProfile {
+    #[default]
+    Personal,
+    Fleet,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 pub enum LocalRole {
@@ -215,6 +223,8 @@ pub struct TrustedPeer {
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct TrustDisk {
     #[serde(default)]
+    mesh_profile: MeshProfile,
+    #[serde(default)]
     local_role: LocalRole,
     peers: BTreeMap<PeerId, TrustedPeer>,
     pending_tickets: BTreeMap<String, PairTicket>,
@@ -230,6 +240,15 @@ pub struct TrustStore {
     disk: TrustDisk,
 }
 impl TrustStore {
+    pub fn mesh_profile(&self) -> MeshProfile {
+        self.disk.mesh_profile
+    }
+
+    pub fn set_mesh_profile(&mut self, profile: MeshProfile) -> Result<()> {
+        self.disk.mesh_profile = profile;
+        self.save()
+    }
+
     fn operation_lock(&self, name: &str) -> Result<fs::File> {
         let path = self.path.with_extension(format!("{name}.lock"));
         let lock = fs::OpenOptions::new()
@@ -274,6 +293,7 @@ impl TrustStore {
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock)?;
         let mut merged = self.read_disk()?;
+        merged.mesh_profile = self.disk.mesh_profile;
         merged.local_role = self.disk.local_role.clone();
         merged
             .pending_tickets
@@ -536,7 +556,7 @@ impl TrustStore {
             let other_role = self
                 .get(&other)
                 .ok_or_else(|| Error::authz("unknown counterparty"))?;
-            if other_role.role == Role::Guest {
+            if other_role.role == Role::Guest && self.disk.mesh_profile == MeshProfile::Personal {
                 return Err(Error::authz("guest-to-guest forbidden"));
             }
             let id = actor
@@ -561,6 +581,20 @@ impl TrustStore {
                 .is_some_and(|s| s.allows(capsule, kind, direction))
             {
                 return Err(Error::authz("out of scope"));
+            }
+            if other_role.role == Role::Guest
+                && !other_role.scopes.as_ref().is_some_and(|scopes| {
+                    scopes.allows(
+                        capsule,
+                        kind,
+                        match direction {
+                            Direction::Send => Direction::Receive,
+                            Direction::Receive => Direction::Send,
+                        },
+                    )
+                })
+            {
+                return Err(Error::authz("guest counterparty out of scope"));
             }
         }
         Ok(())

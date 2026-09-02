@@ -1,7 +1,7 @@
 use crate::{
     auth::{
         accept_handshake, bootstrap_allowed, dial_handshake, format_time, Direction, LocalRole,
-        Ping, Pong, ProtocolError, TrustStore,
+        MeshProfile, Ping, Pong, ProtocolError, TrustStore,
     },
     framing::{ObjectHeader, ObjectKind},
     read_frame, write_frame, Connection, Error, Outbox, OutboxState, Result,
@@ -283,12 +283,27 @@ impl DeliveryNode {
         Ok(requests)
     }
     pub fn enqueue(&mut self, peer: PeerId, raw: &RawManifest, now: u64) -> Result<String> {
-        if self.trust.get(&peer).is_none() {
-            return Err(Error::authz("unknown or untrusted recipient"));
-        }
+        let recipient = self
+            .trust
+            .get(&peer)
+            .ok_or_else(|| Error::authz("unknown or untrusted recipient"))?;
         if let LocalRole::Guest { token } = self.trust.local_role() {
             if !self.allow_agent_send || !token.scopes.send || token.verify(now).is_err() {
                 return Err(Error::authz("local agent sending disabled"));
+            }
+            if recipient.role == crate::Role::Guest
+                && (self.trust.mesh_profile() == MeshProfile::Personal
+                    || !recipient.scopes.as_ref().is_some_and(|scopes| {
+                        scopes.allows(
+                            raw.manifest().capsule_id,
+                            &raw.manifest().kind,
+                            Direction::Receive,
+                        )
+                    }))
+            {
+                return Err(Error::authz(
+                    "guest-to-guest delivery forbidden or out of scope",
+                ));
             }
         }
         self.outbox
@@ -503,7 +518,9 @@ impl DeliveryNode {
             .get(&from)
             .ok_or_else(|| Error::authz("untrusted peer"))?;
         if sender.role == crate::Role::Guest {
-            if !matches!(self.trust.local_role(), LocalRole::Full) {
+            if !matches!(self.trust.local_role(), LocalRole::Full)
+                && self.trust.mesh_profile() == MeshProfile::Personal
+            {
                 return Err(Error::authz("guest-to-guest forbidden"));
             }
             let token_id = sender
@@ -526,11 +543,9 @@ impl DeliveryNode {
             }
         }
         if let LocalRole::Guest { token } = self.trust.local_role() {
-            if self
-                .trust
-                .get(&from)
-                .is_none_or(|p| p.role != crate::Role::Full)
-            {
+            if self.trust.get(&from).is_none_or(|p| {
+                p.role != crate::Role::Full && self.trust.mesh_profile() == MeshProfile::Personal
+            }) {
                 return Err(Error::authz(
                     "guest-to-guest or unknown counterparty forbidden",
                 ));
@@ -541,6 +556,16 @@ impl DeliveryNode {
                 .allows(manifest.capsule_id, &manifest.kind, Direction::Receive)
             {
                 return Err(Error::authz("local guest receive out of scope"));
+            }
+            if self
+                .trust
+                .get(&from)
+                .is_some_and(|p| p.role == crate::Role::Guest)
+                && !sender.scopes.as_ref().is_some_and(|scopes| {
+                    scopes.allows(manifest.capsule_id, &manifest.kind, Direction::Send)
+                })
+            {
+                return Err(Error::authz("guest sender out of scope"));
             }
         }
         Ok(raw)
@@ -1046,7 +1071,15 @@ impl DeliveryNode {
                     let (send, _) = connection.control_mut();
                     write_frame(send, &ack).await?;
                     self.clear_pending_ack(&ack.offer_id)?;
-                    self.record_event(&serde_json::json!({"event":"inbox-arrival","snapshot_id":ack.snapshot_id,"from":connection.peer_id(),"at":ack.received_at}))?;
+                    let event = match offer.scope {
+                        Scope::Full => {
+                            serde_json::json!({"event":"capsule-sync","snapshot_id":ack.snapshot_id,"capsule_id":offer.capsule_id,"scope":"full","from":connection.peer_id(),"at":ack.received_at})
+                        }
+                        Scope::Partial => {
+                            serde_json::json!({"event":"inbox-arrival","snapshot_id":ack.snapshot_id,"scope":"partial","from":connection.peer_id(),"at":ack.received_at})
+                        }
+                    };
+                    self.record_event(&event)?;
                     self.clear_partials(&ack.offer_id)?;
                 }
                 "ack" => {

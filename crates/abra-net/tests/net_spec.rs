@@ -319,6 +319,77 @@ fn capsule_scope_blocks_capsule_less_traffic() {
 }
 
 #[test]
+fn mesh_profiles_gate_guest_to_guest_with_both_scopes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut trust = abra_net::TrustStore::open(root.path()).unwrap();
+    let sender = Identity::generate();
+    let receiver = Identity::generate();
+    let capsule = Hash::from_bytes([13; 32]);
+    for (identity, send, receive, token) in [
+        (&sender, true, false, "31".repeat(16)),
+        (&receiver, false, true, "32".repeat(16)),
+    ] {
+        trust
+            .insert(TrustedPeer {
+                peer_id: identity.peer_id(),
+                name: "guest".into(),
+                role: Role::Guest,
+                x25519_pk: [0; 32],
+                token_id: Some(token),
+                scopes: Some(Scopes {
+                    capsules: vec![capsule.to_hex()],
+                    kinds: vec!["dev.abra.workspace".into()],
+                    send,
+                    receive,
+                    lease_acquire: false,
+                    lease_takeover: false,
+                }),
+                expires_at: Some(abra_net::format_time(NOW + 10_000)),
+            })
+            .unwrap();
+    }
+    assert!(trust
+        .authorize_offer(
+            sender.peer_id(),
+            receiver.peer_id(),
+            Some(capsule),
+            "dev.abra.workspace",
+            abra_net::Direction::Send,
+            NOW
+        )
+        .is_err());
+    trust
+        .set_mesh_profile(abra_net::MeshProfile::Fleet)
+        .unwrap();
+    trust
+        .authorize_offer(
+            sender.peer_id(),
+            receiver.peer_id(),
+            Some(capsule),
+            "dev.abra.workspace",
+            abra_net::Direction::Send,
+            NOW,
+        )
+        .unwrap();
+    assert!(trust
+        .authorize_offer(
+            sender.peer_id(),
+            receiver.peer_id(),
+            Some(capsule),
+            "dev.abra.other",
+            abra_net::Direction::Send,
+            NOW
+        )
+        .is_err());
+    assert_eq!(
+        abra_net::TrustStore::open(root.path())
+            .unwrap()
+            .mesh_profile(),
+        abra_net::MeshProfile::Fleet
+    );
+}
+
+#[test]
 fn revocation_survives_concurrent_stale_save() {
     let root = tempfile::tempdir().unwrap();
     let guest = Identity::generate();

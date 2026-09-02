@@ -1,6 +1,7 @@
 //! Library-first Abra daemon and its newline-delimited JSON control API.
 #![forbid(unsafe_code)]
 pub mod adapters;
+pub mod relay;
 
 use abra_core::{
     capsule::{random_capsule_id, Genesis, LabelOp, LeaseMode, LeaseRecord},
@@ -182,6 +183,7 @@ impl Daemon {
             name: intro.name.clone(),
             role: Role::Full,
             x25519_pk: intro.x25519_pk,
+            relay_key: Some(intro.relay_discovery_key),
             token_id: None,
             scopes: None,
             expires_at: None,
@@ -193,6 +195,7 @@ impl Daemon {
                     name: peer.name,
                     role: peer.role,
                     x25519_pk: peer.x25519_pk,
+                    relay_key: None,
                     token_id: peer.token_id,
                     scopes: peer.scopes,
                     expires_at: peer.expires_at,
@@ -247,6 +250,9 @@ impl Daemon {
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         }
         let mut tasks = Vec::new();
+        if let Err(error) = self.poll_relays().await {
+            eprintln!("cadabra: startup relay poll error: {error}");
+        }
         let daemon = Arc::clone(self);
         let clients = Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS));
         let mut stop = self.shutdown.subscribe();
@@ -271,6 +277,17 @@ impl Daemon {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
+                }
+            }
+        }));
+        let daemon = Arc::clone(self);
+        let mut stop = self.shutdown.subscribe();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let seconds = relay::RelayConfig::load(&daemon.root).map_or(60, |c| c.relay_poll_seconds.max(1));
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => if let Err(error) = daemon.poll_relays().await { eprintln!("cadabra: relay poll error: {error}"); }
                 }
             }
         }));
@@ -359,6 +376,11 @@ impl Daemon {
                     {
                         eprintln!("cadabra: outbox session merge error: {error}");
                     }
+                    if result.is_err() {
+                        if let Err(relay_error) = self.deposit_if_due(&id).await {
+                            eprintln!("cadabra: relay deposit error: {relay_error}");
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = self.node.lock().await.outbox.fail_attempt(
@@ -366,9 +388,80 @@ impl Daemon {
                         error.to_string(),
                         now_ms(),
                     );
+                    if let Err(relay_error) = self.deposit_if_due(&id).await {
+                        eprintln!("cadabra: relay deposit error: {relay_error}");
+                    }
                 }
             }
         }
+    }
+
+    async fn deposit_if_due(&self, id: &str) -> Result<()> {
+        let mut config = relay::RelayConfig::load(&self.root)?;
+        let node = self.node.lock().await;
+        let entry = node.outbox.get(id).cloned().ok_or("unknown outbox id")?;
+        if entry.attempts < config.relay_after_attempts || config.relays.is_empty() {
+            return Ok(());
+        }
+        let peer = node
+            .trust
+            .get(&entry.peer_id)
+            .cloned()
+            .ok_or("relay recipient is not trusted")?;
+        let discovery = peer
+            .relay_key
+            .ok_or("relay recipient lacks discovery key")?;
+        let payload = node.relay_delivery(id, now_ms())?;
+        drop(node);
+        let mut deposited = false;
+        let mut last_error = None;
+        for endpoint in config.relays.clone() {
+            if config.deposited(id, &endpoint.url) {
+                deposited = true;
+                continue;
+            }
+            match relay::enqueue(
+                &endpoint,
+                abra_net::day_tag(&discovery, (now_ms() / 86_400_000) as i64),
+                peer.x25519_pk,
+                &payload,
+                now_ms(),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            }
+            config.mark_deposited(id, &endpoint.url);
+            config.save(&self.root)?;
+            deposited = true;
+        }
+        if deposited {
+            self.node
+                .lock()
+                .await
+                .outbox
+                .mark_relay_deposited(id, now_ms())?;
+        }
+        if !deposited {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_relays(&self) -> Result<usize> {
+        let config = relay::RelayConfig::load(&self.root)?;
+        let mut count = 0;
+        for endpoint in config.relays {
+            let mut node = self.node.lock().await;
+            count += relay::poll(&self.root, &mut node, &endpoint, now_ms()).await?;
+        }
+        Ok(count)
     }
 
     async fn serve_client(&self, stream: UnixStream) -> Result<()> {
@@ -397,6 +490,7 @@ impl Daemon {
             if bytes.len() as u64 <= MAX_CONTROL_LINE && bytes.ends_with(b"\n") {
                 if let Ok(request) = serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]) {
                     if request.get("op").and_then(Value::as_str) == Some("watch") {
+                        let _ = self.poll_relays().await;
                         let _watcher = self
                             .watchers
                             .clone()
@@ -562,7 +656,59 @@ impl Daemon {
                 adapters::AdapterRegistry::remove(&self.root, required_str(&request, "name")?)?;
                 Ok(json!({"removed":required_str(&request, "name")?}))
             }
-            "inbox" => self.inbox().await,
+            "inbox" => {
+                self.poll_relays().await?;
+                self.inbox().await
+            }
+            "relay-list" => {
+                let config = relay::RelayConfig::load(&self.root)?;
+                Ok(Value::Array(
+                    config
+                        .relays
+                        .iter()
+                        .map(|r| json!({"url":r.url,"secret_configured":!r.secret.is_empty()}))
+                        .collect(),
+                ))
+            }
+            "relay-add" => {
+                let url = required_str(&request, "url")?
+                    .trim_end_matches('/')
+                    .to_owned();
+                let secret = request
+                    .get("secret")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let mut config = relay::RelayConfig::load(&self.root)?;
+                if let Some(n) = request.get("relay_after_attempts").and_then(Value::as_u64) {
+                    config.relay_after_attempts = u32::try_from(n)
+                        .map_err(|_| "relay_after_attempts is too large")?
+                        .max(1);
+                }
+                if let Some(n) = request.get("poll_seconds").and_then(Value::as_u64) {
+                    config.relay_poll_seconds = n.max(1);
+                }
+                if let Some(existing) = config.relays.iter_mut().find(|r| r.url == url) {
+                    existing.secret = secret;
+                } else {
+                    config.relays.push(relay::RelayEndpoint {
+                        url: url.clone(),
+                        secret,
+                    });
+                }
+                config.save(&self.root)?;
+                Ok(
+                    json!({"url":url,"secret_configured":!config.relays.iter().find(|r| r.url == url).expect("just inserted").secret.is_empty()}),
+                )
+            }
+            "relay-remove" => {
+                let url = required_str(&request, "url")?.trim_end_matches('/');
+                let mut config = relay::RelayConfig::load(&self.root)?;
+                let before = config.relays.len();
+                config.relays.retain(|r| r.url != url);
+                config.save(&self.root)?;
+                Ok(json!({"removed":before != config.relays.len(),"url":url}))
+            }
             "accept" => self.accept(&request).await,
             "log" => self.log(&request).await,
             "capsules" => self.capsules().await,

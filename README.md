@@ -109,6 +109,21 @@ The default iroh transport uses direct addresses. The optional `abra-relay`
 binary provides blind sealed store-and-forward delivery primitives. Recipes and
 control messages are carried/surfaced as data; Abra does not execute them.
 
+### Self-hosted relay quickstart
+
+```console
+$ ABRA_RELAY_SECRET=change-me target/debug/abra-relay --listen 127.0.0.1:8787
+$ target/debug/abra --root /tmp/abra-a relay add http://127.0.0.1:8787 --secret change-me
+$ target/debug/abra --root /tmp/abra-b relay add http://127.0.0.1:8787 --secret change-me
+$ target/debug/abra --root /tmp/abra-a send <peer-b> --link https://example.test/offline
+# start B later; startup (or `abra inbox`) polls, commits, and returns a signed ack
+$ target/debug/abra --root /tmp/abra-b daemon
+```
+
+Put the HTTP relay behind TLS for Internet deployment. Relay items expose only
+rotating tags, expiry metadata, and recipient-sealed ciphertext. Deposit leaves
+the outbox `awaiting_ack`; only a verified receiver signature makes it `acked`.
+
 ## Status
 
 Stages 1–4 include local primitives, encrypted iroh transport, scoped guests,

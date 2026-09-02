@@ -82,6 +82,7 @@ fn full_peer(peer_id: PeerId) -> TrustedPeer {
         name: "peer".into(),
         role: Role::Full,
         x25519_pk: [7; 32],
+        relay_key: Some([8; 32]),
         token_id: None,
         scopes: None,
         expires_at: None,
@@ -91,6 +92,77 @@ fn full_peer(peer_id: PeerId) -> TrustedPeer {
 fn trust_each_other(a: &mut DeliveryNode, b: &mut DeliveryNode) {
     a.trust.insert(full_peer(b.peer_id())).unwrap();
     b.trust.insert(full_peer(a.peer_id())).unwrap();
+}
+
+#[test]
+fn relay_pack_commits_partial_and_full_then_only_verified_acks_clear_outbox() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let input = tempfile::tempdir().unwrap();
+    fs::write(input.path().join("relay.txt"), b"receiver was offline").unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+
+    let partial = partial(&mut a, input.path(), "secret relay manifest marker");
+    let partial_id = a.enqueue(b.peer_id(), &partial, NOW).unwrap();
+    a.outbox.mark_relay_deposited(&partial_id, NOW + 1).unwrap();
+    let (_, partial_ack) = b
+        .receive_relay_delivery(a.relay_delivery(&partial_id, NOW + 1).unwrap(), NOW + 2)
+        .unwrap();
+    assert!(b.store.inbox.contains_key(&partial.snapshot_id()));
+
+    let mut forged = partial_ack.clone();
+    forged.sig = Signature::from_bytes([0; 64]);
+    assert!(a
+        .outbox
+        .apply_ack(&partial_id, &forged, a.peer_id(), NOW + 3)
+        .is_err());
+    assert_eq!(
+        a.outbox.get(&partial_id).unwrap().state,
+        OutboxState::AwaitingAck
+    );
+    assert!(a
+        .outbox
+        .apply_ack(&partial_id, &partial_ack, a.peer_id(), NOW + 4)
+        .unwrap());
+
+    let creator = Identity::generate();
+    let capsule_id = Hash::from_bytes([91; 32]);
+    let genesis = Genesis::new(
+        capsule_id,
+        abra_net::format_time(NOW),
+        "dev.abra.workspace".into(),
+        "relay capsule".into(),
+        &creator,
+    )
+    .unwrap();
+    let grant = LeaseRecord::new(
+        capsule_id,
+        creator.peer_id(),
+        1,
+        LeaseMode::Grant,
+        abra_net::format_time(NOW),
+        abra_net::format_time(NOW + 86_400_000),
+        genesis.hash().unwrap(),
+        &creator,
+    )
+    .unwrap();
+    a.store.add_capsule(genesis, grant).unwrap();
+    let full = full(&mut a, input.path(), capsule_id, "full relay snapshot");
+    let full_id = a.enqueue(b.peer_id(), &full, NOW).unwrap();
+    a.outbox.mark_relay_deposited(&full_id, NOW + 1).unwrap();
+    let (_, full_ack) = b
+        .receive_relay_delivery(a.relay_delivery(&full_id, NOW + 1).unwrap(), NOW + 2)
+        .unwrap();
+    assert!(b.store.capsules[&capsule_id]
+        .snapshot(&full.snapshot_id())
+        .is_some());
+    assert!(a
+        .outbox
+        .apply_ack(&full_id, &full_ack, a.peer_id(), NOW + 3)
+        .unwrap());
+    assert_eq!(a.outbox.get(&full_id).unwrap().state, OutboxState::Acked);
 }
 
 async fn wire_deliver(
@@ -262,6 +334,7 @@ fn scope_expiry_revocation_and_guest_to_guest_are_enforced() {
             name: "g".into(),
             role: Role::Guest,
             x25519_pk: [0; 32],
+            relay_key: None,
             token_id: Some("aa".repeat(16)),
             scopes: Some(scopes),
             expires_at: Some(abra_net::format_time(NOW + 1000)),
@@ -335,6 +408,7 @@ fn mesh_profiles_gate_guest_to_guest_with_both_scopes() {
                 name: "guest".into(),
                 role: Role::Guest,
                 x25519_pk: [0; 32],
+                relay_key: None,
                 token_id: Some(token),
                 scopes: Some(Scopes {
                     capsules: vec![capsule.to_hex()],
@@ -402,6 +476,7 @@ fn revocation_survives_concurrent_stale_save() {
             name: "guest".into(),
             role: Role::Guest,
             x25519_pk: [0; 32],
+            relay_key: None,
             token_id: Some(token_id.clone()),
             scopes: Some(Scopes {
                 capsules: vec!["*".into()],
@@ -422,6 +497,7 @@ fn revocation_survives_concurrent_stale_save() {
             name: "peer".into(),
             role: Role::Full,
             x25519_pk: [0; 32],
+            relay_key: None,
             token_id: None,
             scopes: None,
             expires_at: None,
@@ -449,6 +525,7 @@ async fn guest_expiry_mid_session_cuts_off_next_frame() {
             name: "short-lived".into(),
             role: Role::Guest,
             x25519_pk: [0; 32],
+            relay_key: None,
             token_id: Some("cd".repeat(16)),
             scopes: Some(Scopes {
                 capsules: vec!["*".into()],

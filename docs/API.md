@@ -46,6 +46,9 @@ Operations and request fields:
 | `ps` / `stop-recipes` | `capsule?` | legacy records / explicit disabled error |
 | `outbox` | — | entries including protocol state and retry metadata |
 | `cancel` | `id` | cancelled outbox id |
+| `relay-list` | — | configured relay endpoints |
+| `relay-add` | `url`, `secret?`, `relay_after_attempts?`, `poll_seconds?` | persisted relay configuration |
+| `relay-remove` | `url` | removal result |
 
 Paths sent to `capsule-create`, `snapshot`, and `accept` must be absolute. The
 CLI resolves them in the caller's working directory before making the request;
@@ -67,6 +70,12 @@ in v1.
 
 `log` results are guaranteed to be topologically ordered: every locally known
 parent appears before its children, with deterministic snapshot-id sibling order.
+
+Relay configuration is stored at `<store-root>/config/relays.json`. The CLI forms
+are `abra relay add <url> [--secret <deploy-secret>] [--relay-after-attempts N]
+[--poll-seconds N]`, `abra relay list`, and `abra relay remove <url>`. Deposit
+defaults to three failed direct attempts and polling defaults to every 60 seconds;
+`inbox` and `watch` also trigger an immediate poll.
 
 Native refs are an optional cache. Receivers compare every fingerprint field
 against a live probe and fall back to the portable file tree and recipe data

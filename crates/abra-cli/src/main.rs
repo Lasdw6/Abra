@@ -95,6 +95,27 @@ enum Command {
         #[command(subcommand)]
         command: AdapterCommand,
     },
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelayCommand {
+    Add {
+        url: String,
+        #[arg(long)]
+        secret: Option<String>,
+        #[arg(long)]
+        relay_after_attempts: Option<u32>,
+        #[arg(long)]
+        poll_seconds: Option<u64>,
+    },
+    List,
+    Remove {
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -373,6 +394,18 @@ async fn main() -> cadabra::Result<()> {
                 json!({"op":"adapters-add","dir":fs::canonicalize(dir)?})
             }
             AdapterCommand::Remove { name } => json!({"op":"adapters-remove","name":name}),
+        },
+        Command::Relay { command } => match command {
+            RelayCommand::Add {
+                url,
+                secret,
+                relay_after_attempts,
+                poll_seconds,
+            } => {
+                json!({"op":"relay-add","url":url,"secret":secret,"relay_after_attempts":relay_after_attempts,"poll_seconds":poll_seconds})
+            }
+            RelayCommand::List => json!({"op":"relay-list"}),
+            RelayCommand::Remove { url } => json!({"op":"relay-remove","url":url}),
         },
         Command::Watch => unreachable!(),
         Command::Link { .. } => unreachable!(),

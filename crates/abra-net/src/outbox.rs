@@ -259,6 +259,20 @@ impl Outbox {
         self.save()?;
         Ok(true)
     }
+    pub fn mark_relay_deposited(&mut self, id: &str, now: u64) -> Result<()> {
+        let e = self
+            .disk
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| Error::protocol("unknown outbox id"))?;
+        if !e.state.terminal() {
+            e.state = OutboxState::AwaitingAck;
+            e.updated_at = format_time(now);
+            e.next_attempt_at = format_time(now.saturating_add(60_000));
+            self.save()?;
+        }
+        Ok(())
+    }
     pub fn expire(&mut self, now: u64) -> Result<()> {
         for e in self.disk.entries.values_mut() {
             if e.state == OutboxState::Queued && age_ms(&e.created_at, now) > OUTBOX_TTL_MS {

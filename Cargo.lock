@@ -357,8 +357,10 @@ version = "0.1.0"
 dependencies = [
  "abra-core",
  "abra-net",
+ "abra-relay",
  "assert_cmd",
  "clap",
+ "data-encoding",
  "fs2",
  "hex",
  "predicates",

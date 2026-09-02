@@ -849,6 +849,14 @@ turn.
 - Relay discovery-key erratum: each device has an independent random 32-byte
   relay discovery key shared through pairing/enrollment records. Relay sealing
   uses the ephemeral-X25519 and AES-256-GCM construction pinned in §8.
+- Relay envelope erratum: sealed plaintext is canonical JSON tagged `delivery`
+  (sender peer id, the exact direct `Offer`, and `{digest,kind,data}` objects) or
+  `ack` (sender peer id and the normal signed `Ack`). Receivers pass offers
+  through `validate_incoming_offer`, reconstruct and verify the manifest closure
+  from object bytes, and only then durably commit. v0.1 uses one object-pack
+  envelope; after JSON/base64/sealing overhead it MUST fit the 16 MiB item cap.
+  Oversize sends fail clearly and require splitting the snapshot. Chunk assembly
+  is reserved for a later wire version.
 - Fleet-profile clarification: guest-to-guest delivery is authorization policy,
   not a protocol change. `personal` forbids it. `fleet` permits it only when the
   sender's send scope and recipient's receive scope both cover the exact kind

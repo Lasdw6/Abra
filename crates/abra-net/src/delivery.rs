@@ -128,6 +128,31 @@ pub struct Ack {
     pub sig: Signature,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayObject {
+    pub digest: Hash,
+    pub kind: String,
+    pub data: String,
+}
+
+/// Recipient-sealed relay payload. It deliberately embeds the exact direct
+/// `Offer` and a byte-authoritative object pack, so relay receipt uses the same
+/// authorization and manifest validation as a live session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RelayPayload {
+    Delivery {
+        sender: PeerId,
+        offer: Box<Offer>,
+        objects: Vec<RelayObject>,
+    },
+    Ack {
+        sender: PeerId,
+        ack: Ack,
+    },
+}
+
 fn ack_payload(
     offer_id: &str,
     snapshot_id: Hash,
@@ -308,6 +333,159 @@ impl DeliveryNode {
         }
         self.outbox
             .enqueue(peer, raw.snapshot_id(), raw.bytes().to_vec(), now)
+    }
+
+    pub fn relay_delivery(&self, id: &str, now: u64) -> Result<RelayPayload> {
+        let entry = self
+            .outbox
+            .get(id)
+            .ok_or_else(|| Error::protocol("unknown outbox id"))?;
+        let raw = RawManifest::parse(entry.manifest_raw.clone())?;
+        let closure_set = closure(&self.store.cas, raw.manifest())?;
+        let mut objects = Vec::with_capacity(closure_set.len());
+        let mut bytes_hint = 0u64;
+        for digest in closure_set {
+            let bytes = self.store.cas.get(&digest)?;
+            bytes_hint = bytes_hint.saturating_add(bytes.len() as u64);
+            objects.push(RelayObject {
+                digest,
+                kind: if Tree::decode(&bytes).is_ok() {
+                    "tree"
+                } else {
+                    "blob"
+                }
+                .into(),
+                data: data_encoding::BASE64URL_NOPAD.encode(&bytes),
+            });
+        }
+        let capsule = raw
+            .manifest()
+            .capsule_id
+            .and_then(|c| self.store.capsules.get(&c));
+        let offer = Offer {
+            message_type: "offer".into(),
+            offer_id: entry.offer_id.clone(),
+            snapshot_id: entry.snapshot_id,
+            scope: raw.manifest().scope,
+            kind: raw.manifest().kind.clone(),
+            title: raw.manifest().title.clone(),
+            capsule_id: raw.manifest().capsule_id,
+            fork: capsule.is_some_and(|c| {
+                c.active_lease(now)
+                    .is_none_or(|l| l.holder != raw.manifest().origin.peer_id)
+            }),
+            bytes_hint,
+            object_count: objects.len() as u64,
+            manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
+            genesis: capsule.map(|c| c.genesis.clone()),
+            genesis_grant: capsule.and_then(|c| {
+                c.leases()
+                    .iter()
+                    .find(|l| l.epoch == 1 && l.mode == LeaseMode::Grant)
+                    .cloned()
+            }),
+            lease_chain: capsule.map(winning_lease_chain).unwrap_or_default(),
+            main_label: capsule.and_then(|c| c.label("main").cloned()),
+        };
+        Ok(RelayPayload::Delivery {
+            sender: self.peer_id(),
+            offer: Box::new(offer),
+            objects,
+        })
+    }
+
+    pub fn receive_relay_delivery(
+        &mut self,
+        payload: RelayPayload,
+        now: u64,
+    ) -> Result<(PeerId, Ack)> {
+        let RelayPayload::Delivery {
+            sender,
+            offer,
+            objects,
+        } = payload
+        else {
+            return Err(Error::protocol("relay payload is not a delivery"));
+        };
+        let raw = self.validate_incoming_offer(&offer, sender, now)?;
+        if objects.len() as u64 != offer.object_count {
+            return Err(Error::protocol("relay object count mismatch"));
+        }
+        let mut supplied = BTreeSet::new();
+        let mut total = 0u64;
+        let mut decoded = Vec::with_capacity(objects.len());
+        for object in objects {
+            let bytes = data_encoding::BASE64URL_NOPAD
+                .decode(object.data.as_bytes())
+                .map_err(|_| Error::protocol("bad relay object base64"))?;
+            total = total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| Error::protocol("relay byte count overflow"))?;
+            if Hash::of(&bytes) != object.digest
+                || !matches!(object.kind.as_str(), "blob" | "tree")
+                || (object.kind == "tree") != Tree::decode(&bytes).is_ok()
+            {
+                return Err(Error::protocol("invalid relay object"));
+            }
+            if !supplied.insert(object.digest) {
+                return Err(Error::protocol("duplicate relay object"));
+            }
+            decoded.push((object.digest, bytes));
+        }
+        if total != offer.bytes_hint || total > MAX_OBJECT_SIZE {
+            return Err(Error::protocol("relay object pack exceeds delivery limit"));
+        }
+        let staged = abra_core::cas::BlobStore::open(
+            self.partial_dir.join(&offer.offer_id).join("relay-staged"),
+        )?;
+        for (_, bytes) in &decoded {
+            staged.put(bytes)?;
+        }
+        if closure(&staged, raw.manifest())? != supplied {
+            return Err(Error::protocol(
+                "relay pack differs from verified manifest closure",
+            ));
+        }
+        for (_, bytes) in decoded {
+            self.store.cas.put(&bytes)?;
+        }
+        if raw.manifest().scope == Scope::Full {
+            let capsule_id = raw.manifest().capsule_id.expect("validated");
+            if !self.store.capsules.contains_key(&capsule_id) {
+                self.store.add_capsule(
+                    offer
+                        .genesis
+                        .clone()
+                        .ok_or_else(|| Error::protocol("missing genesis"))?,
+                    offer
+                        .genesis_grant
+                        .clone()
+                        .ok_or_else(|| Error::protocol("missing genesis grant"))?,
+                )?;
+            }
+        } else if self.store.inbox.len() >= MAX_INBOX_ENTRIES {
+            return Err(Error::authz("inbox quota exceeded"));
+        }
+        let mut shelf = self.commit_manifest(raw, sender, now)?;
+        if shelf == "capsule" {
+            shelf = if self.adopt_offer_capsule_state(&offer, now).unwrap_or(false) {
+                "capsule-head"
+            } else {
+                "capsule-fork"
+            }
+            .into();
+        }
+        let ack = Ack::sign(
+            offer.offer_id.clone(),
+            offer.snapshot_id,
+            shelf,
+            now,
+            sender,
+            &self.store.keys.identity,
+        )?;
+        self.persist_pending_ack(&ack)?;
+        self.record_event(&serde_json::json!({"event":if offer.scope == Scope::Full {"capsule-sync"} else {"inbox-arrival"},"snapshot_id":ack.snapshot_id,"from":sender,"at":ack.received_at,"via":"relay"}))?;
+        Ok((sender, ack))
     }
     fn compute_have(&self, offer: &str, closure: &BTreeSet<Hash>) -> Result<Have> {
         let mut have = Vec::new();

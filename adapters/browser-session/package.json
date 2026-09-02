@@ -1,0 +1,15 @@
+{
+  "name": "@abra/browser-session",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "abra-browser": "./bin/abra-browser.js",
+    "abra-browser-adapter": "./bin/adapter.js",
+    "profile-use": "./facade/profile-use.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": { "node": ">=22" }
+}

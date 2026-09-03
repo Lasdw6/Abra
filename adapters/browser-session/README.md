@@ -17,6 +17,8 @@ Bundle files are `0600` in `0700` directories. Receipts contain an opaque instal
 
 `export --from local --profile Default` makes a private profile copy and always removes it after Chrome exits, including error and interrupt paths. Symlinked source profiles are refused. `import --to local --detach` launches a fresh empty profile under the tool data directory, never a clone of the user's profile, and binds debugging to loopback. `--detach` is explicit because Chrome remains alive until verified revocation.
 
+Local export currently captures cookies only. Chrome's last-session files are not part of a stable, cheap-to-read format, and the copied profile starts with a blank tab. Use direct CDP capture for the demo and whenever tabs or origin storage matter.
+
 Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
 
 ## Playwright compatibility
@@ -25,7 +27,27 @@ Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 
 ## Adapter and façade
 
-`bin/adapter.js` implements `abra-adapter/1`. Export returns manifest metadata only. Imports mark receipts non-re-exportable and never return a CDP URL.
+`bin/adapter.js` implements `abra-adapter/1`. Export puts the real bundle in `files_path`; its `payload` field contains manifest metadata only. Imports mark receipts non-re-exportable and never return a CDP URL.
+
+Import destinations are explicit. Use `--destination local` to launch a fresh detached Chrome, or `--destination cdp:<ws-url>` to install into a CDP browser. Omitting `--destination` fails the import. The filesystem path passed by Abra as the default destination is only where it materializes the bundle and never authorizes a browser launch.
+
+## Through Abra
+
+On Mac A, start a separate Chrome profile with remote debugging. Sign into the demo site in that Chrome window, then fetch its CDP WebSocket URL and send the session:
+
+```sh
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$HOME/.abra-demo-chrome"
+CDP_URL="$(curl -fsS http://127.0.0.1:9222/json/version | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).webSocketDebuggerUrl))')"
+abra send <peer> --kind dev.abra.browser.session.v1 --source "cdp:$CDP_URL"
+```
+
+On Mac B, accept the transfer into a fresh detached local Chrome:
+
+```sh
+abra accept <id> --to <dir> --destination local
+```
+
+GitHub with a test account is the recommended demo site. Google sessions can fail to transfer because Google uses device-bound session credentials.
 
 The façade requires a bearer secret and defaults to loopback:
 

@@ -1,12 +1,9 @@
-import { chmod, copyFile, realpath, rm } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { chmod, copyFile, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { capture, install, launchLocalChrome, revoke, withLocalChrome } from './browser.js';
-import { dataDir, loadBundle, loadManifest, parseList, readJson, RECEIPT_KIND, saveBundle, signObject, signingIdentity, verifyObject, writeJson } from './util.js';
+import { capture, revoke, stopChrome, withLocalChrome } from './browser.js';
+import { installBundle, processIdentity, registryFile, safeContainedDelete } from './import.js';
+import { dataDir, loadBundle, loadManifest, parseList, readJson, RECEIPT_KIND, saveBundle, signingIdentity, verifyObject, writeJson } from './util.js';
 
-const execFileAsync = promisify(execFile);
 export function parseArgs(argv) { const positionals=[],flags={}; for(let i=0;i<argv.length;i++){const arg=argv[i];if(!arg.startsWith('--'))positionals.push(arg);else{const key=arg.slice(2);flags[key]=i+1<argv.length&&!argv[i+1].startsWith('--')?argv[++i]:true;}} return {positionals,flags}; }
 function need(flags,name){if(!flags[name]||flags[name]===true)throw new Error(`--${name} is required`);return flags[name];}
 export function summary(m){const lines=[`${m.kind} captured ${m.capture_time}`,`Signer: ${m.signature.fingerprint}`,`Source: ${m.source_browser}`,`Size: ${m.total_size} bytes`,'Domains:'];for(const d of m.domains)lines.push(`  ${d.domain}: ${d.cookie_count} cookies (${d.http_only_count} HttpOnly, ${d.secure_count} Secure)`);lines.push('Tabs:');for(const t of m.tabs)lines.push(`  ${t.title||'(untitled)'} — ${t.url}`);lines.push('Non-teleportable (heuristic; false positives/negatives possible):');if(!m.non_teleportable.length)lines.push('  none detected');for(const x of m.non_teleportable)lines.push(`  ${x.domain}: ${x.reasons.join('; ')}`);return lines.join('\n');}
@@ -18,18 +15,10 @@ async function trustedBundle(dir, flags) {
   if (result.manifest.signature.fingerprint !== identity.fingerprint && requested !== result.manifest.signature.fingerprint) throw new Error(`untrusted sender ${result.manifest.signature.fingerprint}; rerun with --trust-sender ${result.manifest.signature.fingerprint} after verifying it out of band`);
   return result;
 }
-function registryFile(id){return path.join(dataDir(),'installs',`${id}.json`);}
-function receiptFile(id){return path.join(dataDir(),'receipts',`${id}.json`);}
-async function persistInstall(id, record){await writeJson(registryFile(id),record);}
-async function safeContainedDelete(candidate, root) {
-  const resolvedRoot=await realpath(root), resolved=await realpath(candidate);
-  if(resolved===resolvedRoot||!resolved.startsWith(`${resolvedRoot}${path.sep}`))throw new Error('refusing to remove path outside the browser-session data directory');
-  await rm(resolved,{recursive:true,force:true});
-}
-async function processIdentity(pid){const {stdout}=await execFileAsync('/bin/ps',['-p',String(pid),'-o','lstart=','-o','command=']);const line=stdout.trim();const match=line.match(/^(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+([\s\S]+)$/);if(!match)throw new Error('cannot verify registered Chrome process identity');return{started_at:match[1],command:match[2]};}
+
 async function stopRegisteredChrome(record) {
   if(!Number.isSafeInteger(record.pid)||record.pid<=0||!record.profile_dir)return;
-  try { const current=await processIdentity(record.pid);if(current.started_at!==record.started_at||current.command!==record.command||!current.command.includes(`--user-data-dir=${record.profile_dir}`))throw new Error('registered Chrome process identity no longer matches');process.kill(record.pid,'SIGTERM'); } catch(error) { if(error.code!=='ESRCH')throw error; }
+  try { const current=await processIdentity(record.pid);if(current.started_at!==record.started_at||current.command!==record.command||!current.command.includes(`--user-data-dir=${record.profile_dir}`))throw new Error('registered Chrome process identity no longer matches');await stopChrome(record.pid,record.profile_dir); } catch(error) { if(error.code!=='ESRCH')throw error; }
 }
 
 export async function run(argv,io=console){
@@ -41,18 +30,12 @@ export async function run(argv,io=console){
   }
   if(command==='inspect'){const dir=path.resolve(positionals[1]||'.'),manifest=await loadManifest(dir);io.log(summary(manifest));return manifest;}
   if(command==='import'){
-    const dir=path.resolve(positionals[1]||'.'),to=need(flags,'to'),{state,manifest}=await trustedBundle(dir,flags),policy={allows:parseList(flags['allow-domains']),denies:parseList(flags['deny-domains'])},installId=randomUUID();let local,wsUrl;
-    if(to==='cdp')wsUrl=positionals[2]||need(flags,'cdp');
-    else if(to==='local'){
-      if(!flags.detach)throw new Error('--to local requires explicit --detach because Chrome remains running until revoke');
-      const profileDir=path.join(dataDir(),'profiles',installId);local=await launchLocalChrome(undefined,{fresh:true,root:profileDir});wsUrl=local.wsUrl;
-    } else throw new Error('--to must be local or cdp');
-    try {
-      const receipt=await install(wsUrl,state,policy,{watchMs:Number(flags['watch-ms']||0)});receipt.install_id=installId;receipt.source_bundle_sha256=manifest.state_sha256;receipt.reexportable=false;
-      const localIdentity=local?await processIdentity(local.child.pid):null;
-      await persistInstall(installId,{cdp_url:wsUrl,browser_context_id:receipt.browser_context_id,origins:receipt.origins,...(local?{pid:local.child.pid,profile_dir:local.tempRoot,...localIdentity}: {})});
-      const identity=await signingIdentity();receipt.signature=signObject(receipt,identity,'browser-session-install-receipt');const output=flags.receipt?path.resolve(flags.receipt):receiptFile(installId);await writeJson(output,receipt);if(local)local.child.unref();io.log(output);return receipt;
-    }catch(error){local?.child.kill('SIGTERM');if(local)await safeContainedDelete(local.tempRoot,path.join(dataDir(),'profiles')).catch(()=>{});throw error;}
+    const dir=path.resolve(positionals[1]||'.'),to=need(flags,'to');
+    if(to==='local'&&!flags.detach)throw new Error('--to local requires explicit --detach because Chrome remains running until revoke');
+    if(to!=='local'&&to!=='cdp')throw new Error('--to must be local or cdp');
+    const destination=to==='cdp'?{type:'cdp',cdpUrl:positionals[2]||need(flags,'cdp')}:{type:'local'};
+    const {receipt,receiptPath}=await installBundle(dir,destination,{policy:{allows:parseList(flags['allow-domains']),denies:parseList(flags['deny-domains'])},watchMs:Number(flags['watch-ms']||0),trustSender:flags['trust-sender'],requireLocalTrust:true,receiptPath:flags.receipt});
+    io.log(receiptPath);return receipt;
   }
   if(command==='revoke'){
     const file=path.resolve(positionals[1]||''),receipt=await readJson(file),identity=await signingIdentity();

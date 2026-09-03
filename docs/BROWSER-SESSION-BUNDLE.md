@@ -4,7 +4,7 @@ Status: Track B implementation specification. Normative terms use RFC 2119.
 
 ## Purpose and envelope
 
-`dev.abra.browser-session.v1` is a provider-neutral, human-inspectable browser-session payload: “the `storage_state` of the agent era.” It is a strict semantic superset of Playwright `storage_state`, adding session storage, IndexedDB, tabs, policy, provenance, integrity, receipts, and revocation. It can be sent as an Abra `partial` snapshot. The core authors and signs the Abra envelope; this document specifies the payload files inside it.
+`dev.abra.browser.session.v1` is a provider-neutral, human-inspectable browser-session payload: “the `storage_state` of the agent era.” The adapter also accepts the legacy outer and inner kind `dev.abra.browser-session.v1` so capsules from older builds remain importable. It is a strict semantic superset of Playwright `storage_state`, adding session storage, IndexedDB, tabs, policy, provenance, integrity, receipts, and revocation. It can be sent as an Abra `partial` snapshot. The core authors and signs the Abra envelope; this document specifies the payload files inside it.
 
 A payload directory contains:
 
@@ -12,7 +12,7 @@ A payload directory contains:
 - `state.json`: full browser state. Treat this file as a credential.
 - `storage_state.json`: the Playwright compatibility view.
 
-The payload kind is `dev.abra.browser-session.v1`. `manifest.json` has `version: 1`. Unknown fields MUST be preserved by transforms where practical and ignored by readers. A reader MUST reject an unknown major version, an invalid manifest signature, or a state hash mismatch.
+The payload kind is `dev.abra.browser.session.v1`. `manifest.json` has `version: 1`. Unknown fields MUST be preserved by transforms where practical and ignored by readers. A reader MUST reject an unknown major version, an invalid manifest signature, or a state hash mismatch.
 
 The manifest signature is over canonical key-sorted JSON with `signature` omitted, domain separated by `abra-browser-session-v1\0browser-session-manifest\0`. The private key is persistent and stored `0600` below the tool data directory; `inspect` displays its public-key fingerprint. It proves integrity and continuity with that key, not human identity. Abra's signed outer envelope remains authoritative. A foreign standalone import MUST require explicit trust of an out-of-band-verified fingerprint; it MUST NOT silently trust the embedded key.
 
@@ -81,6 +81,8 @@ The inner manifest signature remains verifiable after transport encryption is re
 
 Import MUST create a fresh isolated browser context and MUST NOT install into the user's default profile. Cookies are installed with CDP `Storage.setCookies` for that browser-context id. Storage is restored in an origin-bound page; tabs are then opened. Cookies SHOULD be reapplied when new targets/contexts appear during the live import operation, because providers may create pages lazily.
 
+The external adapter MUST require an explicit browser destination. Accepted string forms are exactly `local`, `cdp:<ws-url>`, or a bare `ws://` or `wss://` URL; equivalent typed object forms are also accepted. Any other string, including the materialization directory supplied as Abra's default destination, MUST fail without launching a browser. The adapter MUST read bundle files only from `materialized_files`; sender payload metadata MUST NOT select a local path.
+
 An importer writes a receipt signed by the pinned local installation key containing: receipt kind, install time, opaque install id, isolated context id, cookie identifiers (never values), installed origins, effective policy, source-bundle digest, and `reexportable: false`. It MUST NOT contain a PID, path, or CDP URL. The capability mapping lives in a private `0600` registry. Revocation MUST verify kind, signature domain, fingerprint, pinned key, and registry/context match before action. It MUST never kill a PID or delete a path supplied by a receipt; registered processes require command-line verification and tool paths require `realpath` containment.
 
 Revocation is scoped to what the receipt installed. On `revoke`, the importer MUST clear installed cookies and origin storage in that isolated context. Disposing the dedicated browser context satisfies this atomically and is preferred. Revocation is local cleanup, not global credential invalidation: it cannot revoke server-side sessions, copies, prior recaptures, or sessions installed elsewhere. A missing/already-disposed context is reported, not silently treated as proof of remote revocation.
@@ -99,3 +101,7 @@ These signals can produce false positives and false negatives. The manifest mark
 ## Security notes
 
 STATE is equivalent to a bag of bearer credentials. Payloads, receipts, and registries MUST be `0600`; containing directories and temporary profiles MUST be `0700`. Export copies MUST be removed in `finally` and on interrupts. Imports MUST use a fresh tool-owned profile, never a clone of the user's real profile. Keep it encrypted in transit and at rest, minimize retention, avoid logs/backups, and verify integrity before use. Consent MUST be explicit and legible; a shell installer or generic browser permission is not sufficient consent to export authentication state. Secure/HttpOnly flags constrain browser script access, not possession of an exported bundle.
+
+The external adapter MUST reset a materialized bundle to these private modes before reading it. Cadabra may materialize files as `0644` and directories as `0755`.
+
+Copied-profile local export is cookies-only in v1 because Chrome's last-session files do not have a stable format available to this zero-dependency adapter. Direct CDP capture is the supported demo path for tabs and origin storage.

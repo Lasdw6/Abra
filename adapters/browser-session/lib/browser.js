@@ -1,5 +1,6 @@
 import { cp, lstat, mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -7,6 +8,8 @@ import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } fro
 import { filterState } from './util.js';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const execFileAsync = promisify(execFile);
+const REMOVE_OPTIONS = { recursive: true, force: true, maxRetries: 10, retryDelay: 200 };
 
 const CAPTURE_SCRIPT = `(() => {
   const entries = s => Object.keys(s).sort().map(name => ({name, value:s.getItem(name)}));
@@ -105,7 +108,12 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
       kind: 'dev.abra.browser-session.receipt.v1',
       installed_at: new Date().toISOString(),
       browser_context_id: browserContextId,
-      cookies: filtered.cookies.map(c => ({ name: c.name, domain: c.domain, path: c.path || '/', partitionKey: c.partitionKey })),
+      cookies: filtered.cookies.map(c => Object.fromEntries([
+        ['name', c.name],
+        ['domain', c.domain],
+        ['path', c.path || '/'],
+        ['partitionKey', c.partitionKey]
+      ].filter(([, value]) => value !== undefined))),
       origins: filtered.origins.map(o => o.origin),
       policy: { allow_domains: policy.allows || [], deny_domains: policy.denies || [] }
     };
@@ -131,9 +139,41 @@ async function rejectSymlinks(root) {
   }
 }
 
-async function waitForExit(child, timeoutMs = 5000) {
-  if (child.exitCode !== null) return;
-  await Promise.race([new Promise(resolve => child.once('exit', resolve)), delay(timeoutMs)]);
+async function chromePids(profileDir) {
+  if (!profileDir) return [];
+  const { stdout } = await execFileAsync('/bin/ps', ['-ax', '-o', 'pid=', '-o', 'command=']);
+  const marker = `--user-data-dir=${profileDir}`;
+  return stdout.split('\n').flatMap(line => {
+    const match = line.match(/^\s*(\d+)\s+([\s\S]+)$/);
+    return match && match[2].includes(marker) ? [Number(match[1])] : [];
+  });
+}
+
+function processExists(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+}
+
+async function waitForChromeExit(pids, profileDir, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!pids.some(processExists) && !(await chromePids(profileDir)).length) return true;
+    await delay(50);
+  }
+  return !pids.some(processExists) && !(await chromePids(profileDir)).length;
+}
+
+export async function stopChrome(pid, profileDir, timeoutMs = 5000) {
+  const initial = new Set([pid, ...await chromePids(profileDir)].filter(value => Number.isSafeInteger(value) && value > 0));
+  for (const processId of initial) {
+    try { process.kill(processId, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  }
+  if (await waitForChromeExit([...initial], profileDir, timeoutMs)) return;
+  const remaining = new Set([[...initial].filter(processExists), await chromePids(profileDir)].flat());
+  for (const processId of remaining) {
+    try { process.kill(processId, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  }
+  if (!await waitForChromeExit([...remaining], profileDir, 2000)) throw new Error(`Chrome did not exit within ${timeoutMs + 2000}ms`);
 }
 
 export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
@@ -157,9 +197,8 @@ export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
     if (!port) throw new Error('Chrome did not expose a debugging port');
     return { wsUrl: await browserWebSocketFromPort(port), child, tempRoot };
   } catch (error) {
-    child?.kill('SIGTERM');
-    await waitForExit(child || { exitCode: 0 });
-    await rm(tempRoot, { recursive: true, force: true });
+    if (child) await stopChrome(child.pid, tempRoot);
+    await rm(tempRoot, REMOVE_OPTIONS);
     throw new Error(`${fresh ? 'isolated import' : 'copied-profile capture'} failed; SQLite/Keychain fallback is unavailable`);
   }
 }
@@ -167,7 +206,7 @@ export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
 export async function withLocalChrome(profile, fn) {
   const local = await launchLocalChrome(profile);
   let cleaning=false;
-  const cleanup=async()=>{if(cleaning)return;cleaning=true;local.child.kill('SIGTERM');await waitForExit(local.child);await rm(local.tempRoot,{recursive:true,force:true});};
+  const cleanup=async()=>{if(cleaning)return;cleaning=true;await stopChrome(local.child.pid,local.tempRoot);await rm(local.tempRoot,REMOVE_OPTIONS);};
   const interrupted=()=>{cleanup().finally(()=>process.exit(130));};
   process.once('SIGINT',interrupted);process.once('SIGTERM',interrupted);
   try { return await fn(local.wsUrl); }
@@ -175,5 +214,5 @@ export async function withLocalChrome(profile, fn) {
 }
 
 export async function stopLocalChrome(local) {
-  local.child.kill('SIGTERM'); await waitForExit(local.child); await rm(local.tempRoot, { recursive: true, force: true });
+  await stopChrome(local.child.pid, local.tempRoot); await rm(local.tempRoot, REMOVE_OPTIONS);
 }

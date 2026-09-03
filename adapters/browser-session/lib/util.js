@@ -1,11 +1,12 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
-import { chmod, mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, readdir, rename, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { domainToASCII } from 'node:url';
 import { isIP } from 'node:net';
 
-export const KIND = 'dev.abra.browser-session.v1';
+export const KIND = 'dev.abra.browser.session.v1';
+export const LEGACY_KIND = 'dev.abra.browser-session.v1';
 export const RECEIPT_KIND = 'dev.abra.browser-session.receipt.v1';
 const SIGNING_PREFIX = 'abra-browser-session-v1';
 
@@ -15,12 +16,23 @@ export function dataDir() {
 
 export function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().filter(k => value[k] !== undefined).map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  if (value === undefined) throw new Error('canonical: undefined');
   return JSON.stringify(value);
 }
 export function sha256(value) { return createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : canonical(value)).digest('hex'); }
 
 async function privateDir(dir) { await mkdir(dir, { recursive: true, mode: 0o700 }); await chmod(dir, 0o700); }
+export async function secureTree(target) {
+  const info = await lstat(target);
+  if (info.isSymbolicLink()) throw new Error('bundle contains a symbolic link');
+  if (info.isDirectory()) {
+    await chmod(target, 0o700);
+    for (const name of await readdir(target)) await secureTree(path.join(target, name));
+  } else {
+    await chmod(target, 0o600);
+  }
+}
 export async function writePrivate(file, bytes) {
   await privateDir(path.dirname(file));
   const handle = await open(file, 'w', 0o600);
@@ -94,7 +106,7 @@ export async function loadBundle(dir, options = {}) {
 }
 export async function loadManifest(dir, options = {}) {
   const manifest = await readJson(path.join(dir, 'manifest.json'));
-  if (manifest.kind !== KIND || manifest.version !== 1) throw new Error('unsupported browser-session bundle version');
+  if (![KIND, LEGACY_KIND].includes(manifest.kind) || manifest.version !== 1) throw new Error(`unsupported browser-session bundle kind or version: ${manifest.kind} v${manifest.version}`);
   if (!verifyObject(manifest, { domain: 'browser-session-manifest' })) throw new Error('manifest signature is invalid');
   if (options.trustSender && manifest.signature.fingerprint !== options.trustSender) throw new Error(`sender key is not trusted (fingerprint ${manifest.signature.fingerprint})`);
   return manifest;

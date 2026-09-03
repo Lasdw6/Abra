@@ -71,6 +71,14 @@ enum Action {
         capsule: String,
         #[arg(long)]
         snapshot: Option<String>,
+        #[arg(long, env = "ABRA_FC_KERNEL")]
+        kernel: Option<PathBuf>,
+        #[arg(long, env = "ABRA_FC_ROOTFS")]
+        rootfs: Option<PathBuf>,
+        #[arg(long, env = "ABRA_FC_MEM")]
+        mem: Option<u32>,
+        #[arg(long, env = "ABRA_FC_VCPUS")]
+        vcpus: Option<u8>,
     },
     Down {
         #[arg(long)]
@@ -87,6 +95,15 @@ struct Config {
     ssh_key: PathBuf,
     mem_mib: u32,
     vcpus: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RestoreOverrides {
+    kernel: Option<PathBuf>,
+    rootfs: Option<PathBuf>,
+    ssh_key: Option<PathBuf>,
+    mem_mib: Option<u32>,
+    vcpus: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,13 +172,23 @@ fn main() -> Result<()> {
             slot,
             capsule,
             snapshot,
+            kernel,
+            rootfs,
+            mem,
+            vcpus,
         } => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&restore(
                     &root,
                     &cli.firecracker,
-                    cli.ssh_key.as_deref(),
+                    RestoreOverrides {
+                        kernel,
+                        rootfs,
+                        ssh_key: cli.ssh_key,
+                        mem_mib: mem,
+                        vcpus,
+                    },
                     slot,
                     &capsule,
                     snapshot.as_deref()
@@ -220,14 +247,14 @@ fn up(root: &Path, fc: &Path, slot: u8, config: Config, token: Option<&str>) -> 
     require_file(&config.ssh_key)?;
     let _ = down(root, slot);
     let dir = slot_dir(root, slot);
-    fs::create_dir_all(&dir)?;
+    create_slot_dir(root, slot)?;
     let rootfs = dir.join("rootfs.ext4");
     fs::copy(&config.base_rootfs, &rootfs)?;
     if let Some(token) = token {
         validate_token(token)?;
         inject_token(&rootfs, token)?;
     }
-    fs::create_dir_all(adapter_root(root))?;
+    create_adapter_root(root)?;
     fs::write(
         adapter_root(root).join("config.json"),
         serde_json::to_vec_pretty(&config)?,
@@ -243,8 +270,7 @@ fn start_vm(
     rootfs: PathBuf,
 ) -> Result<SlotState> {
     let dir = slot_dir(root, slot);
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    create_slot_dir(root, slot)?;
     let socket = dir.join("firecracker.sock");
     let log = dir.join("firecracker.log");
     let stdout = fs::File::create(dir.join("stdout.log"))?;
@@ -426,7 +452,7 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Resu
             "parent_snapshot":portable_snapshot,"snapshot_type":"Full","artifact_root":slot_dir(root, slot),
             "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":state.rootfs}]}),
         )?;
-        Ok::<Value, Box<dyn std::error::Error>>(response)
+        snapshot_output(portable_snapshot, &response)
     })();
     let resumed = api(
         &state.api_socket,
@@ -443,7 +469,7 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Resu
 fn restore(
     root: &Path,
     fc: &Path,
-    key_override: Option<&Path>,
+    overrides: RestoreOverrides,
     slot: u8,
     capsule: &str,
     requested: Option<&str>,
@@ -463,19 +489,14 @@ fn restore(
     let record = cap
         .snapshot(&snapshot_id)
         .ok_or("snapshot not found in capsule")?;
+    let config = resolve_restore_config(root, overrides)?;
     let local = local_fingerprint(root, fc)?;
     let matched = matching_native(record.raw.manifest().native.as_deref(), &local);
-    let mut config: Config =
-        serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
-    if let Some(key) = key_override {
-        config.ssh_key = key.to_path_buf();
-    }
     if let Some((vmstate, memory, disk)) = matched {
         let native_attempt = (|| -> Result<Value> {
             let _ = down(root, slot);
             let dir = slot_dir(root, slot);
-            fs::create_dir_all(&dir)?;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            create_slot_dir(root, slot)?;
             let vmstate_path = dir.join("restore.vmstate");
             let memory_path = dir.join("restore.memory");
             let disk_path = dir.join("rootfs.ext4");
@@ -581,6 +602,83 @@ fn matching_native<'a>(
         matching.iter().find(|n| n.role == "memory")?,
         matching.iter().find(|n| n.role == "disk")?,
     ))
+}
+
+fn snapshot_output(portable_snapshot: &str, native_response: &Value) -> Result<Value> {
+    let native_snapshot = native_response
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or("native-attach response lacks snapshot_id")?;
+    Ok(json!({
+        "portable_snapshot_id": portable_snapshot,
+        "native_snapshot_id": native_snapshot,
+    }))
+}
+
+fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Config> {
+    let path = adapter_root(root).join("config.json");
+    let existing = match fs::read(&path) {
+        Ok(bytes) => Some(serde_json::from_slice::<Config>(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let config_was_absent = existing.is_none();
+    let missing = if config_was_absent {
+        let mut names = Vec::new();
+        if overrides.kernel.is_none() {
+            names.push("--kernel or ABRA_FC_KERNEL");
+        }
+        if overrides.rootfs.is_none() {
+            names.push("--rootfs or ABRA_FC_ROOTFS");
+        }
+        if overrides.ssh_key.is_none() {
+            names.push("--ssh-key or ABRA_FC_SSH_KEY");
+        }
+        names
+    } else {
+        Vec::new()
+    };
+    if !missing.is_empty() {
+        return Err(format!(
+            "restore config is absent at {}; missing: {}",
+            path.display(),
+            missing.join(", ")
+        )
+        .into());
+    }
+    let mut config = match existing {
+        Some(config) => config,
+        None => Config {
+            kernel: overrides.kernel.clone().unwrap(),
+            base_rootfs: overrides.rootfs.clone().unwrap(),
+            ssh_key: overrides.ssh_key.clone().unwrap(),
+            mem_mib: overrides.mem_mib.unwrap_or(512),
+            vcpus: overrides.vcpus.unwrap_or(1),
+        },
+    };
+    if let Some(value) = overrides.kernel {
+        config.kernel = value;
+    }
+    if let Some(value) = overrides.rootfs {
+        config.base_rootfs = value;
+    }
+    if let Some(value) = overrides.ssh_key {
+        config.ssh_key = value;
+    }
+    if let Some(value) = overrides.mem_mib {
+        config.mem_mib = value;
+    }
+    if let Some(value) = overrides.vcpus {
+        config.vcpus = value;
+    }
+    require_file(&config.kernel)?;
+    require_file(&config.base_rootfs)?;
+    resolve_key(Some(config.ssh_key.clone()), &config.base_rootfs)?;
+    if config_was_absent {
+        create_adapter_root(root)?;
+        fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    }
+    Ok(config)
 }
 
 fn fingerprint(fc: &Path) -> Result<Fingerprint> {
@@ -750,6 +848,7 @@ fn setup_network(tap: &str, host: &str, guest: &str, mac: &str) -> Result<()> {
             "-j",
             "MASQUERADE",
         ])
+        .stderr(Stdio::null())
         .status()?
         .success()
     {
@@ -923,7 +1022,7 @@ fn control(root: &Path, request: &Value) -> Result<Value> {
 }
 
 fn write_state(root: &Path, state: &SlotState) -> Result<()> {
-    fs::create_dir_all(slot_dir(root, state.slot))?;
+    create_slot_dir(root, state.slot)?;
     fs::write(
         state_path(root, state.slot),
         serde_json::to_vec_pretty(state)?,
@@ -1010,6 +1109,7 @@ fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 fn inject_token(rootfs: &Path, token: &str) -> Result<()> {
+    let token_file = write_token_temp(token)?;
     let mount = tempfile::tempdir()?;
     run(
         "sudo",
@@ -1032,13 +1132,29 @@ fn inject_token(rootfs: &Path, token: &str) -> Result<()> {
             }
         }
         let etc = mount.path().join("etc/abra");
-        fs::create_dir_all(&etc)?;
+        run_owned(
+            "sudo",
+            ["mkdir", "-p", "--"]
+                .into_iter()
+                .map(Into::into)
+                .chain([etc.as_os_str().to_owned()]),
+        )?;
         let path = etc.join("token");
-        fs::write(&path, token.as_bytes())?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file() {
-            return Err("guest token path is not a regular file".into());
+        guard_token_destination(&path)?;
+        run_owned("sudo", token_install_args(token_file.path(), &path))?;
+        let output = Command::new("sudo")
+            .args(["stat", "-c", "%F:%u:%g:%a", "--"])
+            .arg(&path)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("sudo stat failed for {}", path.display()).into());
+        }
+        if String::from_utf8(output.stdout)?.trim() != "regular file:0:0:600" {
+            return Err(format!(
+                "guest token must be a root:root 0600 regular file: {}",
+                path.display()
+            )
+            .into());
         }
         Ok(())
     })();
@@ -1051,7 +1167,88 @@ fn inject_token(rootfs: &Path, token: &str) -> Result<()> {
             .args(["umount", "-l", mount.path().to_str().unwrap()])
             .status();
     }
+    token_file.close()?;
     result
+}
+
+fn guard_token_destination(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "guest token path must be a regular file or absent: {}",
+            path.display()
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            guard_token_destination_with_sudo(path)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn guard_token_destination_with_sudo(path: &Path) -> Result<()> {
+    let output = Command::new("sudo")
+        .args(["stat", "-c", "%F", "--"])
+        .arg(path)
+        .output()?;
+    if output.status.success() {
+        if String::from_utf8(output.stdout)?.trim() == "regular file" {
+            return Ok(());
+        }
+        return Err(format!(
+            "guest token path must be a regular file or absent: {}",
+            path.display()
+        )
+        .into());
+    }
+
+    let exists = Command::new("sudo")
+        .args(["test", "-e"])
+        .arg(path)
+        .status()?;
+    if exists.success() {
+        Err(format!("sudo stat failed for {}", path.display()).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn write_token_temp(token: &str) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(token.as_bytes())?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn token_install_args(source: &Path, destination: &Path) -> Vec<std::ffi::OsString> {
+    ["install", "-m", "0600", "-o", "root", "-g", "root", "--"]
+        .into_iter()
+        .map(Into::into)
+        .chain([
+            source.as_os_str().to_owned(),
+            destination.as_os_str().to_owned(),
+        ])
+        .collect()
+}
+
+fn create_adapter_root(root: &Path) -> Result<()> {
+    let dir = adapter_root(root);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn create_slot_dir(root: &Path, slot: u8) -> Result<()> {
+    create_adapter_root(root)?;
+    let slots = adapter_root(root).join("slots");
+    fs::create_dir_all(&slots)?;
+    fs::set_permissions(&slots, fs::Permissions::from_mode(0o700))?;
+    let dir = slot_dir(root, slot);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 fn wait_path(path: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
@@ -1086,5 +1283,215 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
         Ok(())
     } else {
         Err(format!("{program} {:?} failed: {status}", args).into())
+    }
+}
+
+fn run_owned(program: &str, args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<()> {
+    let args: Vec<_> = args.into_iter().collect();
+    let status = Command::new(program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} {args:?} failed: {status}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_file(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"fixture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn token_install_uses_root_ownership_and_private_mode() {
+        let args = token_install_args(Path::new("/tmp/source"), Path::new("/mnt/etc/abra/token"));
+        assert_eq!(
+            args,
+            [
+                "install",
+                "-m",
+                "0600",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "--",
+                "/tmp/source",
+                "/mnt/etc/abra/token",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn token_temp_file_is_private() {
+        let file = write_token_temp("abra-enroll/1/test").unwrap();
+        assert_eq!(
+            file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_to_string(file.path()).unwrap(),
+            "abra-enroll/1/test"
+        );
+    }
+
+    #[test]
+    fn token_destination_guard_accepts_only_regular_file_or_absent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        guard_token_destination(&path).unwrap();
+
+        fs::write(&path, b"old token").unwrap();
+        guard_token_destination(&path).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        symlink("/etc/shadow", &path).unwrap();
+        assert!(guard_token_destination(&path).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(guard_token_destination(&path).is_err());
+    }
+
+    #[test]
+    fn adapter_and_slot_directories_are_private() {
+        let root = tempfile::tempdir().unwrap();
+        create_slot_dir(root.path(), 0).unwrap();
+        for path in [
+            adapter_root(root.path()),
+            adapter_root(root.path()).join("slots"),
+            slot_dir(root.path(), 0),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_restore_config_lists_every_missing_required_input() {
+        let root = tempfile::tempdir().unwrap();
+        let error = resolve_restore_config(root.path(), RestoreOverrides::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--kernel or ABRA_FC_KERNEL"));
+        assert!(error.contains("--rootfs or ABRA_FC_ROOTFS"));
+        assert!(error.contains("--ssh-key or ABRA_FC_SSH_KEY"));
+    }
+
+    #[test]
+    fn fresh_restore_config_is_written_and_defaults_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = fixture_file(root.path(), "vmlinux", 0o644);
+        let rootfs = fixture_file(root.path(), "rootfs.ext4", 0o644);
+        let key = fixture_file(root.path(), "id_rsa", 0o600);
+        let config = resolve_restore_config(
+            root.path(),
+            RestoreOverrides {
+                kernel: Some(kernel.clone()),
+                rootfs: Some(rootfs.clone()),
+                ssh_key: Some(key.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.mem_mib, 512);
+        assert_eq!(config.vcpus, 1);
+        let saved: Config = serde_json::from_slice(
+            &fs::read(adapter_root(root.path()).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.kernel, kernel);
+        assert_eq!(saved.base_rootfs, rootfs);
+        assert_eq!(saved.ssh_key, key);
+    }
+
+    #[test]
+    fn existing_restore_config_keeps_values_without_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            kernel: fixture_file(root.path(), "kernel", 0o644),
+            base_rootfs: fixture_file(root.path(), "disk", 0o644),
+            ssh_key: fixture_file(root.path(), "key", 0o600),
+            mem_mib: 768,
+            vcpus: 2,
+        };
+        fs::create_dir_all(adapter_root(root.path())).unwrap();
+        fs::write(
+            adapter_root(root.path()).join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_restore_config(root.path(), RestoreOverrides::default()).unwrap();
+        assert_eq!(resolved.mem_mib, 768);
+        assert_eq!(resolved.vcpus, 2);
+    }
+
+    #[test]
+    fn snapshot_output_names_portable_and_native_ids() {
+        let output = snapshot_output("portable", &json!({"snapshot_id":"native"})).unwrap();
+        assert_eq!(
+            output,
+            json!({
+                "portable_snapshot_id":"portable",
+                "native_snapshot_id":"native"
+            })
+        );
+    }
+
+    #[test]
+    fn restore_flags_parse_into_overrides() {
+        let cli = Cli::try_parse_from([
+            "abra-fc",
+            "--firecracker",
+            "/bin/firecracker",
+            "--ssh-key",
+            "/tmp/key",
+            "restore",
+            "--slot",
+            "3",
+            "--capsule",
+            "capsule",
+            "--kernel",
+            "/tmp/kernel",
+            "--rootfs",
+            "/tmp/rootfs",
+            "--mem",
+            "1024",
+            "--vcpus",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.firecracker, PathBuf::from("/bin/firecracker"));
+        assert_eq!(cli.ssh_key, Some(PathBuf::from("/tmp/key")));
+        match cli.command {
+            Action::Restore {
+                slot,
+                kernel,
+                rootfs,
+                mem,
+                vcpus,
+                ..
+            } => {
+                assert_eq!(slot, 3);
+                assert_eq!(kernel, Some(PathBuf::from("/tmp/kernel")));
+                assert_eq!(rootfs, Some(PathBuf::from("/tmp/rootfs")));
+                assert_eq!(mem, Some(1024));
+                assert_eq!(vcpus, Some(2));
+            }
+            _ => panic!("expected restore command"),
+        }
     }
 }

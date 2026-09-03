@@ -8,22 +8,37 @@ ABRA_FC="${ABRA_FC_BIN:-$REPO_ROOT/target/release/abra-fc}"
 FC="${FIRECRACKER_BIN:-/usr/local/bin/firecracker}"
 ARTIFACTS="${FIRECRACKER_ARTIFACT_DIR:-/home/ubuntu/paperplanes/artifacts/firecracker}"
 KERNEL="${FIRECRACKER_KERNEL:-$ARTIFACTS/vmlinux}"
-ROOTFS="${FIRECRACKER_ROOTFS:-$ARTIFACTS/rootfs-headless-abra.ext4}"
+BASE_ROOTFS="${FIRECRACKER_BASE_ROOTFS:-$ARTIFACTS/rootfs-headless-base.ext4}"
+# With per-run image rebuild (the default) only the base image must pre-exist.
+if [[ "${ABRA_FC_E2E_REBUILD_IMAGE:-1}" == "1" ]]; then
+  ROOTFS="${FIRECRACKER_ROOTFS:-$BASE_ROOTFS}"
+else
+  ROOTFS="${FIRECRACKER_ROOTFS:-$ARTIFACTS/rootfs-headless-abra.ext4}"
+fi
 KEY="${FIRECRACKER_SSH_KEY:-$ARTIFACTS/desktop_id_rsa}"
 RUN_ROOT="${ABRA_FC_E2E_ROOT:-/home/ubuntu/.abra-fc-e2e}"
+RUN_ROOT_B="${ABRA_FC_E2E_ROOT_B:-${RUN_ROOT}-device-b}"
+FRESH_ROOT="${ABRA_FC_E2E_FRESH_ROOT:-${RUN_ROOT}-fresh-host}"
 WORKSPACE="${ABRA_FC_E2E_WORKSPACE:-/home/ubuntu/abra-fc-e2e-workspace}"
+RECEIVED_B="${ABRA_FC_E2E_RECEIVED_B:-${WORKSPACE}-received-b}"
 REPORT="${ABRA_FC_E2E_REPORT:-$REPO_ROOT/adapters/firecracker/tests/e2e-report.json}"
 HOST_LOG="$RUN_ROOT/host-daemon.log"
 HOST_PID=""
+HOST_PID_B=""
+FRESH_PID=""
 
 cleanup() {
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 1 >/dev/null 2>&1 || true
+  "$ABRA_FC" --root "$RUN_ROOT_B" down --slot 0 >/dev/null 2>&1 || true
+  "$ABRA_FC" --root "$FRESH_ROOT" down --slot 1 >/dev/null 2>&1 || true
   [[ -z "$HOST_PID" ]] || kill "$HOST_PID" 2>/dev/null || true
+  [[ -z "$HOST_PID_B" ]] || kill "$HOST_PID_B" 2>/dev/null || true
+  [[ -z "$FRESH_PID" ]] || kill "$FRESH_PID" 2>/dev/null || true
   for tap in osdtap0 osdtap1; do sudo ip link del "$tap" >/dev/null 2>&1 || true; done
   while read -r pid; do
     [[ -r "/proc/$pid/cmdline" ]] || continue
-    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "$RUN_ROOT" && sudo kill "$pid" 2>/dev/null || true
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Eq "$(printf '%s|%s' "$RUN_ROOT" "$FRESH_ROOT")" && sudo kill "$pid" 2>/dev/null || true
   done < <(pgrep -x firecracker 2>/dev/null || true)
 }
 trap cleanup EXIT
@@ -44,15 +59,18 @@ guest() {
 host_has_peer() { "$ABRA" --root "$RUN_ROOT" --json peers 2>/dev/null | jq -e --arg id "$GUEST_PEER" '.[] | select(.peer_id == $id)' >/dev/null; }
 host_has_snapshot() { "$ABRA" --root "$RUN_ROOT" --json log --capsule "$CAPSULE" 2>/dev/null | jq -e --arg id "$GUEST_SNAPSHOT" '.[] | select(.snapshot_id == $id)' >/dev/null; }
 guest_has_capsule() { guest "abra --root /var/lib/abra --json log --capsule '$CAPSULE'" 2>/dev/null | jq -e 'length > 0' >/dev/null; }
+inbox_has() { "$ABRA" --root "$1" --json inbox 2>/dev/null | jq -e --arg id "$2" '.[] | select(.id == $id)' >/dev/null; }
+# Full-capsule snapshots sync into the capsule log, not the inbox.
+log_has() { "$ABRA" --root "$1" --json log --capsule "$2" 2>/dev/null | jq -e --arg id "$3" '.[] | select(.snapshot_id == $id)' >/dev/null; }
 
 for binary in "$ABRA" "$CADABRA" "$ABRA_FC" "$FC" "$KERNEL" "$ROOTFS" "$KEY"; do
   [[ -e "$binary" ]] || { echo "missing prerequisite: $binary" >&2; exit 1; }
 done
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 1 >/dev/null 2>&1 || true
-rm -rf "$RUN_ROOT" "$WORKSPACE"
-mkdir -p "$RUN_ROOT" "$WORKSPACE" "$(dirname "$REPORT")"
-chmod 0700 "$RUN_ROOT"
+rm -rf "$RUN_ROOT" "$RUN_ROOT_B" "$FRESH_ROOT" "$WORKSPACE" "$RECEIVED_B"
+mkdir -p "$RUN_ROOT" "$RUN_ROOT_B" "$FRESH_ROOT" "$WORKSPACE" "$(dirname "$REPORT")"
+chmod 0700 "$RUN_ROOT" "$RUN_ROOT_B" "$FRESH_ROOT"
 
 STARTED="$(now_ms)"
 "$CADABRA" --root "$RUN_ROOT" --yes >"$HOST_LOG" 2>&1 &
@@ -72,10 +90,9 @@ TOKEN="$("$ABRA" --root "$RUN_ROOT" --json enroll --capsule "$CAPSULE" --kind de
 if [[ "${ABRA_FC_E2E_REBUILD_IMAGE:-1}" == "1" ]]; then
   (cd "$REPO_ROOT" && cargo build --release --target x86_64-unknown-linux-musl -p abra-cli -p cadabra >/dev/null)
   MUSL="$REPO_ROOT/target/x86_64-unknown-linux-musl/release"
-  BASE_ROOTFS="${FIRECRACKER_BASE_ROOTFS:-$ARTIFACTS/rootfs-headless-base.ext4}"
   ROOTFS="$RUN_ROOT/rootfs-headless-abra.ext4"
   cp -f "$BASE_ROOTFS" "$ROOTFS"
-  bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+  sudo bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
 fi
 
 UP_STARTED="$(now_ms)"
@@ -102,9 +119,57 @@ wait_until "guest snapshot received by host" host_has_snapshot
 SNAP_STARTED="$(now_ms)"
 NATIVE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" snapshot --slot 0 --capsule "$CAPSULE")"
 SNAPSHOT_MS="$(( $(now_ms) - SNAP_STARTED ))"
-NATIVE_SNAPSHOT="$(jq -r .snapshot_id <<<"$NATIVE_RESULT")"
+PORTABLE_SNAPSHOT="$(jq -r .portable_snapshot_id <<<"$NATIVE_RESULT")"
+NATIVE_SNAPSHOT="$(jq -r .native_snapshot_id <<<"$NATIVE_RESULT")"
+[[ "$PORTABLE_SNAPSHOT" != null && "$NATIVE_SNAPSHOT" != null ]]
 MANIFEST="$RUN_ROOT/capsules/$CAPSULE/snapshots/$NATIVE_SNAPSHOT.cjson"
 jq -e '.native | length == 3 and all(.fingerprint.hypervisor == "firecracker")' "$MANIFEST" >/dev/null
+
+# Device B receives only the portable parent, then materializes files and recipes.
+"$CADABRA" --root "$RUN_ROOT_B" --yes >"$RUN_ROOT_B/daemon.log" 2>&1 &
+HOST_PID_B=$!
+wait_until "device B daemon socket" test -S "$RUN_ROOT_B/cadabra.sock"
+PAIR_TICKET_B="$("$ABRA" --root "$RUN_ROOT_B" pair ticket)"
+"$ABRA" --root "$RUN_ROOT" pair add "$PAIR_TICKET_B" >/dev/null
+PEER_B="$("$ABRA" --root "$RUN_ROOT_B" --json status | jq -r .peer_id)"
+"$ABRA" --root "$RUN_ROOT" send "$PEER_B" --capsule "$PORTABLE_SNAPSHOT" >/dev/null
+wait_until "portable snapshot at device B" log_has "$RUN_ROOT_B" "$CAPSULE" "$PORTABLE_SNAPSHOT"
+"$ABRA" --root "$RUN_ROOT_B" accept "$PORTABLE_SNAPSHOT" --to "$RECEIVED_B" >/dev/null
+# B holds the guest-authored snapshot: the original marker plus the file the guest wrote.
+diff -q "$WORKSPACE/marker.txt" "$RECEIVED_B/marker.txt"
+grep -qx native-marker "$RECEIVED_B/native-marker.txt"
+test -s "$RECEIVED_B/.abra/recipes.json"
+
+# Matching host B receives the native child and restores it from its own CAS.
+"$ABRA" --root "$RUN_ROOT" send "$PEER_B" --capsule "$NATIVE_SNAPSHOT" >/dev/null
+wait_until "native snapshot at device B" log_has "$RUN_ROOT_B" "$CAPSULE" "$NATIVE_SNAPSHOT"
+"$ABRA_FC" --root "$RUN_ROOT" down --slot 0
+SECOND_NATIVE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT_B" --firecracker "$FC" --ssh-key "$KEY" restore \
+  --slot 0 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT" \
+  --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1)"
+[[ "$(jq -r .mode <<<"$SECOND_NATIVE_RESULT")" == native ]]
+guest "test -f /workspace/native-marker.txt; test -r /proc/$MARKER_PID/stat; test \"\$(awk '{print \$22}' /proc/$MARKER_PID/stat)\" = '$MARKER_START'"
+curl -sf --noproxy '*' http://172.30.0.2:8123/native-marker.txt | grep -qx native-marker
+"$ABRA_FC" --root "$RUN_ROOT_B" down --slot 0
+
+# A third empty root acts as a fresh compatible host. It receives the portable
+# parent, so native blobs are absent even though host A still owns them.
+"$CADABRA" --root "$FRESH_ROOT" --yes >"$FRESH_ROOT/daemon.log" 2>&1 &
+FRESH_PID=$!
+wait_until "fresh host daemon socket" test -S "$FRESH_ROOT/cadabra.sock"
+PAIR_TICKET_FRESH="$("$ABRA" --root "$FRESH_ROOT" pair ticket)"
+"$ABRA" --root "$RUN_ROOT" pair add "$PAIR_TICKET_FRESH" >/dev/null
+PEER_FRESH="$("$ABRA" --root "$FRESH_ROOT" --json status | jq -r .peer_id)"
+"$ABRA" --root "$RUN_ROOT" send "$PEER_FRESH" --capsule "$PORTABLE_SNAPSHOT" >/dev/null
+wait_until "portable snapshot at fresh host" log_has "$FRESH_ROOT" "$CAPSULE" "$PORTABLE_SNAPSHOT"
+FRESH_RESULT="$("$ABRA_FC" --root "$FRESH_ROOT" --firecracker "$FC" --ssh-key "$KEY" restore \
+  --slot 1 --capsule "$CAPSULE" --snapshot "$PORTABLE_SNAPSHOT" \
+  --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1)"
+[[ "$(jq -r .mode <<<"$FRESH_RESULT")" == portable-fallback ]]
+ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 \
+  'test -f /workspace/native-marker.txt && test -s /workspace/.abra/recipes.json'
+test -s "$FRESH_ROOT/firecracker/config.json"
+"$ABRA_FC" --root "$FRESH_ROOT" down --slot 1
 
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
 printf '%s\n' '{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":999,"cpu_template":"-","cpu_identity":"lying-cache"}' > "$RUN_ROOT/firecracker/fingerprint.json"
@@ -128,8 +193,8 @@ cleanup
 ! ip link show osdtap1 >/dev/null 2>&1
 
 jq -n \
-  --arg capsule "$CAPSULE" --arg snapshot "$NATIVE_SNAPSHOT" \
+  --arg capsule "$CAPSULE" --arg snapshot "$NATIVE_SNAPSHOT" --arg portable "$PORTABLE_SNAPSHOT" \
   --argjson total_ms "$(( $(now_ms) - STARTED ))" --argjson up_ms "$UP_MS" \
   --argjson snapshot_ms "$SNAPSHOT_MS" --argjson restore_ms "$RESTORE_MS" \
   --argjson native "$(jq -c .native "$MANIFEST")" \
-  '{ok:true,capsule:$capsule,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,zero_firecracker_processes:true,zero_taps:true}}' | tee "$REPORT"
+  '{ok:true,capsule:$capsule,portable_snapshot:$portable,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,second_device_transfer:true,second_device_files:true,second_device_recipes:true,native_transfer:true,second_root_native_restore:true,fresh_root_config:true,fresh_host_portable_fallback:true,zero_firecracker_processes:true,zero_taps:true}}' | tee "$REPORT"

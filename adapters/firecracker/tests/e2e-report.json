@@ -1,16 +1,17 @@
 {
   "ok": true,
-  "capsule": "bc368a8b9cba3bc97541ff2c625ea985d94a4b698d31b2fe2d48671285739f8f",
-  "native_snapshot": "2dd3b140d58ac85b7c1ae2805593fdabd24c282f16246fa89f4a7976703be8bd",
+  "capsule": "bc5f2cbaab9d923a802b3433455bdc48fee689a30d3181ffa5714d22a8507bd8",
+  "portable_snapshot": "e241dfb08c906f57e2cafc63d27132ae3a33e405c7c1051a1db0d6aa19d2d701",
+  "native_snapshot": "b5c797ed852b4db3be6921f72cbf522d4261cef869df42eddf0e8c0b366fed40",
   "timings_ms": {
-    "total": 62988,
-    "up": 7244,
-    "snapshot": 6220,
-    "native_restore": 6675
+    "total": 168647,
+    "up": 18815,
+    "snapshot": 24602,
+    "native_restore": 27055
   },
   "native": [
     {
-      "blob": "eba1e3b69f59aacc1410bf09f9c51d5581c2b25394f60c8407a542e06730e6a6",
+      "blob": "e1f698d1121dc76eb8dbc0eab157ed9ae7ddb1e07572cf08cd0f2d3b1cd20d1b",
       "bytes": 14647,
       "fingerprint": {
         "arch": "x86_64",
@@ -23,7 +24,7 @@
       "role": "vmstate"
     },
     {
-      "blob": "4ba171aecb2ec53ea0df101c87fc0612983f3d46dbf0e977631d6653e55ab2e6",
+      "blob": "763aa93c03b3a474a8e6c663b6d80b2ce396acf6e82127327bf3d5e9eb921c60",
       "bytes": 536870912,
       "fingerprint": {
         "arch": "x86_64",
@@ -36,7 +37,7 @@
       "role": "memory"
     },
     {
-      "blob": "256d43cd85399b76a70be0d393a02bc970f636a451ca1feb9d8059161a403320",
+      "blob": "64b8a6e397d172e882dc614e4c8d0976ce074f0cf5178fcbe2351be73f4f5752",
       "bytes": 2147483648,
       "fingerprint": {
         "arch": "x86_64",
@@ -61,6 +62,13 @@
     "http_after_resume": true,
     "portable_fallback": true,
     "fallback_marker_process_absent": true,
+    "second_device_transfer": true,
+    "second_device_files": true,
+    "second_device_recipes": true,
+    "native_transfer": true,
+    "second_root_native_restore": true,
+    "fresh_root_config": true,
+    "fresh_host_portable_fallback": true,
     "zero_firecracker_processes": true,
     "zero_taps": true
   }

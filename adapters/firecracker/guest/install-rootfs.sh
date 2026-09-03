@@ -47,7 +47,8 @@ safe_dest() {
   done
 }
 for dest in usr/local/bin/abra usr/local/bin/cadabra usr/local/libexec/abra-observer \
-            usr/local/libexec/abra-start-guest var/lib/abra workspace etc/abra \
+            usr/local/libexec/abra-start-guest usr/local/bin/os-desktop-init.sh \
+            var/lib/abra workspace etc/abra \
             etc/systemd/system/cadabra.service etc/systemd/system/abra-observer.service \
             etc/systemd/system/multi-user.target.wants/cadabra.service \
             etc/systemd/system/multi-user.target.wants/abra-observer.service; do
@@ -57,6 +58,7 @@ install -D -m 0755 "$ABRA_BIN" "$MOUNT_DIR/usr/local/bin/abra"
 install -D -m 0755 "$CADABRA_BIN" "$MOUNT_DIR/usr/local/bin/cadabra"
 install -D -m 0755 "$SCRIPT_DIR/observer.py" "$MOUNT_DIR/usr/local/libexec/abra-observer"
 install -D -m 0755 "$SCRIPT_DIR/start-guest.sh" "$MOUNT_DIR/usr/local/libexec/abra-start-guest"
+install -D -m 0755 "$SCRIPT_DIR/os-desktop-init.sh" "$MOUNT_DIR/usr/local/bin/os-desktop-init.sh"
 mkdir -p "$MOUNT_DIR/var/lib/abra" "$MOUNT_DIR/workspace" "$MOUNT_DIR/etc/abra"
 chmod 0700 "$MOUNT_DIR/var/lib/abra"
 

@@ -18,8 +18,9 @@ sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
   target/x86_64-unknown-linux-musl/release/cadabra
 ```
 
-The installer adds `cadabra.service`, an observer, `/workspace`, and the two
-binaries. Before boot, the adapter injects the enrollment token into the private
+The installer adds `cadabra.service`, an observer, `/workspace`, the two
+binaries, and the `os-desktop-init.sh` PID 1 handoff named in the boot arguments.
+Before boot, the adapter injects the enrollment token into the private
 per-slot disk as root-owned `/etc/abra/token` mode `0600`. The service reads only
 that file. Tokens never appear in kernel arguments, adapter JSON, or Firecracker
 configuration/logs; `/proc/cmdline` is treated as public.
@@ -91,7 +92,37 @@ Firecracker also warns that host-kernel differences can matter. A static CPU
 template such as `T2CL` can widen the compatible CPU set, but this adapter does
 not enable it by default because it changes the guest CPU contract. Custom
 `/cpu-config` probing and UFFD/CAS paging are deferred Tier 2 work. Tier 1 is
-cold boot, full/diff capture, File-backed native restore, and portable fallback.
+cold boot, full capture, File-backed native restore, and portable fallback.
+Differential capture is rejected until chained restore is implemented.
+
+`snapshot` prints both `portable_snapshot_id` and `native_snapshot_id`. Send the
+native child to a compatible host. Abra streams its memory and disk objects and
+the receiver verifies them on disk:
+
+```sh
+RESULT="$(abra-fc snapshot --slot 0 --capsule "$CAPSULE_ID")"
+PORTABLE_ID="$(printf '%s' "$RESULT" | jq -r .portable_snapshot_id)"
+NATIVE_ID="$(printf '%s' "$RESULT" | jq -r .native_snapshot_id)"
+abra send "$OTHER_PEER" --capsule "$NATIVE_ID"
+```
+
+Native memory and disk objects are host-specific cache data. Each native-role
+object may be up to 8 GiB. The receiver's default total offer budget is 16 GiB
+and it checks free disk space before accepting. A receiver with a mismatched
+fingerprint can request the portable tree without downloading native blobs.
+
+On a new host, pass image settings on the first restore. The adapter writes
+`$ABRA_ROOT/firecracker/config.json`; later restores keep its existing values.
+
+```sh
+abra-fc --root /var/lib/abra-new --firecracker /usr/local/bin/firecracker \
+  --ssh-key /images/desktop_id_rsa restore --slot 0 \
+  --capsule "$CAPSULE_ID" --snapshot "$PORTABLE_ID" \
+  --kernel /images/vmlinux --rootfs /images/abra.ext4 --mem 512 --vcpus 1
+```
+
+The matching environment variables are `ABRA_FC_BINARY`, `ABRA_FC_SSH_KEY`,
+`ABRA_FC_KERNEL`, `ABRA_FC_ROOTFS`, `ABRA_FC_MEM`, and `ABRA_FC_VCPUS`.
 
 On mismatch, missing native roles, snapshot-load error, resume error, or guest
 readiness timeout, the partial VM is torn down and a fresh base image is booted, the selected

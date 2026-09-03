@@ -23,6 +23,7 @@ const HEADER_LEN: usize = 8 + 1 + 12 + 8 + 8;
 /// Hard ceiling for an encrypted capability, including its header. This keeps
 /// hostile links from forcing an unbounded allocation during decrypt/import.
 pub const MAX_CAPABILITY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_CAPABILITY_OBJECT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,15 +123,26 @@ pub fn mint(
             .collect(),
         LinkMode::Full => closure(&store.cas, raw.manifest())?,
     };
-    let blobs = hashes
-        .into_iter()
-        .map(|digest| {
-            Ok(PackBlob {
-                digest,
-                data: BASE64URL_NOPAD.encode(&store.cas.get(&digest)?),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut encoded_bytes = base64_len(raw.bytes().len());
+    let mut blobs = Vec::new();
+    for digest in hashes {
+        let bytes = store.cas.get(&digest)?;
+        if bytes.len() > MAX_CAPABILITY_OBJECT_BYTES {
+            return Err(Error::invalid("capability object exceeds 32 MiB limit"));
+        }
+        encoded_bytes = encoded_bytes
+            .checked_add(base64_len(bytes.len()))
+            .ok_or_else(|| Error::invalid("sealed capability bundle exceeds 64 MiB limit"))?;
+        if encoded_bytes > MAX_CAPABILITY_BYTES - HEADER_LEN - 16 {
+            return Err(Error::invalid(
+                "sealed capability bundle exceeds 64 MiB limit",
+            ));
+        }
+        blobs.push(PackBlob {
+            digest,
+            data: BASE64URL_NOPAD.encode(&bytes),
+        });
+    }
     let pack = CapabilityPack {
         spec: crate::SPEC.into(),
         pack_type: "capability-pack".into(),
@@ -160,6 +172,11 @@ pub fn mint(
             },
         )
         .map_err(|_| Error::invalid("capability encryption failed"))?;
+    if HEADER_LEN + ciphertext.len() > MAX_CAPABILITY_BYTES {
+        return Err(Error::invalid(
+            "sealed capability bundle exceeds 64 MiB limit",
+        ));
+    }
     let mut blob = aad;
     blob.extend_from_slice(&(ciphertext.len() as u64).to_be_bytes());
     blob.extend_from_slice(&ciphertext);
@@ -177,6 +194,10 @@ pub fn mint(
     };
     record.resign(&store.keys.identity)?;
     Ok(MintedLink { record, key, blob })
+}
+
+fn base64_len(bytes: usize) -> usize {
+    bytes.saturating_mul(4).saturating_add(2) / 3
 }
 
 pub fn open(blob: &[u8], key: &[u8; 32], now_ms: u64) -> Result<CapabilityPack> {

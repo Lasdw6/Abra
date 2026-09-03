@@ -32,14 +32,20 @@ per operation. Export/import time out after ten minutes. Cancellation sends
 
 ## Verbs
 
-- `export`: request `{kind,source,staging_dir,options}`. The daemon creates an
+- `export`: request `{kind,source,staging_dir,options}`. `source` is the parsed
+  JSON object when the CLI value parses as an object, otherwise it is the raw
+  string. `options` is an object of string values from repeated
+  `--adapter-option k=v` arguments. The daemon creates an
   empty writable staging directory. The adapter writes only within it. Success
   returns `{payload,files_path|null,floor?:{title?,summary?,link?,thumbnail_path?}}`.
   The daemon hashes files, attaches observed recipes/native blobs, and authors
   and signs the manifest.
 
 - `import`: request
-  `{kind,payload,materialized_files|null,destination,options}`. Files have
+  `{kind,payload,materialized_files|null,destination,options}`. `destination` is
+  the parsed JSON object when `--destination` parses as an object, the raw
+  string otherwise, or the `--to` path string when omitted. `options` has the
+  same repeated `--adapter-option k=v` form as export. Files have
   already been verified and materialized. Success returns `{result,deep_link?}`.
   Recipes are never run implicitly.
 
@@ -52,6 +58,11 @@ Cadabra's built-in workspace export/import and handoff handling are the
 reference behavior for this contract; they are not external adapter processes.
 
 The runner is implemented in Cadabra. `abra send <peer> --kind <kind> --source
-<path-or-uri>` exports into daemon-owned staging before signing and enqueueing;
-`abra accept` invokes a registered importer after verified materialization. The
+<value> [--adapter-option k=v ...]` exports into daemon-owned staging before
+signing and enqueueing; `abra accept <id> --to <dir> [--destination <value>]
+[--adapter-option k=v ...]` invokes a registered importer after verified
+materialization. Discovery skips broken registrations and reports them through
+`abra adapters list`; `abra adapters add` still rejects the requested broken
+directory. If two valid adapters claim the same kind, discovery reports the
+conflict and refuses to dispatch that kind. The
 reference conformance adapter is `adapters/reference-folder/`.

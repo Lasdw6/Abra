@@ -256,14 +256,62 @@ impl BlobStore {
     }
 
     pub fn has(&self, hash: &Hash) -> bool {
-        match self.get(hash) {
-            Ok(_) => true,
-            Err(Error::Corrupt { .. }) => {
-                let _ = fs::remove_file(self.path_for(hash));
+        let path = self.path_for(hash);
+        match hash_file(&path) {
+            Ok(actual) if actual == *hash => true,
+            Ok(_) | Err(Error::Corrupt { .. }) => {
+                let _ = fs::remove_file(path);
                 false
             }
             Err(_) => false,
         }
+    }
+
+    /// Open an object for bounded-memory reads. Callers that send the object
+    /// must hash bytes as they read them and compare the result with `hash`.
+    pub fn open_object(&self, hash: &Hash) -> Result<fs::File> {
+        let path = self.path_for(hash);
+        match fs::File::open(&path) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::not_found("blob", hash.to_hex()))
+            }
+            Err(error) => Err(Error::io(path, error)),
+        }
+    }
+
+    /// Move a completed temporary file into the CAS after streaming hash
+    /// verification. A mismatch removes the temporary file.
+    pub fn commit_file(&self, path: impl AsRef<Path>, expected: &Hash) -> Result<u64> {
+        let path = path.as_ref();
+        if hash_file(path)? != *expected {
+            let _ = fs::remove_file(path);
+            return Err(Error::corrupt("blob", "streamed blob failed verification"));
+        }
+        self.commit_verified_file(path, expected)
+    }
+
+    /// Move a file whose digest the caller already verified into the CAS.
+    pub fn commit_verified_file(&self, path: impl AsRef<Path>, expected: &Hash) -> Result<u64> {
+        let path = path.as_ref();
+        let bytes = fs::metadata(path).map_err(|e| Error::io(path, e))?.len();
+        let dest = self.path_for(expected);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        if dest.is_file() {
+            if fs::metadata(&dest).map_err(|e| Error::io(&dest, e))?.len() == bytes {
+                fs::remove_file(path).map_err(|e| Error::io(path, e))?;
+                return Ok(bytes);
+            }
+            fs::remove_file(&dest).map_err(|e| Error::io(&dest, e))?;
+        }
+        fs::rename(path, &dest).map_err(|e| Error::io(&dest, e))?;
+        let shard = dest.parent().expect("CAS object has shard directory");
+        fs::File::open(shard)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| Error::io(shard, e))?;
+        Ok(bytes)
     }
 
     /// Store bytes, returning their hash. Storing the same bytes twice is a

@@ -140,7 +140,7 @@ pub async fn poll(
     node: &mut DeliveryNode,
     endpoint: &RelayEndpoint,
     now: u64,
-) -> Result<usize> {
+) -> Result<(usize, Vec<abra_core::identity::PeerId>)> {
     let tags = polling_tags(&node.store.keys.relay_discovery_key, now).map(hex::encode);
     let response = request(
         endpoint,
@@ -150,6 +150,7 @@ pub async fn poll(
     )
     .await?;
     let mut handled = 0;
+    let mut delivery_senders = Vec::new();
     for item in response["items"]
         .as_array()
         .ok_or("invalid relay poll response")?
@@ -165,6 +166,7 @@ pub async fn poll(
         match payload {
             RelayPayload::Delivery { .. } => {
                 let (sender, ack) = node.receive_relay_delivery(payload, now)?;
+                delivery_senders.push(sender);
                 let peer = node
                     .trust
                     .get(&sender)
@@ -188,7 +190,7 @@ pub async fn poll(
         handled += 1;
     }
     let _ = root;
-    Ok(handled)
+    Ok((handled, delivery_senders))
 }
 fn apply_ack(
     node: &mut DeliveryNode,

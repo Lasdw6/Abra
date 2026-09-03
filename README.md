@@ -1,7 +1,8 @@
 Abra is infrastructure for teleportation.
 
 Abra moves typed snapshots between trusted peers. The default iroh transport is
-end-to-end encrypted over QUIC/TLS.
+end-to-end encrypted over QUIC/TLS and uses n0's public relay and discovery
+service, so paired devices can connect across NATs.
 
 The core principle is **carry the data, don't prescribe the experience**. A
 snapshot carries the maximal amount of structured, parsable data about what it
@@ -76,12 +77,26 @@ Then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
 `inbox` shows partial handoffs and `accept <id> --to <empty-path>` materializes
 them; full capsule snapshots appear in `log` and can also be accepted by id.
 
+The default `--iroh-relay n0` mode is the right choice across the Internet. For
+a LAN-only setup with no iroh relay or discovery traffic, start once with
+`--iroh-relay none`. The daemon saves explicit relay choices in
+`config/daemon.json`. You can also pass one custom HTTPS relay URL. Custom
+mode keeps n0 DNS/pkarr discovery enabled but sends relay traffic only through
+that URL.
+
+An iroh relay can see the devices' IP addresses and iroh node ids. It cannot
+read Abra payloads. QUIC/TLS encrypts the connection end to end between the
+devices. The `n0` and custom modes also publish endpoint ids through iroh's
+DNS/pkarr discovery; `none` does not. Abra's separate `abra-relay` service below is for sealed offline
+store-and-forward delivery, not NAT traversal.
+
 Mint a zero-install capability link for any stored snapshot and serve the blob
 plus static viewer locally (use an HTTPS+CORS object host in production):
 
 ```console
-$ target/debug/abra --root /tmp/abra-a link mint <snapshot-id> --ttl 7d --full --out ./shared --viewer http://127.0.0.1:8080/viewer/
+$ mkdir -p ./link-build ./shared
 $ cp -R viewer ./shared/viewer
+$ target/debug/abra --root /tmp/abra-a link mint <snapshot-id> --ttl 7d --full --out ./link-build --url http://127.0.0.1:8080/{hash}.abracap --upload-command "cp {file} $(pwd)/shared/{hash}.abracap" --revoke-command "rm -f $(pwd)/shared/{hash}.abracap" --viewer http://127.0.0.1:8080/viewer/
 $ target/debug/abra link serve ./shared --listen 127.0.0.1:8080
 ```
 
@@ -105,9 +120,16 @@ $ target/debug/abra --root /tmp/abra-b daemon --token "$TOKEN"
 Human-mode enrollment also prints `abra://join/<token>`. `abra join <token>`
 redeems through an already-running daemon. TCP is retained explicitly as
 `daemon --transport tcp`; it is loopback-only, authenticated, and not encrypted.
-The default iroh transport uses direct addresses. The optional `abra-relay`
+The default iroh transport persists complete peer addresses, including relay
+URLs, across daemon restarts. Use `--iroh-relay none` only when direct LAN
+addresses are enough. Capability links
+are limited to 64 MiB sealed, with a 32 MiB limit per object. The `abra-relay`
 binary provides blind sealed store-and-forward delivery primitives. Recipes and
 control messages are carried/surfaced as data; Abra does not execute them.
+
+`abra daemon --skip-native` skips optional native cache blobs, except blobs also
+used by the portable tree. `abra daemon --offer-budget <bytes>` sets the
+per-offer byte limit. Both settings persist in `config/daemon.json`.
 
 ### Self-hosted relay quickstart
 
@@ -131,6 +153,9 @@ receive grants, durable delivery, the daemon, CLI, and cross-process tests. A
 static capability-link viewer ships in `viewer/`; Cadabra runs external adapters,
 the reference folder adapter lives under `adapters/`, and `abra-relay` provides
 the minimal self-hosted relay service.
+Paired iroh addresses survive restarts. The default n0 mode supports cross-NAT
+connections. Capability links have a 64 MiB sealed-bundle
+limit and a 32 MiB per-object limit.
 
 ## Building
 

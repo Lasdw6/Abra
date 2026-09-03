@@ -34,11 +34,15 @@ pub struct Connection {
     control_send: ControlSend,
     control_recv: ControlRecv,
     streams: Streams,
+    observed_addresses: Vec<String>,
 }
 
 impl Connection {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+    pub fn observed_addresses(&self) -> &[String] {
+        &self.observed_addresses
     }
     pub fn control_mut(&mut self) -> (&mut ControlSend, &mut ControlRecv) {
         (&mut self.control_send, &mut self.control_recv)
@@ -150,7 +154,10 @@ pub struct TcpTransport {
 
 impl TcpTransport {
     pub async fn bind(secret: [u8; 32]) -> Result<Self> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        Self::bind_port(secret, 0).await
+    }
+    pub async fn bind_port(secret: [u8; 32], port: u16) -> Result<Self> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
         let address = listener.local_addr()?;
         Ok(Self {
             identity: Identity::from_secret_bytes(&secret),
@@ -158,6 +165,9 @@ impl TcpTransport {
             address,
             addresses: Mutex::new(BTreeMap::new()),
         })
+    }
+    pub fn bound_port(&self) -> u16 {
+        self.address.port()
     }
     async fn authenticate(&self, mut stream: TcpStream) -> Result<Connection> {
         let nonce = rand::random::<[u8; 32]>();
@@ -210,6 +220,9 @@ impl TcpTransport {
             control_send: Box::new(send.clone()),
             control_recv: Box::new(recv.clone()),
             streams: Streams::Tcp { send, recv },
+            // The peer advertises this address itself. Keep it session-local;
+            // it is not proof that the peer owns a durable dial target.
+            observed_addresses: Vec::new(),
         })
     }
 }
@@ -223,12 +236,7 @@ impl Transport for TcpTransport {
         vec![format!("tcp://{}", self.address)]
     }
     fn add_peer_address(&self, peer: PeerId, address: &str) -> Result<()> {
-        let address = address
-            .strip_prefix("tcp://")
-            .ok_or_else(|| Error::Transport("unsupported dial address".into()))?;
-        let address = address
-            .parse()
-            .map_err(|_| Error::Transport("invalid TCP dial address".into()))?;
+        let address = parse_tcp_address(address)?;
         self.addresses
             .lock()
             .expect("tcp address lock")
@@ -269,6 +277,12 @@ pub trait Transport: Send + Sync {
     }
     fn add_peer_address(&self, _peer: PeerId, _address: &str) -> Result<()> {
         Ok(())
+    }
+    async fn wait_local_addresses(&self) -> Result<Vec<String>> {
+        Ok(self.local_addresses())
+    }
+    fn requires_relay_for_wide_area(&self) -> bool {
+        false
     }
     async fn dial(&self, peer: PeerId) -> Result<Connection>;
     async fn accept(&self) -> Result<Connection>;
@@ -330,6 +344,7 @@ impl Transport for LoopbackTransport {
                 uni_send: a_tx,
                 uni_recv: AsyncMutex::new(a_rx),
             },
+            observed_addresses: Vec::new(),
         };
         let remote = Connection {
             peer_id: self.peer,
@@ -339,6 +354,7 @@ impl Transport for LoopbackTransport {
                 uni_send: b_tx,
                 uni_recv: AsyncMutex::new(b_rx),
             },
+            observed_addresses: Vec::new(),
         };
         target
             .send(remote)
@@ -360,11 +376,76 @@ impl Transport for LoopbackTransport {
 pub struct IrohTransport {
     endpoint: iroh::Endpoint,
     addresses: Mutex<BTreeMap<PeerId, iroh::EndpointAddr>>,
+    relay: IrohRelayMode,
+}
+#[cfg(feature = "iroh")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IrohRelayMode {
+    #[default]
+    N0,
+    None,
+    Custom(iroh::RelayUrl),
+}
+#[cfg(feature = "iroh")]
+impl std::fmt::Display for IrohRelayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::N0 => f.write_str("n0"),
+            Self::None => f.write_str("none"),
+            Self::Custom(url) => url.fmt(f),
+        }
+    }
+}
+#[cfg(feature = "iroh")]
+impl std::str::FromStr for IrohRelayMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "n0" => Ok(Self::N0),
+            "none" => Ok(Self::None),
+            url => {
+                let url: iroh::RelayUrl = url.parse().map_err(|error| {
+                    Error::Transport(format!("invalid iroh relay URL: {error}"))
+                })?;
+                if url.scheme() != "https" {
+                    return Err(Error::Transport(
+                        "custom iroh relay URL must use https".into(),
+                    ));
+                }
+                Ok(Self::Custom(url))
+            }
+        }
+    }
 }
 #[cfg(feature = "iroh")]
 impl IrohTransport {
     pub async fn bind(secret: [u8; 32]) -> Result<Self> {
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        Self::bind_port_with_relay(secret, 0, IrohRelayMode::default()).await
+    }
+    pub async fn bind_port(secret: [u8; 32], port: u16) -> Result<Self> {
+        Self::bind_port_with_relay(secret, port, IrohRelayMode::default()).await
+    }
+    pub async fn bind_port_with_relay(
+        secret: [u8; 32],
+        port: u16,
+        relay: IrohRelayMode,
+    ) -> Result<Self> {
+        use iroh::endpoint::presets::Preset;
+
+        let builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal);
+        let builder = match &relay {
+            IrohRelayMode::None => builder,
+            IrohRelayMode::N0 => iroh::endpoint::presets::N0.apply(builder),
+            IrohRelayMode::Custom(url) => iroh::endpoint::presets::N0
+                .apply(builder)
+                .relay_mode(iroh::RelayMode::custom([url.clone()])),
+        };
+        let endpoint = builder
+            .bind_addr((std::net::Ipv4Addr::UNSPECIFIED, port))
+            .map_err(|e| Error::Transport(e.to_string()))?
+            .bind_addr((std::net::Ipv6Addr::UNSPECIFIED, port))
+            .map_err(|e| Error::Transport(e.to_string()))?
             .secret_key(iroh::SecretKey::from_bytes(&secret))
             .alpns(vec![crate::ALPN.to_vec()])
             .bind()
@@ -373,18 +454,33 @@ impl IrohTransport {
         Ok(Self {
             endpoint,
             addresses: Mutex::new(BTreeMap::new()),
+            relay,
         })
     }
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
         self.endpoint.addr()
     }
-    pub fn add_peer_addr(&self, peer: PeerId, addr: iroh::EndpointAddr) {
-        self.addresses
-            .lock()
-            .expect("iroh address lock")
-            .insert(peer, addr);
+    pub fn relay_mode(&self) -> &IrohRelayMode {
+        &self.relay
     }
-    async fn wrap(conn: iroh::endpoint::Connection, outgoing: bool) -> Result<Connection> {
+    pub fn bound_port(&self) -> Option<u16> {
+        self.endpoint
+            .bound_sockets()
+            .first()
+            .map(std::net::SocketAddr::port)
+    }
+    pub fn add_peer_addr(&self, peer: PeerId, addr: iroh::EndpointAddr) {
+        let mut addresses = self.addresses.lock().expect("iroh address lock");
+        addresses
+            .entry(peer)
+            .and_modify(|known| merge_endpoint_addr(known, &addr))
+            .or_insert(addr);
+    }
+    async fn wrap(
+        conn: iroh::endpoint::Connection,
+        outgoing: bool,
+        observed_addresses: Vec<String>,
+    ) -> Result<Connection> {
         let peer_id = PeerId::from_bytes(*conn.remote_id().as_bytes());
         let (send, recv) = if outgoing {
             conn.open_bi().await
@@ -397,8 +493,14 @@ impl IrohTransport {
             control_send: Box::new(send),
             control_recv: Box::new(recv),
             streams: Streams::Iroh(conn),
+            observed_addresses,
         })
     }
+}
+
+#[cfg(feature = "iroh")]
+fn merge_endpoint_addr(known: &mut iroh::EndpointAddr, observed: &iroh::EndpointAddr) {
+    known.addrs.extend(observed.addrs.iter().cloned());
 }
 #[cfg(feature = "iroh")]
 #[async_trait]
@@ -411,11 +513,29 @@ impl Transport for IrohTransport {
             .map(|address| vec![address])
             .unwrap_or_default()
     }
+    fn requires_relay_for_wide_area(&self) -> bool {
+        !matches!(self.relay, IrohRelayMode::None)
+    }
     fn add_peer_address(&self, peer: PeerId, address: &str) -> Result<()> {
-        let address = serde_json::from_str(address)
-            .map_err(|error| Error::Transport(format!("invalid iroh address: {error}")))?;
+        let address = parse_iroh_address(address)?;
+        validate_iroh_relay_policy(&address, &self.relay)?;
         self.add_peer_addr(peer, address);
         Ok(())
+    }
+    async fn wait_local_addresses(&self) -> Result<Vec<String>> {
+        wait_for_dialable_address(std::time::Duration::from_secs(3), || {
+            let address = self.endpoint_addr();
+            let ready = iroh_address_is_dialable(&address);
+            if ready {
+                serde_json::to_string(&address)
+                    .map(|address| vec![address])
+                    .map(Some)
+                    .map_err(|error| Error::Transport(error.to_string()))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
     async fn dial(&self, peer: PeerId) -> Result<Connection> {
         let addr = self
@@ -428,12 +548,15 @@ impl Transport for IrohTransport {
                 iroh::EndpointId::from_bytes(peer.as_bytes())
                     .map_err(|e| Error::Transport(e.to_string()))?,
             ));
+        let observed_addresses = serde_json::to_string(&addr)
+            .map(|address| vec![address])
+            .map_err(|error| Error::Transport(error.to_string()))?;
         let conn = self
             .endpoint
             .connect(addr, crate::ALPN)
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
-        Self::wrap(conn, true).await
+        Self::wrap(conn, true, observed_addresses).await
     }
     async fn accept(&self) -> Result<Connection> {
         let incoming = self
@@ -441,11 +564,280 @@ impl Transport for IrohTransport {
             .accept()
             .await
             .ok_or_else(|| Error::Transport("endpoint closed".into()))?;
+        let incoming_addr = incoming.remote_addr();
         let conn = incoming
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
-        tokio::time::timeout(std::time::Duration::from_secs(1), Self::wrap(conn, false))
+        let remote_addr = iroh::EndpointAddr::from_parts(
+            conn.remote_id(),
+            [iroh::TransportAddr::from(incoming_addr)],
+        );
+        let observed_addresses = serde_json::to_string(&remote_addr)
+            .map(|address| vec![address])
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Self::wrap(conn, false, observed_addresses),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+}
+
+#[cfg(feature = "iroh")]
+fn iroh_address_is_dialable(address: &iroh::EndpointAddr) -> bool {
+    address.relay_urls().next().is_some() || address.ip_addrs().next().is_some()
+}
+
+fn parse_tcp_address(address: &str) -> Result<std::net::SocketAddr> {
+    address
+        .strip_prefix("tcp://")
+        .ok_or_else(|| Error::Transport("unsupported dial address".into()))?
+        .parse()
+        .map_err(|_| Error::Transport("invalid TCP dial address".into()))
+}
+
+#[cfg(feature = "iroh")]
+fn parse_iroh_address(address: &str) -> Result<iroh::EndpointAddr> {
+    let address: iroh::EndpointAddr = serde_json::from_str(address)
+        .map_err(|error| Error::Transport(format!("invalid iroh address: {error}")))?;
+    for relay in address.relay_urls() {
+        if relay.scheme() != "https" {
+            return Err(Error::Transport("iroh relay URL must use https".into()));
+        }
+    }
+    Ok(address)
+}
+
+#[cfg(feature = "iroh")]
+fn validate_iroh_relay_policy(address: &iroh::EndpointAddr, mode: &IrohRelayMode) -> Result<()> {
+    let allowed = |relay: &iroh::RelayUrl| match mode {
+        IrohRelayMode::None => false,
+        IrohRelayMode::N0 => iroh::defaults::prod::default_relay_map().contains(relay),
+        IrohRelayMode::Custom(expected) => relay == expected,
+    };
+    if address.relay_urls().any(|relay| !allowed(relay)) {
+        return Err(Error::Transport(
+            "peer address uses a relay outside the configured policy".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// True when a persisted hint contains a direct network address.
+pub fn peer_address_has_direct_hint(address: &str) -> bool {
+    if address.starts_with("tcp://") {
+        return true;
+    }
+    #[cfg(feature = "iroh")]
+    if let Ok(address) = parse_iroh_address(address) {
+        return address.ip_addrs().next().is_some();
+    }
+    false
+}
+
+/// True when a serialized iroh hint names a relay.
+pub fn peer_address_has_relay_hint(address: &str) -> bool {
+    #[cfg(feature = "iroh")]
+    if let Ok(address) = parse_iroh_address(address) {
+        return address.relay_urls().next().is_some();
+    }
+    false
+}
+
+/// Merge two serialized iroh hints for the same endpoint.
+pub fn merge_peer_address_hints(existing: &str, observed: &str) -> Option<String> {
+    #[cfg(feature = "iroh")]
+    {
+        let mut existing = parse_iroh_address(existing).ok()?;
+        let observed = parse_iroh_address(observed).ok()?;
+        if existing.id != observed.id {
+            return None;
+        }
+        merge_endpoint_addr(&mut existing, &observed);
+        serde_json::to_string(&existing).ok()
+    }
+    #[cfg(not(feature = "iroh"))]
+    {
+        let _ = (existing, observed);
+        None
+    }
+}
+
+/// Validate a persisted dial hint with the same parser used by a transport.
+pub fn validate_peer_address(address: &str) -> Result<()> {
+    if address.starts_with("tcp://") {
+        return parse_tcp_address(address).map(drop);
+    }
+    #[cfg(feature = "iroh")]
+    {
+        parse_iroh_address(address).map(drop)
+    }
+    #[cfg(not(feature = "iroh"))]
+    {
+        Err(Error::Transport("unsupported peer address".into()))
+    }
+}
+
+#[cfg(feature = "iroh")]
+async fn wait_for_dialable_address(
+    timeout: std::time::Duration,
+    mut snapshot: impl FnMut() -> Result<Option<Vec<String>>>,
+) -> Result<Vec<String>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(addresses) = snapshot()? {
+            return Ok(addresses);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Transport(format!(
+                "iroh endpoint has no direct or relay address after {} seconds",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(all(test, feature = "iroh"))]
+mod iroh_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn waiting_for_dialable_addresses_times_out() {
+        let error = wait_for_dialable_address(std::time::Duration::ZERO, || Ok(None))
             .await
-            .map_err(|_| Error::Timeout)?
+            .unwrap_err();
+        assert!(error.to_string().contains("no direct or relay address"));
+    }
+
+    #[test]
+    fn iroh_relay_mode_parsing() {
+        assert_eq!("n0".parse::<IrohRelayMode>().unwrap(), IrohRelayMode::N0);
+        assert_eq!(
+            "none".parse::<IrohRelayMode>().unwrap(),
+            IrohRelayMode::None
+        );
+        assert!(matches!(
+            "https://relay.example.test"
+                .parse::<IrohRelayMode>()
+                .unwrap(),
+            IrohRelayMode::Custom(_)
+        ));
+        assert!("http://relay.example.test"
+            .parse::<IrohRelayMode>()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn bound_relay_modes_expose_the_configured_relay_set() {
+        let none = match IrohTransport::bind_port_with_relay([31; 32], 0, IrohRelayMode::None).await
+        {
+            Ok(transport) => transport,
+            Err(Error::Transport(message)) if message.contains("netmon monitor") => {
+                eprintln!("skipping iroh bind test: sandbox denied network monitor access");
+                return;
+            }
+            Err(error) => panic!("iroh none bind failed: {error}"),
+        };
+        assert!(none.endpoint_addr().relay_urls().next().is_none());
+
+        // A relay URL only appears in the live endpoint address once the
+        // relay connection is up, so an unreachable custom relay is checked
+        // through the configured mode rather than the address.
+        let relay: iroh::RelayUrl = "https://relay.example.test".parse().unwrap();
+        let custom =
+            IrohTransport::bind_port_with_relay([32; 32], 0, IrohRelayMode::Custom(relay.clone()))
+                .await
+                .unwrap();
+        assert_eq!(custom.relay_mode(), &IrohRelayMode::Custom(relay));
+        assert_ne!(none.relay_mode(), custom.relay_mode());
+
+        let n0 = IrohTransport::bind_port_with_relay([33; 32], 0, IrohRelayMode::N0)
+            .await
+            .unwrap();
+        assert_eq!(n0.relay_mode(), &IrohRelayMode::N0);
+        // With Internet access n0 assigns a home relay within a few seconds;
+        // without it the address simply stays direct-only.
+        for _ in 0..50 {
+            if n0.endpoint_addr().relay_urls().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[test]
+    fn endpoint_address_json_preserves_relay_url() {
+        let id = iroh::SecretKey::from_bytes(&[23; 32]).public();
+        let relay: iroh::RelayUrl = "https://relay.example.test".parse().unwrap();
+        let address = iroh::EndpointAddr::new(id).with_relay_url(relay.clone());
+        let encoded = serde_json::to_string(&address).unwrap();
+        let decoded = parse_iroh_address(&encoded).unwrap();
+
+        assert_eq!(decoded.relay_urls().next(), Some(&relay));
+    }
+
+    #[test]
+    fn direct_address_is_dialable_without_a_relay_url() {
+        let id = iroh::SecretKey::from_bytes(&[26; 32]).public();
+        let address = iroh::EndpointAddr::new(id).with_ip_addr("127.0.0.1:4242".parse().unwrap());
+        assert!(iroh_address_is_dialable(&address));
+        assert!(address.relay_urls().next().is_none());
+    }
+
+    #[test]
+    fn peer_relay_hints_require_https_and_respect_custom_pin() {
+        let id = iroh::SecretKey::from_bytes(&[24; 32]).public();
+        let insecure: iroh::RelayUrl = "http://relay.example.test".parse().unwrap();
+        let encoded =
+            serde_json::to_string(&iroh::EndpointAddr::new(id).with_relay_url(insecure)).unwrap();
+        assert!(parse_iroh_address(&encoded).is_err());
+
+        let configured: iroh::RelayUrl = "https://one.example.test".parse().unwrap();
+        let other: iroh::RelayUrl = "https://two.example.test".parse().unwrap();
+        let address = iroh::EndpointAddr::new(id).with_relay_url(other);
+        assert!(validate_iroh_relay_policy(&address, &IrohRelayMode::Custom(configured)).is_err());
+        assert!(validate_iroh_relay_policy(&address, &IrohRelayMode::None).is_err());
+        assert!(validate_iroh_relay_policy(&address, &IrohRelayMode::N0).is_err());
+
+        let n0 = iroh::defaults::prod::default_relay_map()
+            .urls::<Vec<_>>()
+            .pop()
+            .unwrap();
+        let address = iroh::EndpointAddr::new(id).with_relay_url(n0);
+        assert!(validate_iroh_relay_policy(&address, &IrohRelayMode::N0).is_ok());
+    }
+
+    #[test]
+    fn repeated_peer_addresses_keep_relay_and_direct_hints() {
+        let id = iroh::SecretKey::from_bytes(&[28; 32]).public();
+        let relay = iroh::defaults::prod::default_relay_map()
+            .urls::<Vec<_>>()
+            .pop()
+            .unwrap();
+        let mut known = iroh::EndpointAddr::new(id).with_relay_url(relay.clone());
+        let observed = iroh::EndpointAddr::new(id).with_ip_addr("127.0.0.1:4242".parse().unwrap());
+        merge_endpoint_addr(&mut known, &observed);
+        assert_eq!(known.relay_urls().next(), Some(&relay));
+        assert_eq!(known.ip_addrs().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn iroh_binds_ipv4_and_ipv6_when_available() {
+        let ipv6_available = std::net::UdpSocket::bind("[::1]:0").is_ok();
+        let transport = match IrohTransport::bind([7; 32]).await {
+            Ok(transport) => transport,
+            Err(Error::Transport(message)) if message.contains("netmon monitor") => {
+                eprintln!("skipping iroh bind test: sandbox denied network monitor access");
+                return;
+            }
+            Err(error) => panic!("iroh bind failed: {error}"),
+        };
+        let sockets = transport.endpoint.bound_sockets();
+        assert!(sockets.iter().any(std::net::SocketAddr::is_ipv4));
+        if ipv6_available {
+            assert!(sockets.iter().any(std::net::SocketAddr::is_ipv6));
+        }
     }
 }

@@ -11,11 +11,17 @@ The shipped binaries default to iroh 1.1 over QUIC/TLS. Abra's Ed25519 identity
 bytes are supplied directly as the iroh `SecretKey`, so the Abra peer id and
 iroh endpoint id cannot diverge. The workspace MSRV is Rust 1.91. Pairing
 tickets and enrollment-token intro records carry the complete serialized iroh
-`EndpointAddr`: endpoint id and direct UDP addresses.
+`EndpointAddr`: endpoint id, direct UDP addresses, and the home relay URL when
+one is available. `TrustedPeer` persists the same strings and passes the parsed
+address unchanged to `Endpoint::connect` after restart.
 
-The shipped `presets::Minimal` endpoint has no iroh discovery, relay, or port
-mapping. It therefore needs directly usable addresses for direct delivery.
-Abra's optional blind HTTP relay is a separate sealed store-and-forward path.
+The default `--iroh-relay n0` mode uses iroh's `presets::N0`: n0 public relays,
+DNS/pkarr discovery, and direct QUIC paths with hole punching. `none` uses
+`presets::Minimal`, with no relay, discovery, or port mapping. A custom HTTPS
+URL uses n0 DNS/pkarr discovery with `RelayMode::custom` for that relay only.
+The relay sees device IP addresses and iroh node ids, but QUIC/TLS keeps Abra
+payloads encrypted end to end. Abra's optional blind HTTP relay is a separate
+sealed store-and-forward path.
 The historical Stage-2 authenticated but unencrypted
 TCP transport remains an explicit `--transport tcp` loopback-only test mode;
 it is not an inter-device fallback.

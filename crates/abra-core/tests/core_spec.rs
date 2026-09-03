@@ -1,7 +1,7 @@
 use abra_core::{
     canonical,
     capsule::{Capsule, Genesis, LabelOp, LeaseMode, LeaseRecord},
-    cas::{Hash, Tree},
+    cas::{EntryMode, Hash, Tree, TreeEntry},
     identity::{Identity, Signature},
     manifest::{Manifest, Origin, RawManifest, Scope},
 };
@@ -88,6 +88,80 @@ fn capability_link_roundtrip_expiry_wrong_key_and_revoke() {
     let revoked = link::revoke_record(&store, &minted.record.link_id).unwrap();
     assert!(revoked.revoked);
     assert_eq!(link::list_records(&store).unwrap().len(), 1);
+}
+
+#[test]
+fn capability_mint_rejects_an_object_over_32_mib() {
+    use abra_core::{
+        cas::snapshot_dir,
+        link::{self, LinkMode},
+        store::AbraStore,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("large"),
+        vec![0u8; link::MAX_CAPABILITY_OBJECT_BYTES + 1],
+    )
+    .unwrap();
+    let store = AbraStore::open(temp.path()).unwrap();
+    let (_, mut manifest) = signed_manifest(Scope::Full);
+    manifest.files = Some(snapshot_dir(&store.cas, source.path()).unwrap());
+    manifest
+        .sign(&Identity::from_secret_bytes(&[3; 32]))
+        .unwrap();
+    let raw = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+    let error = link::mint(
+        &store,
+        &raw,
+        2_000,
+        "1970-01-01T00:00:02.000Z".into(),
+        LinkMode::Full,
+        "https://example.test/{hash}.abracap".into(),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("32 MiB"));
+}
+
+#[test]
+fn capability_mint_rejects_a_sealed_bundle_over_64_mib() {
+    use abra_core::{
+        link::{self, LinkMode},
+        store::AbraStore,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = AbraStore::open(temp.path()).unwrap();
+    let mut entries = Vec::new();
+    for index in 0..49_u8 {
+        let bytes = vec![index; 1024 * 1024];
+        let digest = store.cas.put(&bytes).unwrap();
+        entries.push(TreeEntry {
+            name: format!("blob-{index}"),
+            mode: EntryMode::File,
+            hash: digest,
+            size: bytes.len() as u64,
+        });
+    }
+    let files = store.cas.put_tree(&Tree::new(entries).unwrap()).unwrap();
+    let (_, mut manifest) = signed_manifest(Scope::Full);
+    manifest.files = Some(files);
+    manifest
+        .sign(&Identity::from_secret_bytes(&[3; 32]))
+        .unwrap();
+    let raw = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+    let error = link::mint(
+        &store,
+        &raw,
+        2_000,
+        "1970-01-01T00:00:02.000Z".into(),
+        LinkMode::Full,
+        "https://example.test/{hash}.abracap".into(),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("64 MiB"));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use cadabra::{control_call, Daemon};
+use cadabra::{control_call, Daemon, DaemonConfig};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
@@ -31,6 +31,15 @@ enum Command {
         transport: TransportKind,
         #[arg(long)]
         token: Option<String>,
+        /// n0, none, or a custom https relay URL.
+        #[arg(long)]
+        iroh_relay: Option<String>,
+        /// Accept portable content without optional native cache blobs.
+        #[arg(long)]
+        skip_native: bool,
+        /// Maximum bytes accepted for one direct offer.
+        #[arg(long)]
+        offer_budget: Option<u64>,
     },
     Pair {
         #[command(subcommand)]
@@ -50,8 +59,14 @@ enum Command {
     Inbox,
     Accept {
         id: String,
+        #[arg(long, required_unless_present = "into", conflicts_with = "into")]
+        to: Option<PathBuf>,
+        #[arg(long, required_unless_present = "to", conflicts_with = "to")]
+        into: Option<PathBuf>,
         #[arg(long)]
-        to: PathBuf,
+        destination: Option<String>,
+        #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
+        adapter_options: Vec<(String, String)>,
     },
     Log {
         #[arg(long)]
@@ -180,6 +195,8 @@ enum PolicyCommand {
         #[arg(long)]
         kind: String,
         #[arg(long)]
+        capsule: Option<String>,
+        #[arg(long)]
         auto_accept: bool,
         #[arg(long)]
         auto_run_recipes: bool,
@@ -187,6 +204,7 @@ enum PolicyCommand {
         to: Option<PathBuf>,
     },
     List,
+    Clear,
     Revoke {
         id: String,
     },
@@ -239,6 +257,18 @@ struct SendArgs {
     kind: Option<String>,
     #[arg(long, requires = "kind")]
     source: Option<String>,
+    #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
+    adapter_options: Vec<(String, String)>,
+}
+
+fn parse_adapter_option(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "adapter option must be k=v".to_owned())?;
+    if key.is_empty() {
+        return Err("adapter option key must not be empty".into());
+    }
+    Ok((key.to_owned(), value.to_owned()))
 }
 
 #[derive(Args)]
@@ -288,8 +318,26 @@ async fn main() -> cadabra::Result<()> {
         yes,
         transport,
         token,
+        iroh_relay,
+        skip_native,
+        offer_budget,
     } = cli.command
     {
+        let mut config = DaemonConfig::load(&root)?;
+        let config_changed = iroh_relay.is_some() || skip_native || offer_budget.is_some();
+        if let Some(relay) = &iroh_relay {
+            relay.parse::<abra_net::IrohRelayMode>()?;
+            config.iroh_relay = relay.clone();
+        }
+        if skip_native {
+            config.skip_native = true;
+        }
+        if let Some(bytes) = offer_budget {
+            config.offer_budget = bytes;
+        }
+        if config_changed {
+            config.save(&root)?;
+        }
         let daemon = Arc::new(match transport {
             #[cfg(feature = "iroh")]
             TransportKind::Iroh => Daemon::iroh(&root, yes).await?,
@@ -336,16 +384,32 @@ async fn main() -> cadabra::Result<()> {
         }
         Command::Send(args) => {
             let path = args.path.map(std::fs::canonicalize).transpose()?;
-            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule,"kind":args.kind,"source":args.source})
+            let options = args
+                .adapter_options
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule,"kind":args.kind,"source":args.source,"options":options})
         }
         Command::Inbox => json!({"op":"inbox"}),
-        Command::Accept { id, to } => {
-            let absolute = if to.is_absolute() {
-                to
+        Command::Accept {
+            id,
+            to,
+            into,
+            destination,
+            adapter_options,
+        } => {
+            let path = to.or(into.clone()).expect("clap requires a destination");
+            let absolute = if into.is_some() {
+                std::fs::canonicalize(&path)?
+            } else if path.is_absolute() {
+                path
             } else {
-                std::env::current_dir()?.join(to)
+                std::env::current_dir()?.join(path)
             };
-            json!({"op":"accept","id":id,"to":absolute})
+            let options = adapter_options
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            json!({"op":"accept","id":id,"to":absolute,"into":into.is_some(),"destination":destination,"options":options})
         }
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
         Command::Capsules => json!({"op":"capsules"}),
@@ -360,6 +424,7 @@ async fn main() -> cadabra::Result<()> {
             PolicyCommand::Grant {
                 peer,
                 kind,
+                capsule,
                 auto_accept,
                 auto_run_recipes,
                 to,
@@ -371,9 +436,10 @@ async fn main() -> cadabra::Result<()> {
                         std::env::current_dir().unwrap().join(path)
                     }
                 });
-                json!({"op":"policy-grant","peer":peer,"kind":kind,"auto_accept":auto_accept,"auto_run_recipes":auto_run_recipes,"to":to})
+                json!({"op":"policy-grant","peer":peer,"kind":kind,"capsule":capsule,"auto_accept":auto_accept,"auto_run_recipes":auto_run_recipes,"to":to})
             }
             PolicyCommand::List => json!({"op":"policy-list"}),
+            PolicyCommand::Clear => json!({"op":"policy-clear"}),
             PolicyCommand::Revoke { id } => json!({"op":"policy-revoke","id":id}),
         },
         Command::Ps => json!({"op":"ps"}),
@@ -500,19 +566,7 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
             let blob_hash = Hash::of(&minted.blob);
             let blob_path = out.join(format!("{blob_hash}.abracap"));
             fs::write(&blob_path, &minted.blob)?;
-            let actual_url = if minted.record.url.starts_with("file://") {
-                format!(
-                    "file://{}",
-                    if blob_path.is_absolute() {
-                        blob_path.clone()
-                    } else {
-                        std::env::current_dir()?.join(&blob_path)
-                    }
-                    .display()
-                )
-            } else {
-                minted.record.url.clone()
-            };
+            let actual_url = capability_public_url(&minted.record.url, blob_hash, &blob_path)?;
             if let Some(template) = upload_command {
                 let command = template
                     .replace("{file}", &blob_path.to_string_lossy())
@@ -707,7 +761,7 @@ async fn serve_links(dir: &Path, listen: &str) -> cadabra::Result<()> {
             } else {
                 root.join(path)
             };
-            let resolved = tokio::fs::canonicalize(&file).await;
+            let resolved = resolve_served_path(&file).await;
             if resolved.as_ref().is_ok_and(|p| !p.starts_with(&root)) {
                 let _ = stream
                     .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -740,6 +794,30 @@ async fn serve_links(dir: &Path, listen: &str) -> cadabra::Result<()> {
     }
 }
 
+fn capability_public_url(
+    configured: &str,
+    hash: abra_core::cas::Hash,
+    blob_path: &Path,
+) -> cadabra::Result<String> {
+    if configured.starts_with("file://") {
+        let path = if blob_path.is_absolute() {
+            blob_path.to_owned()
+        } else {
+            std::env::current_dir()?.join(blob_path)
+        };
+        Ok(format!("file://{}", path.display()))
+    } else {
+        Ok(configured.replace("{hash}", &hash.to_hex()))
+    }
+}
+
+async fn resolve_served_path(path: &Path) -> std::io::Result<PathBuf> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(path) if path.is_dir() => tokio::fs::canonicalize(path.join("index.html")).await,
+        other => other,
+    }
+}
+
 async fn wait_for_shutdown() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -759,5 +837,52 @@ fn print_human(value: &Value) {
             }
         }
         _ => println!("{}", serde_json::to_string_pretty(value).unwrap()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_url_substitutes_ciphertext_hash() {
+        let hash = abra_core::cas::Hash::of(b"ciphertext");
+        assert_eq!(
+            capability_public_url(
+                "http://127.0.0.1:8080/{hash}.abracap",
+                hash,
+                Path::new("unused"),
+            )
+            .unwrap(),
+            format!("http://127.0.0.1:8080/{hash}.abracap")
+        );
+    }
+
+    #[test]
+    fn accept_requires_exactly_one_materialization_mode() {
+        assert!(Cli::try_parse_from(["abra", "accept", "id"]).is_err());
+        assert!(
+            Cli::try_parse_from(["abra", "accept", "id", "--to", "new", "--into", "existing"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["abra", "accept", "id", "--to", "new"]).is_ok());
+        assert!(Cli::try_parse_from(["abra", "accept", "id", "--into", "existing"]).is_ok());
+    }
+
+    #[test]
+    fn policy_clear_is_a_valid_command() {
+        assert!(Cli::try_parse_from(["abra", "policy", "clear"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn directory_routes_resolve_to_their_index() {
+        let root = tempfile::tempdir().unwrap();
+        let viewer = root.path().join("viewer");
+        fs::create_dir(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        assert_eq!(
+            resolve_served_path(&viewer).await.unwrap(),
+            fs::canonicalize(viewer.join("index.html")).unwrap()
+        );
     }
 }

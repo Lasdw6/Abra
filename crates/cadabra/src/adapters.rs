@@ -40,6 +40,7 @@ pub struct AdapterRegistration {
 pub struct AdapterRegistry {
     by_kind: BTreeMap<String, AdapterRegistration>,
     by_name: BTreeMap<String, AdapterRegistration>,
+    errors: Vec<String>,
 }
 
 impl AdapterRegistry {
@@ -62,41 +63,53 @@ impl AdapterRegistry {
         dirs.dedup();
         let mut by_kind = BTreeMap::new();
         let mut by_name = BTreeMap::new();
+        let mut errors = Vec::new();
+        let mut ambiguous_kinds = std::collections::BTreeSet::new();
         for directory in dirs {
-            let path = directory.join("abra-adapter.json");
-            if !path.is_file() {
-                continue;
-            }
-            let manifest: AdapterManifest = serde_json::from_slice(&fs::read(&path)?)?;
-            if manifest.spec != "abra-adapter/1" || manifest.kinds.is_empty() {
-                return Err(format!("invalid adapter manifest {}", path.display()).into());
-            }
-            let executable = resolve_executable(&directory, &manifest)?;
+            let (manifest, executable) = match load_registration(&directory) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", directory.display()));
+                    continue;
+                }
+            };
             let registration = AdapterRegistration {
                 manifest: manifest.clone(),
                 directory,
                 executable,
             };
-            if by_name
-                .insert(manifest.name.clone(), registration.clone())
-                .is_some()
-            {
-                return Err(format!("duplicate adapter name {}", manifest.name).into());
+            if by_name.contains_key(&manifest.name) {
+                errors.push(format!("duplicate adapter name {}", manifest.name));
+                continue;
             }
+            if let Some((kind, other)) = manifest.kinds.iter().find_map(|kind| {
+                by_kind
+                    .get(kind)
+                    .map(|other: &AdapterRegistration| (kind, other))
+            }) {
+                errors.push(format!(
+                    "duplicate adapter kind claim {kind}: {} and {}",
+                    other.manifest.name, manifest.name
+                ));
+                ambiguous_kinds.insert(kind.clone());
+                by_kind.remove(kind);
+                continue;
+            }
+            by_name.insert(manifest.name.clone(), registration.clone());
             for kind in &manifest.kinds {
-                if let Some(other) = by_kind.insert(kind.clone(), registration.clone()) {
-                    return Err(format!(
-                        "duplicate adapter kind claim {kind}: {} and {}",
-                        other.manifest.name, manifest.name
-                    )
-                    .into());
+                if !ambiguous_kinds.contains(kind) {
+                    by_kind.insert(kind.clone(), registration.clone());
                 }
             }
         }
-        Ok(Self { by_kind, by_name })
+        Ok(Self {
+            by_kind,
+            by_name,
+            errors,
+        })
     }
-    pub fn list(&self) -> Vec<&AdapterRegistration> {
-        self.by_name.values().collect()
+    pub fn list(&self) -> Value {
+        json!({"adapters":self.by_name.values().collect::<Vec<_>>(),"errors":self.errors})
     }
     pub fn for_kind(&self, kind: &str) -> Option<&AdapterRegistration> {
         self.by_kind.get(kind)
@@ -113,24 +126,32 @@ impl AdapterRegistry {
     }
     pub fn add(root: &Path, directory: &Path) -> Result<()> {
         let directory = fs::canonicalize(directory)?;
-        if !directory.join("abra-adapter.json").is_file() {
-            return Err("directory lacks abra-adapter.json".into());
+        let (manifest, _) = load_registration(&directory)?;
+        let existing = Self::discover(root)?;
+        if existing.by_name.contains_key(&manifest.name) {
+            return Err(format!("duplicate adapter name {}", manifest.name).into());
+        }
+        for kind in &manifest.kinds {
+            if let Some(other) = existing.by_kind.get(kind) {
+                return Err(format!(
+                    "duplicate adapter kind claim {kind}: {} and {}",
+                    other.manifest.name, manifest.name
+                )
+                .into());
+            }
         }
         update_registry(root, |dirs| {
             if !dirs.contains(&directory) {
                 dirs.push(directory.clone());
             }
         })?;
-        if let Err(error) = Self::discover(root) {
-            let _ = update_registry(root, |dirs| dirs.retain(|d| d != &directory));
-            return Err(error);
-        }
         Ok(())
     }
     pub async fn export(
         &self,
         kind: &str,
-        source: &str,
+        source: Value,
+        options: &BTreeMap<String, String>,
         daemon_root: &Path,
         timeout: Option<Duration>,
     ) -> Result<ExportResult> {
@@ -143,7 +164,7 @@ impl AdapterRegistry {
         let staging = tempfile::Builder::new()
             .prefix("export-")
             .tempdir_in(&staging_parent)?;
-        let result = invoke(adapter, json!({"verb":"export","kind":kind,"source":source,"staging_dir":staging.path(),"options":{}}), timeout).await?;
+        let result = invoke(adapter, json!({"verb":"export","kind":kind,"source":source,"staging_dir":staging.path(),"options":options}), timeout).await?;
         validate_staging(staging.path())?;
         let mut export: ExportResult = serde_json::from_value(result)?;
         if let Some(path) = &export.files_path {
@@ -160,7 +181,7 @@ impl AdapterRegistry {
                 *path = staging.path().join(&*path);
             }
         }
-        let _persisted = staging.keep();
+        export.staging = Some(staging);
         Ok(export)
     }
     pub async fn import(
@@ -168,21 +189,24 @@ impl AdapterRegistry {
         kind: &str,
         payload: Value,
         materialized_files: Option<&Path>,
-        destination: &Path,
+        destination: Value,
+        options: &BTreeMap<String, String>,
         timeout: Option<Duration>,
     ) -> Result<Value> {
         let adapter = self.for_kind(kind).ok_or("adapter disappeared")?;
         require_verb(adapter, "import")?;
-        invoke(adapter, json!({"verb":"import","kind":kind,"payload":payload,"materialized_files":materialized_files,"destination":destination,"options":{}}), timeout).await
+        invoke(adapter, json!({"verb":"import","kind":kind,"payload":payload,"materialized_files":materialized_files,"destination":destination,"options":options}), timeout).await
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ExportResult {
     pub payload: Value,
     pub files_path: Option<PathBuf>,
     #[serde(default)]
     pub floor: Option<Floor>,
+    #[serde(skip)]
+    pub staging: Option<tempfile::TempDir>,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Floor {
@@ -204,6 +228,18 @@ fn resolve_executable(dir: &Path, manifest: &AdapterManifest) -> Result<PathBuf>
         return Err("adapter executable escapes its directory".into());
     }
     Ok(executable)
+}
+fn load_registration(directory: &Path) -> Result<(AdapterManifest, PathBuf)> {
+    let path = directory.join("abra-adapter.json");
+    if !path.is_file() {
+        return Err("directory lacks abra-adapter.json".into());
+    }
+    let manifest: AdapterManifest = serde_json::from_slice(&fs::read(&path)?)?;
+    if manifest.spec != "abra-adapter/1" || manifest.kinds.is_empty() {
+        return Err(format!("invalid adapter manifest {}", path.display()).into());
+    }
+    let executable = resolve_executable(directory, &manifest)?;
+    Ok((manifest, executable))
 }
 fn require_verb(adapter: &AdapterRegistration, verb: &str) -> Result<()> {
     if adapter.manifest.verbs.iter().any(|x| x == verb) {
@@ -355,14 +391,16 @@ mod tests {
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
     }
     #[test]
-    fn discovery_rejects_duplicate_kind_claims() {
+    fn discovery_reports_duplicate_kind_claims_and_refuses_dispatch() {
         let root = tempfile::tempdir().unwrap();
         adapter(root.path(), "a", "a", "com.test.kind", "exit 0");
         adapter(root.path(), "b", "b", "com.test.kind", "exit 0");
-        assert!(AdapterRegistry::discover(root.path())
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate adapter kind"));
+        let registry = AdapterRegistry::discover(root.path()).unwrap();
+        assert!(registry.for_kind("com.test.kind").is_none());
+        assert!(registry
+            .errors
+            .iter()
+            .any(|error| error.contains("duplicate adapter kind")));
     }
     #[tokio::test]
     async fn malformed_timeout_and_escape_are_rejected() {
@@ -378,7 +416,8 @@ mod tests {
         assert!(registry
             .export(
                 "com.test.bad",
-                "x",
+                json!("x"),
+                &BTreeMap::new(),
                 malformed.path(),
                 Some(Duration::from_secs(1))
             )
@@ -392,7 +431,8 @@ mod tests {
         assert!(registry
             .export(
                 "com.test.slow",
-                "x",
+                json!("x"),
+                &BTreeMap::new(),
                 slow.path(),
                 Some(Duration::from_millis(20))
             )
@@ -412,7 +452,8 @@ mod tests {
         assert!(registry
             .export(
                 "com.test.escape",
-                "x",
+                json!("x"),
+                &BTreeMap::new(),
                 escape.path(),
                 Some(Duration::from_secs(1))
             )
@@ -438,7 +479,8 @@ mod tests {
         let exported = registry
             .export(
                 "dev.abra.folder",
-                source.path().to_str().unwrap(),
+                json!(source.path()),
+                &BTreeMap::new(),
                 root.path(),
                 Some(Duration::from_secs(2)),
             )
@@ -454,7 +496,8 @@ mod tests {
                 "dev.abra.folder",
                 exported.payload,
                 exported.files_path.as_deref(),
-                destination.path(),
+                json!(destination.path()),
+                &BTreeMap::new(),
                 Some(Duration::from_secs(2)),
             )
             .await
@@ -463,5 +506,91 @@ mod tests {
             fs::read(destination.path().join("hello")).unwrap(),
             b"world"
         );
+    }
+
+    #[tokio::test]
+    async fn export_preserves_json_or_string_source_and_options() {
+        let root = tempfile::tempdir().unwrap();
+        let captured = root.path().join("captured.json");
+        adapter(
+            root.path(),
+            "capture",
+            "capture",
+            "com.test.capture",
+            &format!(
+                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"result":{{"payload":{{}},"files_path":null}}}}\n' "$id""#,
+                captured.display()
+            ),
+        );
+        let registry = AdapterRegistry::discover(root.path()).unwrap();
+        let options = BTreeMap::from([("mode".into(), "fast".into())]);
+        registry
+            .export(
+                "com.test.capture",
+                json!({"tab":3}),
+                &options,
+                root.path(),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_slice(&fs::read(&captured).unwrap()).unwrap();
+        assert_eq!(request["source"], json!({"tab":3}));
+        assert_eq!(request["options"], json!({"mode":"fast"}));
+        registry
+            .export(
+                "com.test.capture",
+                json!("not json"),
+                &BTreeMap::new(),
+                root.path(),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_slice(&fs::read(captured).unwrap()).unwrap();
+        assert_eq!(request["source"], json!("not json"));
+    }
+
+    #[tokio::test]
+    async fn import_passes_destination_and_options() {
+        let root = tempfile::tempdir().unwrap();
+        let captured = root.path().join("import.json");
+        adapter(
+            root.path(),
+            "capture",
+            "capture",
+            "com.test.import",
+            &format!(
+                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"result":{{}}}}\n' "$id""#,
+                captured.display()
+            ),
+        );
+        let registry = AdapterRegistry::discover(root.path()).unwrap();
+        registry
+            .import(
+                "com.test.import",
+                json!({}),
+                None,
+                json!({"profile":"work"}),
+                &BTreeMap::from([("merge".into(), "true".into())]),
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_slice(&fs::read(captured).unwrap()).unwrap();
+        assert_eq!(request["destination"], json!({"profile":"work"}));
+        assert_eq!(request["options"], json!({"merge":"true"}));
+    }
+
+    #[test]
+    fn broken_sibling_does_not_block_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        adapter(root.path(), "good", "good", "com.test.good", "exit 0");
+        let broken = root.path().join("adapters/broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("abra-adapter.json"), b"not json").unwrap();
+        let registry = AdapterRegistry::discover(root.path()).unwrap();
+        assert!(registry.for_kind("com.test.good").is_some());
+        assert_eq!(registry.errors.len(), 1);
     }
 }

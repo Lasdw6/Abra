@@ -401,15 +401,19 @@ application messages.
 length 1..16 MiB, one object per frame with a string `type`. Unknown `type` after
 handshake → `error {code:"unknown_type"}`, connection lives.
 
-**Object streams** (unidirectional, sender→receiver): binary, one object each —
+**Object streams** (unidirectional, sender→receiver): binary, one bounded chunk each —
 
 ```
 u8 kind (1=blob, 2=tree) || digest[32] || u64be total_size || u64be offset || bytes...
 ```
 
-Chunking is QUIC's job. On EOF the receiver hashes and MUST discard on mismatch;
-commit to CAS is atomic. Bulk bytes never travel as JSON/base64. Max 8 concurrent
-object streams.
+Successive streams use contiguous offsets for the same object. Senders use chunks
+of at most 1 MiB for objects above 8 MiB, so neither endpoint buffers a whole
+large object. Objects up to 8 MiB retain the single-stream path. The receiver updates
+its BLAKE3 state for each chunk and MUST discard the temporary file on mismatch;
+commit to CAS is atomic. Bulk bytes never travel as JSON/base64. The receiver
+processes object streams serially. This uses the existing wire-1 object header
+and offset field.
 
 ### 6.2 Handshake
 
@@ -417,14 +421,23 @@ Dialer sends `hello`, listener answers `hello-ok` (or `hello-reject`):
 
 ```json
 {"type":"hello","wire":1,"spec":"abra/0.1","peer_id":"<hex>","name":"laptop",
- "features":["resume","control"],"nonce":"<16 bytes hex>"}
+ "features":["resume","control","revocation","skip-native","bind-cert"],
+ "nonce":"<16 bytes hex>"}
 {"type":"hello-ok","wire":1,"peer_id":"<hex>","features":[...],"nonce":"<echo>",
- "session":"trusted|bootstrap"}
+ "session":"trusted|bootstrap","revocations":[...optional, negotiated signed records...]}
 {"type":"hello-reject","reason":"wire|busy|protocol","message":"..."}
 ```
 
-v0.1 speaks `wire` 1 only; `resume` and `control` are mandatory features, `relay`
-optional. Unknown peers get `session:"bootstrap"`, in which the only legal types
+v0.1 speaks `wire` 1 only; `resume` and `control` are mandatory features. The
+`revocation`, `skip-native`, and `bind-cert` entries negotiate optional JSON
+fields. A sender MUST omit `revocations` unless the remote advertised
+`revocation`, MUST omit `skip_native` unless it advertised `skip-native`, and
+MUST omit `bind_certificate` plus `bind_certificate_issuer` unless it advertised
+`bind-cert`. Wire-1 decoders reject unknown fields. A dialer's first `hello`
+cannot know the listener's features, so it never carries revocations. `hello-ok`
+and later offers carry them after negotiation. Relay envelopes have no preceding
+handshake and omit these fields. Unknown peers get `session:"bootstrap"`. The
+only legal bootstrap types
 are `pair-request`, `pair-abort`, `pair-accept`, `enroll-bind`, `enroll-ok`,
 `error` — anything else → `error {code:"untrusted"}` and close. (This is the single
 authoritative bootstrap rule.) The transport already authenticates both keys;
@@ -443,10 +456,13 @@ leaves outbox entries queued with backoff.
  "capsule_id":"<hex, full only>","fork":false,
  "bytes_hint":123456,"object_count":42,
  "manifest_raw":"<base64url of exact bytes M>",
+ "bind_certificate_issuer":"<peer id, optional>",
+ "bind_certificate":{...optional, signed guest bind certificate...},
  "genesis":{...optional, full only...},
  "genesis_grant":{...optional, signed epoch-1 grant, full only...},
  "lease_chain":[...signed winning lease ancestry after epoch 1, full only...],
- "main_label":{...optional, current signed main label-op, full only...}}
+ "main_label":{...optional, current signed main label-op, full only...},
+ "revocations":[...optional, negotiated signed records...]}
 ```
 
 `manifest_raw` is the **only** representation of the manifest on the wire.
@@ -458,6 +474,17 @@ notification may show before blobs arrive) and reply `offer-accept {offer_id}` o
 `offer-reject {offer_id, reason: "quota"|"scope"|"duplicate"|"invalid"|"busy"}`.
 If the receiver already holds the full closure it MAY skip transfer and ack
 directly.
+
+When the manifest origin is an unknown guest, the receiver MAY install it from
+the optional bind certificate. The named issuer MUST already be a trusted full
+peer, the certificate signature and expiry MUST verify, and its guest subject
+MUST equal the manifest origin. The installed guest gets the certificate's
+name, X25519 key, scopes, token id, and expiry, with no transport addresses.
+Guest-issued, expired, mismatched, or invalid certificates do not add trust and
+the receiver rejects the origin under the normal rule. A full peer forwards a
+bind certificate it issued or previously installed whenever it offers a
+snapshot authored by that guest when the receiver advertised `bind-cert`.
+Relay delivery cannot negotiate this field and omits it.
 
 For a full offer, `lease_chain` is strictly epoch-ordered and capped at 256
 records. It carries a suffix of the signed winning ancestry after epoch 1; a
@@ -483,7 +510,7 @@ objects:[{digest, kind, bytes}]}`, split above 50k objects). Receiver answers
 
 ```json
 {"type":"have","offer_id":"...","have":["<digest>",...],
- "resume":{"<digest>":<offset>,...},"eof":true}
+ "resume":{"<digest>":<offset>,...},"skip_native":false,"eof":true}
 ```
 
 The receiver MUST recompute `have` against its own verified CAS — sender
@@ -491,11 +518,32 @@ assumptions are never trusted. `resume` maps any number of partially received
 objects to committed offsets (contiguous-from-zero prefixes only). Sender then
 streams `plan − have`, resuming partials from their offsets.
 
+Objects named by `manifest.native` MAY be as large as 8 GiB. Every other object
+is capped at 256 MiB. A receiver applies a configurable total budget to each
+offer, default 16 GiB, and MUST check available disk space before acceptance.
+The total budget replaces the old 256 MiB sum cap.
+
+A receiver that cannot use this manifest's native fingerprint sets
+`skip_native:true` and lists every native digest in `have`. The sender MUST omit
+those objects. The receiver still commits the signed manifest and portable tree;
+missing native objects remain an optional cache miss. A receiver MUST reject a
+stream for every digest it listed in `have`; skipped bytes were excluded from
+its budget and disk calculation. `skip_native` defaults to false when absent.
+
 ### 6.6 Transfer errors
 
 `transfer-error {offer_id, digest, reason: "hash"|"size"|"io"}`. Sender may retry
 an object once, then fails the attempt. There are **no per-object signed acks**;
 progress is observable from stream completion.
+
+The receiver writes chunks to an offer-scoped temporary directory at
+`net/partials/<offer-id>/`, next to the CAS.
+Resume offsets survive retries in the running process. Startup removes
+abandoned offer directories, so resume does not survive a daemon restart.
+It incrementally advances only contiguous offsets, verifies BLAKE3 after the
+final chunk, deletes a failed partial, and atomically moves a verified file into
+the CAS. Admission fails with `offer-reject reason:"quota"` when the configured
+budget or available disk space is too small.
 
 ### 6.7 The ack
 
@@ -572,12 +620,15 @@ Ticket (CJSON signed domain `pair-ticket`; conveyed as
 {"v":1,"type":"pair-ticket","peer_id":"<issuer>","name":"laptop",
  "ticket_id":"<16 bytes hex>","issued_at":"<time>","expires_at":"<+10 min max>",
  "x25519_pk":"<hex 64>","relay_key":"<hex 64, optional>",
- "addresses":["<transport hints>"],"sig":"<hex>"}
+ "addresses":["<serialized complete transport address>"],"sig":"<hex>"}
 ```
 
 Flow: B verifies the ticket (signature, expiry with 60s skew), dials the issuer,
 completes a bootstrap hello, sends `pair-request {ticket_id, peer_id, name,
-nonce, x25519_pk, relay_key?, sig}` (domain `pair-request`). A verifies, checks
+nonce, x25519_pk, relay_key?, addresses, sig}` (domain `pair-request`). The
+signature covers `ticket_id || nonce`; the authenticated transport binds the
+address hints to the joiner's peer id. A validates the hints with its transport
+parser before storing them, then checks
 the ticket is pending and unused, **prompts the user** (display both short ids),
 atomically consumes the nonce, replies `pair-accept {peer_id, name, nonce}`, and
 B replies `pair-confirm {ticket_id}`; each side inserts the other as a full
@@ -585,6 +636,10 @@ B replies `pair-confirm {ticket_id}`; each side inserts the other as a full
 half-paired side that simply re-pairs. Tickets are strictly single-use.
 Pairing exchanges each device's X25519 public key and (optional) relay discovery
 key alongside the Ed25519 identity.
+For iroh, each address is a serialized complete `EndpointAddr`, including its
+endpoint id, direct UDP addresses, and home relay URL when available.
+`TrustedPeer` keeps these dial hints from pairing, enrollment, or a successful
+connection and passes them back to the transport unchanged after restart.
 
 ### 7.2 Enrollment (cloud sandbox / guest)
 
@@ -595,7 +650,8 @@ A tokenless guest binary is **inert**. Only full devices mint tokens. Token
 ```json
 {"v":1,"type":"enrollment","token_id":"<16 bytes hex>","issuer":"<peer id>",
  "issued_at":"<time>","expires_at":"<default +24h, max +30d>",
- "label":"cloud-agent-1","intro":[{"peer_id":"<hex>","name":"laptop"}],
+ "label":"cloud-agent-1","intro":[{"peer_id":"<hex>","name":"laptop",
+ "addresses":["<serialized complete transport address>"]}],
  "audience":"<guest peer id, optional>","bind_by":"<time, required iff no audience>",
  "scopes":{"capsules":["<hex>"]|["*"],"kinds":["dev.abra.workspace"]|["*"],
            "send":true,"receive":true,"lease_acquire":true,"lease_takeover":false},
@@ -614,16 +670,38 @@ sig}` (domain `enroll-bind`). The intro peer verifies token signature/expiry/
 revocation and either `audience == guest_peer_id` or (audience-less) now ≤
 `bind_by` and the token is unbound. It persists the guest as
 `TrustedPeer {role:"guest", token_id, scopes}`, replies
-`enroll-ok {mesh:[{peer_id,name,role}]}`. In v1 the guest trust row is
-device-local to the issuer; bind-certificate distribution is not implemented.
-The mesh projection contains no other guests' token ids, scopes, or keys.
+`enroll-ok {mesh:[{peer_id,name,role}]}` and retains the signed bind certificate.
+Full peers distribute that bounded authority with guest-authored offers as
+specified in §6.4. The mesh projection contains no other guests' token ids,
+scopes, or keys.
 
 ### 7.3 Revocation
 
-Revocation is device-local in v1, matching device-local guest enrollment. On
-revoke the issuer drops the guest and refuses subsequent binds and frames,
-including frames on an already-open session. Cross-device revocation flooding
-and full-peer removal gossip are not implemented.
+Revoking a bound token creates this CJSON record, signed by the certificate
+issuer with domain `revoke`:
+
+```json
+{"type":"revocation","issuer":"<peer id>","token_id":"<16 bytes hex>",
+ "guest_peer_id":"<peer id>","revoked_at":"<time>","sig":"<hex>"}
+```
+
+The issuer persists the record, drops the guest trust row and bind certificate,
+and rejects later binds and sessions for that guest. Full peers attach up to 128
+of their newest still-relevant records to `hello-ok` and direct offers when the
+remote advertised `revocation`. A record remains relevant until its matching
+bind certificate expires. A receiver rejects a larger list.
+
+A receiver accepts a record only if `issuer` is a trusted full peer, the
+signature verifies against `issuer`, and the receiver has the matching bind
+certificate or has already verified and stored the same record. It then drops
+the guest row and certificate, persists the record, rejects attempts to install
+that certificate again, and refuses new or active sessions from that guest.
+Peers may forward records they have accepted. Forwarding does not change which
+issuer key verifies the signature.
+
+Propagation is on-contact, not broadcast. A peer that does not receive an offer
+or handshake from the issuer or a forwarder keeps the guest trust row until the
+bind certificate expires.
 
 ### 7.4 Scope enforcement (receiver-side, every operation)
 
@@ -846,6 +924,9 @@ turn.
   replaces XChaCha20-Poly1305 for capability links only because browsers expose
   AES-GCM, but not XChaCha20, through WebCrypto. Fresh per-link keys prevent
   nonce reuse in normal operation. Mesh and relay cryptography are unchanged.
+  A sealed capability bundle MUST NOT exceed 64 MiB, and each packed object
+  MUST NOT exceed 32 MiB. Relay delivery has a 256 MiB decoded-pack cap,
+  so larger capability bundles require direct hosting rather than relay transit.
 - Relay discovery-key erratum: each device has an independent random 32-byte
   relay discovery key shared through pairing/enrollment records. Relay sealing
   uses the ephemeral-X25519 and AES-256-GCM construction pinned in §8.
@@ -854,9 +935,15 @@ turn.
   `ack` (sender peer id and the normal signed `Ack`). Receivers pass offers
   through `validate_incoming_offer`, reconstruct and verify the manifest closure
   from object bytes, and only then durably commit. v0.1 uses one object-pack
-  envelope; after JSON/base64/sealing overhead it MUST fit the 16 MiB item cap.
-  Oversize sends fail clearly and require splitting the snapshot. Chunk assembly
-  is reserved for a later wire version.
+  envelope; the decoded object pack MUST fit the 256 MiB relay delivery cap.
+  Oversize sends fail clearly and require splitting the snapshot. Direct wire-1
+  delivery uses the chunk assembly described in §6.1; relay envelopes remain a
+  single bounded object pack.
+- Wire-1 optional-field erratum: `revocations`, `skip_native`,
+  `bind_certificate`, and `bind_certificate_issuer` are emitted only after the
+  matching `revocation`, `skip-native`, or `bind-cert` feature was advertised.
+  The initial dialer `hello` and relay envelopes omit these additions because no
+  remote feature list is available yet.
 - Fleet-profile clarification: guest-to-guest delivery is authorization policy,
   not a protocol change. `personal` forbids it. `fleet` permits it only when the
   sender's send scope and recipient's receive scope both cover the exact kind
@@ -871,6 +958,9 @@ turn.
 - Stage-2 review erratum: bind certificates carry the guest name, X25519 key,
   effective scopes, and token expiry so non-issuer intro peers can verify and
   install the same bounded guest authority without an out-of-band token cache.
+- Track-1 follow-up erratum: direct and relay offers distribute a retained bind
+  certificate for a guest manifest origin. Only a trusted full issuer can add
+  the bounded guest row; signature, expiry, and subject are checked first.
 - Stage-2 review clarification: a first full-capsule offer carries both signed
   genesis and its signed epoch-1 grant, since capsule installation verifies both.
 - Stage-4 clarification: enrollment intro records include the peer's X25519 key

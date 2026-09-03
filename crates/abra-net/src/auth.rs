@@ -56,11 +56,50 @@ mod optional_hex32 {
 }
 
 pub const CLOCK_SKEW_MS: u64 = 60_000;
+pub const MAX_REVOCATIONS_PER_MESSAGE: usize = 128;
+pub const FEATURE_REVOCATION: &str = "revocation";
+pub const FEATURE_SKIP_NATIVE: &str = "skip-native";
+pub const FEATURE_BIND_CERT: &str = "bind-cert";
+const MAX_CERTIFICATE_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_PERSISTED_REVOCATIONS: usize = 4096;
+const MAX_PERSISTED_BIND_CERTIFICATES: usize = 4096;
 
 fn random16() -> String {
     let mut b = [0; 16];
     OsRng.fill_bytes(&mut b);
     hex::encode(b)
+}
+fn supported_features() -> Vec<String> {
+    [
+        "resume",
+        "control",
+        FEATURE_REVOCATION,
+        FEATURE_SKIP_NATIVE,
+        FEATURE_BIND_CERT,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+pub fn has_feature(features: &[String], feature: &str) -> bool {
+    features.iter().any(|candidate| candidate == feature)
+}
+
+fn negotiated_hello_revocations(
+    trust: &TrustStore,
+    remote_features: &[String],
+    now: u64,
+) -> Vec<Revocation> {
+    if matches!(trust.local_role(), LocalRole::Full)
+        && has_feature(remote_features, FEATURE_REVOCATION)
+    {
+        trust.current_revocations(now)
+    } else {
+        Vec::new()
+    }
+}
+fn revocation_key(issuer: PeerId, token_id: &str) -> String {
+    format!("{}:{token_id}", issuer.to_hex())
 }
 fn unsigned<T: Serialize>(x: &T, field: &str) -> Result<Vec<u8>> {
     let mut v = serde_json::to_value(x)?;
@@ -220,6 +259,8 @@ pub struct TrustedPeer {
     pub token_id: Option<String>,
     pub scopes: Option<Scopes>,
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -233,8 +274,24 @@ struct TrustDisk {
     awaiting_pair_confirm: BTreeMap<String, TrustedPeer>,
     used_tickets: BTreeSet<String>,
     bound_tokens: BTreeMap<String, PeerId>,
+    #[serde(default)]
+    bind_certificates: BTreeMap<PeerId, StoredBindCertificate>,
     revoked: BTreeSet<String>,
+    #[serde(default)]
+    revocations: BTreeMap<String, StoredRevocation>,
     control_nonces: BTreeMap<String, u64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRevocation {
+    record: Revocation,
+    relevant_until: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredBindCertificate {
+    pub issuer: PeerId,
+    pub certificate: BindCertificate,
 }
 #[derive(Clone)]
 pub struct TrustStore {
@@ -307,16 +364,57 @@ impl TrustStore {
         for (token, peer) in &self.disk.bound_tokens {
             merged.bound_tokens.entry(token.clone()).or_insert(*peer);
         }
+        merged
+            .bind_certificates
+            .extend(self.disk.bind_certificates.clone());
         merged.revoked.extend(self.disk.revoked.clone());
+        merged.revocations.extend(self.disk.revocations.clone());
         merged
             .control_nonces
             .extend(self.disk.control_nonces.clone());
         merged.peers.extend(self.disk.peers.clone());
+        let now = abra_core::now_ms();
+        merged
+            .revocations
+            .retain(|_, stored| parse_time(&stored.relevant_until).is_ok_and(|until| until >= now));
+        merged.bind_certificates.retain(|_, stored| {
+            parse_time(&stored.certificate.expires_at).is_ok_and(|until| until >= now)
+        });
+        while merged.revocations.len() > MAX_PERSISTED_REVOCATIONS {
+            let oldest = merged
+                .revocations
+                .iter()
+                .min_by_key(|(_, stored)| parse_time(&stored.relevant_until).unwrap_or(0))
+                .map(|(key, _)| key.clone())
+                .expect("non-empty revocation map");
+            merged.revocations.remove(&oldest);
+        }
+        while merged.bind_certificates.len() > MAX_PERSISTED_BIND_CERTIFICATES {
+            let oldest = merged
+                .bind_certificates
+                .iter()
+                .min_by_key(|(_, stored)| parse_time(&stored.certificate.expires_at).unwrap_or(0))
+                .map(|(peer, _)| *peer)
+                .expect("non-empty certificate map");
+            merged.bind_certificates.remove(&oldest);
+        }
         let revoked = merged.revoked.clone();
-        merged.peers.retain(|_, peer| {
-            peer.token_id
-                .as_ref()
-                .is_none_or(|token| !revoked.contains(token))
+        let revocations = merged.revocations.clone();
+        merged.peers.retain(|peer_id, peer| {
+            peer.token_id.as_ref().is_none_or(|token| {
+                !revoked.contains(token)
+                    && !revocations.values().any(|stored| {
+                        stored.record.guest_peer_id == *peer_id && stored.record.token_id == *token
+                    })
+            })
+        });
+        merged.bind_certificates.retain(|guest, stored| {
+            !revoked.contains(&stored.certificate.token_id)
+                && !revocations.values().any(|revocation| {
+                    revocation.record.issuer == stored.issuer
+                        && revocation.record.guest_peer_id == *guest
+                        && revocation.record.token_id == stored.certificate.token_id
+                })
         });
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, canonical::to_vec(&merged)?)?;
@@ -331,6 +429,144 @@ impl TrustStore {
     pub fn peers(&self) -> &BTreeMap<PeerId, TrustedPeer> {
         &self.disk.peers
     }
+    pub fn bind_certificate(&self, guest: &PeerId) -> Option<&StoredBindCertificate> {
+        self.disk.bind_certificates.get(guest)
+    }
+
+    pub fn current_revocations(&self, now: u64) -> Vec<Revocation> {
+        let mut records = self
+            .disk
+            .revocations
+            .values()
+            .filter(|stored| parse_time(&stored.relevant_until).is_ok_and(|end| now <= end))
+            .map(|stored| stored.record.clone())
+            .collect::<Vec<_>>();
+        records
+            .sort_by_key(|record| std::cmp::Reverse(parse_time(&record.revoked_at).unwrap_or(0)));
+        records.truncate(MAX_REVOCATIONS_PER_MESSAGE);
+        records
+    }
+
+    pub fn apply_revocations(&mut self, records: &[Revocation], now: u64) -> Result<()> {
+        if records.len() > MAX_REVOCATIONS_PER_MESSAGE {
+            return Err(Error::protocol("revocation list exceeds 128 records"));
+        }
+        let _operation_lock = self.operation_lock("bind-op")?;
+        self.reload()?;
+        let mut changed = false;
+        for record in records {
+            if record.verify_at(now).is_err()
+                || self
+                    .get(&record.issuer)
+                    .is_none_or(|peer| peer.role != Role::Full)
+            {
+                continue;
+            }
+            let matching_certificate = self
+                .disk
+                .bind_certificates
+                .get(&record.guest_peer_id)
+                .filter(|stored| {
+                    stored.issuer == record.issuer && stored.certificate.token_id == record.token_id
+                });
+            let existing = self
+                .disk
+                .revocations
+                .get(&revocation_key(record.issuer, &record.token_id))
+                .filter(|stored| {
+                    stored.record.issuer == record.issuer
+                        && stored.record.guest_peer_id == record.guest_peer_id
+                });
+            if matching_certificate.is_none() && existing.is_none() {
+                continue;
+            }
+            let relevant_until = matching_certificate
+                .map(|stored| stored.certificate.expires_at.clone())
+                .or_else(|| existing.map(|stored| stored.relevant_until.clone()))
+                .unwrap_or_else(|| format_time(now.saturating_add(MAX_CERTIFICATE_LIFETIME_MS)));
+            self.disk.revocations.insert(
+                revocation_key(record.issuer, &record.token_id),
+                StoredRevocation {
+                    record: record.clone(),
+                    relevant_until,
+                },
+            );
+            self.disk.revoked.insert(record.token_id.clone());
+            self.disk.peers.retain(|peer_id, peer| {
+                *peer_id != record.guest_peer_id
+                    || peer.token_id.as_deref() != Some(&record.token_id)
+            });
+            self.disk.bind_certificates.remove(&record.guest_peer_id);
+            changed = true;
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn install_bind_certificate(
+        &mut self,
+        issuer: PeerId,
+        certificate: BindCertificate,
+        now: u64,
+    ) -> Result<()> {
+        if certificate.record_type != "bind-cert" {
+            return Err(Error::protocol("invalid bind certificate type"));
+        }
+        let issuer_peer = self
+            .get(&issuer)
+            .ok_or_else(|| Error::authz("untrusted bind certificate issuer"))?;
+        if issuer_peer.role != Role::Full {
+            return Err(Error::authz("bind certificate issuer is not full"));
+        }
+        certificate.verify(issuer)?;
+        let expires_at = parse_time(&certificate.expires_at)?;
+        if now > expires_at {
+            return Err(Error::authz("bind certificate expired"));
+        }
+        let bound_at = parse_time(&certificate.bound_at)?;
+        if expires_at.saturating_sub(bound_at) > MAX_CERTIFICATE_LIFETIME_MS {
+            return Err(Error::authz("bind certificate lifetime exceeds 30 days"));
+        }
+        if self.is_revoked(&certificate.token_id) {
+            return Err(Error::authz("token revoked"));
+        }
+        if self.disk.revocations.values().any(|stored| {
+            stored.record.issuer == issuer
+                && stored.record.token_id == certificate.token_id
+                && stored.record.guest_peer_id == certificate.guest_peer_id
+        }) {
+            return Err(Error::authz("token revoked"));
+        }
+        if self
+            .get(&certificate.guest_peer_id)
+            .is_some_and(|peer| peer.role == Role::Full)
+        {
+            return Err(Error::authz("bind certificate subject is already full"));
+        }
+        certificate.scopes.validate()?;
+        let guest = TrustedPeer {
+            peer_id: certificate.guest_peer_id,
+            name: certificate.name.clone(),
+            role: Role::Guest,
+            x25519_pk: certificate.x25519_pk,
+            relay_key: None,
+            token_id: Some(certificate.token_id.clone()),
+            scopes: Some(certificate.scopes.clone()),
+            expires_at: Some(certificate.expires_at.clone()),
+            addresses: Vec::new(),
+        };
+        self.disk.peers.insert(guest.peer_id, guest);
+        self.disk.bind_certificates.insert(
+            certificate.guest_peer_id,
+            StoredBindCertificate {
+                issuer,
+                certificate,
+            },
+        );
+        self.save()
+    }
     pub fn local_role(&self) -> &LocalRole {
         &self.disk.local_role
     }
@@ -340,6 +576,32 @@ impl TrustStore {
     }
     pub fn insert(&mut self, p: TrustedPeer) -> Result<()> {
         self.disk.peers.insert(p.peer_id, p);
+        self.save()
+    }
+    pub fn update_addresses(&mut self, peer: PeerId, addresses: Vec<String>) -> Result<()> {
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let Some(trusted) = self.disk.peers.get_mut(&peer) else {
+            return Ok(());
+        };
+        let mut merged = trusted.addresses.clone();
+        for address in addresses {
+            crate::transport::validate_peer_address(&address)?;
+            if let Some((index, combined)) = merged.iter().enumerate().find_map(|(index, known)| {
+                crate::transport::merge_peer_address_hints(known, &address)
+                    .map(|combined| (index, combined))
+            }) {
+                merged[index] = combined;
+                continue;
+            }
+            if !merged.contains(&address) {
+                merged.push(address);
+            }
+        }
+        merged.sort_by_key(|address| !crate::transport::peer_address_has_direct_hint(address));
+        merged.truncate(8);
+        trusted.addresses = merged;
         self.save()
     }
     pub fn register_ticket(&mut self, ticket: PairTicket) -> Result<()> {
@@ -367,6 +629,14 @@ impl TrustStore {
             ));
         }
         request.verify()?;
+        let addresses = request
+            .addresses
+            .iter()
+            .map(|address| {
+                crate::transport::validate_peer_address(address)?;
+                Ok(address.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let ticket = self
             .disk
             .pending_tickets
@@ -393,6 +663,7 @@ impl TrustStore {
             token_id: None,
             scopes: None,
             expires_at: None,
+            addresses,
         };
         if confirm_immediately {
             self.disk.peers.insert(peer.peer_id, peer);
@@ -447,6 +718,7 @@ impl TrustStore {
                 token_id: None,
                 scopes: None,
                 expires_at: None,
+                addresses: ticket.addresses.clone(),
             },
         );
         self.save()?;
@@ -455,19 +727,52 @@ impl TrustStore {
             ticket_id: ticket.ticket_id.clone(),
         })
     }
-    pub fn revoke_token(&mut self, id: &str) -> Result<()> {
+    pub fn revoke_token(&mut self, id: &str, now: u64, issuer: &Identity) -> Result<()> {
         let _operation_lock = self.operation_lock("bind-op")?;
         self.reload()?;
         self.disk.revoked.insert(id.into());
+        if let Some(stored) = self
+            .disk
+            .bind_certificates
+            .values()
+            .find(|stored| stored.certificate.token_id == id && stored.issuer == issuer.peer_id())
+            .cloned()
+        {
+            let record =
+                Revocation::sign(id.to_owned(), stored.certificate.guest_peer_id, now, issuer)?;
+            self.disk.revocations.insert(
+                revocation_key(issuer.peer_id(), id),
+                StoredRevocation {
+                    record,
+                    relevant_until: stored.certificate.expires_at,
+                },
+            );
+        }
         self.disk
             .peers
             .retain(|_, p| p.token_id.as_deref() != Some(id));
         self.disk.bound_tokens.remove(id);
+        self.disk
+            .bind_certificates
+            .retain(|_, stored| stored.certificate.token_id != id);
         self.save()
     }
 
     pub fn is_revoked(&self, id: &str) -> bool {
         self.disk.revoked.contains(id)
+    }
+    pub fn is_revoked_guest(&self, peer: &PeerId, now: u64) -> bool {
+        let token = self.disk.peers.get(peer).and_then(|trusted| {
+            (trusted.role == Role::Guest)
+                .then_some(trusted.token_id.as_deref())
+                .flatten()
+        });
+        token.is_some_and(|token| self.disk.revoked.contains(token))
+            || self.disk.revocations.values().any(|stored| {
+                stored.record.guest_peer_id == *peer
+                    && token.is_none_or(|token| stored.record.token_id == token)
+                    && parse_time(&stored.relevant_until).is_ok_and(|until| now <= until)
+            })
     }
     pub fn bind_enrollment(
         &mut self,
@@ -490,7 +795,13 @@ impl TrustStore {
                 "bind certificate signer is not token issuer".into(),
             ));
         }
-        if self.is_revoked(&token.token_id) {
+        if self.is_revoked(&token.token_id)
+            || self.disk.revocations.values().any(|stored| {
+                stored.record.issuer == token.issuer
+                    && stored.record.token_id == token.token_id
+                    && stored.record.guest_peer_id == bind.guest_peer_id
+            })
+        {
             return Err(Error::authz("token revoked"));
         }
         if let Some(audience) = token.audience {
@@ -531,10 +842,11 @@ impl TrustStore {
                 token_id: Some(token.token_id.clone()),
                 scopes: Some(token.scopes.clone()),
                 expires_at: Some(token.expires_at.clone()),
+                addresses: bind.addresses.clone(),
             },
         );
         self.save()?;
-        BindCertificate::sign(
+        let certificate = BindCertificate::sign(
             token.token_id.clone(),
             bind.guest_peer_id,
             now,
@@ -543,7 +855,16 @@ impl TrustStore {
             token.scopes.clone(),
             token.expires_at.clone(),
             issuer,
-        )
+        )?;
+        self.disk.bind_certificates.insert(
+            bind.guest_peer_id,
+            StoredBindCertificate {
+                issuer: issuer.peer_id(),
+                certificate: certificate.clone(),
+            },
+        );
+        self.save()?;
+        Ok(certificate)
     }
     pub fn authorize_offer(
         &self,
@@ -765,6 +1086,8 @@ pub struct PairRequest {
     #[serde(default)]
     #[serde(with = "optional_hex32")]
     pub relay_key: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
     pub sig: Signature,
 }
 impl PairRequest {
@@ -773,6 +1096,7 @@ impl PairRequest {
         name: String,
         x25519_pk: [u8; 32],
         relay_key: Option<[u8; 32]>,
+        addresses: Vec<String>,
         nonce: [u8; 16],
         id: &Identity,
     ) -> Result<Self> {
@@ -784,6 +1108,7 @@ impl PairRequest {
             nonce: hex::encode(nonce),
             x25519_pk,
             relay_key,
+            addresses,
             sig: Signature::from_bytes([0; 64]),
         };
         let mut payload =
@@ -956,6 +1281,8 @@ pub struct EnrollBind {
     pub x25519_pk: [u8; 32],
     #[serde(with = "hex32")]
     pub relay_discovery_key: [u8; 32],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
     pub sig: Signature,
 }
 impl EnrollBind {
@@ -964,6 +1291,7 @@ impl EnrollBind {
         name: Option<String>,
         x25519_pk: [u8; 32],
         relay_discovery_key: [u8; 32],
+        addresses: Vec<String>,
         guest: &Identity,
     ) -> Result<Self> {
         if token.audience.is_some_and(|p| p != guest.peer_id()) {
@@ -983,6 +1311,7 @@ impl EnrollBind {
             name,
             x25519_pk,
             relay_discovery_key,
+            addresses,
             sig,
         })
     }
@@ -1071,6 +1400,56 @@ impl BindCertificate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Revocation {
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub issuer: PeerId,
+    pub token_id: String,
+    pub guest_peer_id: PeerId,
+    pub revoked_at: String,
+    pub sig: Signature,
+}
+impl Revocation {
+    pub fn sign(
+        token_id: String,
+        guest_peer_id: PeerId,
+        now: u64,
+        issuer: &Identity,
+    ) -> Result<Self> {
+        let mut record = Self {
+            record_type: "revocation".into(),
+            issuer: issuer.peer_id(),
+            token_id,
+            guest_peer_id,
+            revoked_at: format_time(now),
+            sig: Signature::from_bytes([0; 64]),
+        };
+        record.sig = issuer.sign("revoke", &unsigned(&record, "sig")?);
+        Ok(record)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        self.verify_at(abra_core::now_ms())
+    }
+
+    pub fn verify_at(&self, now: u64) -> Result<()> {
+        if self.record_type != "revocation"
+            || hex::decode(&self.token_id).map_or(true, |bytes| bytes.len() != 16)
+        {
+            return Err(Error::protocol("invalid revocation record"));
+        }
+        let revoked_at = parse_time(&self.revoked_at)?;
+        if revoked_at > now.saturating_add(CLOCK_SKEW_MS) {
+            return Err(Error::protocol("revocation timestamp is in the future"));
+        }
+        self.issuer
+            .verify("revoke", &unsigned(self, "sig")?, &self.sig)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -1080,6 +1459,8 @@ pub struct Hello {
     pub name: String,
     pub features: Vec<String>,
     pub nonce: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revocations: Vec<Revocation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1091,6 +1472,8 @@ pub struct HelloOk {
     pub features: Vec<String>,
     pub nonce: String,
     pub session: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revocations: Vec<Revocation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1139,13 +1522,17 @@ pub fn check_hello(hello: &Hello, authenticated: PeerId, trusted: bool) -> Resul
     {
         return Err(Error::protocol("mandatory feature missing"));
     }
+    if hello.revocations.len() > MAX_REVOCATIONS_PER_MESSAGE {
+        return Err(Error::protocol("revocation list exceeds 128 records"));
+    }
     Ok(HelloOk {
         message_type: "hello-ok".into(),
         wire: WIRE_VERSION,
         peer_id: authenticated,
-        features: vec!["resume".into(), "control".into()],
+        features: supported_features(),
         nonce: hello.nonce.clone(),
         session: if trusted { "trusted" } else { "bootstrap" }.into(),
+        revocations: Vec::new(),
     })
 }
 pub fn bootstrap_allowed(kind: &str) -> bool {
@@ -1173,8 +1560,9 @@ pub async fn dial_handshake(
         spec: abra_core::SPEC.into(),
         peer_id: local,
         name,
-        features: vec!["resume".into(), "control".into()],
+        features: supported_features(),
         nonce: random16(),
+        revocations: Vec::new(),
     };
     let (send, recv) = connection.control_mut();
     crate::write_frame(send, &hello).await?;
@@ -1197,10 +1585,53 @@ pub async fn dial_handshake(
     }
 }
 
+pub async fn dial_handshake_with_trust(
+    connection: &mut crate::Connection,
+    local: PeerId,
+    name: String,
+    trust: &mut TrustStore,
+    now: u64,
+) -> Result<HelloOk> {
+    let remote = connection.peer_id();
+    let hello = Hello {
+        message_type: "hello".into(),
+        wire: WIRE_VERSION,
+        spec: abra_core::SPEC.into(),
+        peer_id: local,
+        name,
+        features: supported_features(),
+        nonce: random16(),
+        // The dialer does not know the listener's features yet.
+        revocations: Vec::new(),
+    };
+    let (send, recv) = connection.control_mut();
+    crate::write_frame(send, &hello).await?;
+    let value: serde_json::Value =
+        tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
+            .await
+            .map_err(|_| Error::Timeout)??;
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("hello-ok") => {
+            let ok: HelloOk = serde_json::from_value(value)?;
+            if ok.nonce != hello.nonce || ok.peer_id != remote {
+                return Err(Error::Authentication("invalid hello response".into()));
+            }
+            if has_feature(&ok.features, FEATURE_REVOCATION) {
+                trust.apply_revocations(&ok.revocations, now)?;
+            }
+            Ok(ok)
+        }
+        Some("hello-reject") => Err(Error::protocol(
+            serde_json::from_value::<HelloReject>(value)?.message,
+        )),
+        _ => Err(Error::protocol("expected hello response")),
+    }
+}
+
 pub async fn accept_handshake(
     connection: &mut crate::Connection,
     local: PeerId,
-    trust: &TrustStore,
+    trust: &mut TrustStore,
 ) -> Result<HelloOk> {
     let remote = connection.peer_id();
     let (send, recv) = connection.control_mut();
@@ -1208,10 +1639,26 @@ pub async fn accept_handshake(
         tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
             .await
             .map_err(|_| Error::Timeout)??;
-    match check_hello(&hello, remote, trust.get(&remote).is_some()) {
+    let now = abra_core::now_ms();
+    let was_trusted = trust.get(&remote).is_some();
+    let mut checked = if trust.is_revoked_guest(&remote, now) {
+        Err(Error::authz("token revoked"))
+    } else {
+        check_hello(&hello, remote, was_trusted)
+    };
+    if checked.is_ok() && was_trusted {
+        trust.apply_revocations(&hello.revocations, now)?;
+        if trust.get(&remote).is_none() || trust.is_revoked_guest(&remote, now) {
+            checked = Err(Error::authz("token revoked"));
+        }
+    }
+    match checked {
         Ok(mut ok) => {
             ok.peer_id = local;
+            ok.revocations = negotiated_hello_revocations(trust, &hello.features, now);
             crate::write_frame(send, &ok).await?;
+            // Later responses must be gated by the dialer's advertised features.
+            ok.features = hello.features;
             Ok(ok)
         }
         Err(error) => {
@@ -1246,11 +1693,89 @@ pub async fn health_check(connection: &mut crate::Connection, now: u64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_NOW: u64 = 1_800_000_000_000;
+
+    fn scopes() -> Scopes {
+        Scopes {
+            capsules: vec!["*".into()],
+            kinds: vec!["*".into()],
+            send: true,
+            receive: true,
+            lease_acquire: false,
+            lease_takeover: false,
+        }
+    }
+
+    fn full_peer(identity: &Identity) -> TrustedPeer {
+        TrustedPeer {
+            peer_id: identity.peer_id(),
+            name: "issuer".into(),
+            role: Role::Full,
+            x25519_pk: [1; 32],
+            relay_key: None,
+            token_id: None,
+            scopes: None,
+            expires_at: None,
+            addresses: Vec::new(),
+        }
+    }
     #[test]
     fn time_roundtrip() {
         for n in [0, 1_800_000_000_000] {
             assert_eq!(parse_time(&format_time(n)).unwrap(), n)
         }
+    }
+    #[test]
+    fn unknown_feature_peer_receives_no_new_hello_fields() {
+        let identity = Identity::generate();
+        let hello = Hello {
+            message_type: "hello".into(),
+            wire: WIRE_VERSION,
+            spec: abra_core::SPEC.into(),
+            peer_id: identity.peer_id(),
+            name: "old-peer".into(),
+            features: vec!["resume".into(), "control".into()],
+            nonce: "00".repeat(16),
+            revocations: Vec::new(),
+        };
+        let hello_json = serde_json::to_value(&hello).unwrap();
+        assert!(hello_json.get("revocations").is_none());
+        let ok = check_hello(&hello, identity.peer_id(), true).unwrap();
+        let ok_json = serde_json::to_value(ok).unwrap();
+        assert!(ok_json.get("revocations").is_none());
+
+        let have = crate::Have {
+            message_type: "have".into(),
+            offer_id: "11".repeat(16),
+            have: Vec::new(),
+            resume: BTreeMap::new(),
+            eof: true,
+            skip_native: false,
+        };
+        assert!(serde_json::to_value(have)
+            .unwrap()
+            .get("skip_native")
+            .is_none());
+
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.disk.revocations.insert(
+            revocation_key(issuer.peer_id(), "token"),
+            StoredRevocation {
+                record: Revocation::sign("token".into(), guest.peer_id(), TEST_NOW, &issuer)
+                    .unwrap(),
+                relevant_until: format_time(TEST_NOW + 60_000),
+            },
+        );
+        assert!(negotiated_hello_revocations(&trust, &hello.features, TEST_NOW).is_empty());
+        let mut features = hello.features;
+        features.push(FEATURE_REVOCATION.into());
+        assert_eq!(
+            negotiated_hello_revocations(&trust, &features, TEST_NOW).len(),
+            1
+        );
     }
     #[test]
     fn strict_time_parser_never_panics_on_hostile_utf8_or_bad_calendar() {
@@ -1287,5 +1812,226 @@ mod tests {
         token.expires_at = "202\u{e9}-01-01T00:00:00.00Z".into();
         token.sig = issuer.sign("enroll", &unsigned(&token, "sig").unwrap());
         assert!(token.verify(1_800_000_000_000).is_err());
+    }
+
+    #[test]
+    fn stored_revocation_can_be_reverified_without_bind_certificate() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.insert(full_peer(&issuer)).unwrap();
+        let record = Revocation::sign("42".repeat(16), guest.peer_id(), TEST_NOW, &issuer).unwrap();
+        trust.disk.revocations.insert(
+            revocation_key(issuer.peer_id(), &record.token_id),
+            StoredRevocation {
+                record: record.clone(),
+                relevant_until: format_time(TEST_NOW + 60_000),
+            },
+        );
+        trust.save().unwrap();
+        trust.apply_revocations(&[record], TEST_NOW + 1).unwrap();
+        assert_eq!(trust.current_revocations(TEST_NOW + 1).len(), 1);
+    }
+
+    #[test]
+    fn revocation_matches_current_token_and_expires() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        let old_token = "42".repeat(16);
+        trust.disk.revocations.insert(
+            revocation_key(issuer.peer_id(), &old_token),
+            StoredRevocation {
+                record: Revocation::sign(old_token.clone(), guest.peer_id(), TEST_NOW, &issuer)
+                    .unwrap(),
+                relevant_until: format_time(TEST_NOW + 10),
+            },
+        );
+        trust.disk.peers.insert(
+            guest.peer_id(),
+            TrustedPeer {
+                peer_id: guest.peer_id(),
+                name: "guest".into(),
+                role: Role::Guest,
+                x25519_pk: [2; 32],
+                relay_key: None,
+                token_id: Some(old_token),
+                scopes: Some(scopes()),
+                expires_at: Some(format_time(TEST_NOW + 60_000)),
+                addresses: Vec::new(),
+            },
+        );
+        assert!(trust.is_revoked_guest(&guest.peer_id(), TEST_NOW));
+        assert!(!trust.is_revoked_guest(&guest.peer_id(), TEST_NOW + 11));
+        trust.disk.peers.get_mut(&guest.peer_id()).unwrap().token_id = Some("43".repeat(16));
+        assert!(!trust.is_revoked_guest(&guest.peer_id(), TEST_NOW));
+    }
+
+    #[test]
+    fn save_prunes_expired_revocations_and_certificates() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let now = abra_core::now_ms();
+        let record = Revocation::sign("42".repeat(16), guest.peer_id(), now, &issuer).unwrap();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.disk.revocations.insert(
+            revocation_key(issuer.peer_id(), &record.token_id),
+            StoredRevocation {
+                record,
+                relevant_until: format_time(now.saturating_sub(1)),
+            },
+        );
+        let certificate = BindCertificate::sign(
+            "43".repeat(16),
+            guest.peer_id(),
+            now.saturating_sub(2),
+            "g".into(),
+            [3; 32],
+            scopes(),
+            format_time(now.saturating_sub(1)),
+            &issuer,
+        )
+        .unwrap();
+        trust.disk.bind_certificates.insert(
+            guest.peer_id(),
+            StoredBindCertificate {
+                issuer: issuer.peer_id(),
+                certificate,
+            },
+        );
+        trust.save().unwrap();
+        let reopened = TrustStore::open(root.path()).unwrap();
+        assert!(reopened.disk.revocations.is_empty());
+        assert!(reopened.disk.bind_certificates.is_empty());
+    }
+
+    #[test]
+    fn certificate_lifetime_and_future_revocation_are_bounded() {
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let root = tempfile::tempdir().unwrap();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.insert(full_peer(&issuer)).unwrap();
+        let certificate = BindCertificate::sign(
+            "42".repeat(16),
+            guest.peer_id(),
+            TEST_NOW,
+            "g".into(),
+            [4; 32],
+            scopes(),
+            format_time(TEST_NOW + MAX_CERTIFICATE_LIFETIME_MS + 1),
+            &issuer,
+        )
+        .unwrap();
+        assert!(trust
+            .install_bind_certificate(issuer.peer_id(), certificate, TEST_NOW)
+            .is_err());
+
+        let future = Revocation::sign(
+            "43".repeat(16),
+            guest.peer_id(),
+            TEST_NOW + CLOCK_SKEW_MS + 1,
+            &issuer,
+        )
+        .unwrap();
+        assert!(future.verify_at(TEST_NOW).is_err());
+    }
+
+    #[test]
+    fn evicted_revocation_still_blocks_certificate_reinstall() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.insert(full_peer(&issuer)).unwrap();
+        let certificate = BindCertificate::sign(
+            "42".repeat(16),
+            guest.peer_id(),
+            TEST_NOW,
+            "g".into(),
+            [4; 32],
+            scopes(),
+            format_time(TEST_NOW + 60_000),
+            &issuer,
+        )
+        .unwrap();
+        trust
+            .install_bind_certificate(issuer.peer_id(), certificate.clone(), TEST_NOW)
+            .unwrap();
+        let record = Revocation::sign(
+            certificate.token_id.clone(),
+            guest.peer_id(),
+            TEST_NOW + 1,
+            &issuer,
+        )
+        .unwrap();
+        trust.apply_revocations(&[record], TEST_NOW + 1).unwrap();
+        trust.disk.revocations.clear();
+        trust.save().unwrap();
+
+        let mut reopened = TrustStore::open(root.path()).unwrap();
+        assert!(reopened
+            .install_bind_certificate(issuer.peer_id(), certificate, TEST_NOW + 2)
+            .is_err());
+    }
+
+    #[test]
+    fn current_revocations_prefers_newest_records() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        for index in 0..=MAX_REVOCATIONS_PER_MESSAGE {
+            let guest = Identity::generate();
+            let record = Revocation::sign(
+                format!("{index:032x}"),
+                guest.peer_id(),
+                TEST_NOW + index as u64,
+                &issuer,
+            )
+            .unwrap();
+            trust.disk.revocations.insert(
+                revocation_key(issuer.peer_id(), &record.token_id),
+                StoredRevocation {
+                    record,
+                    relevant_until: format_time(TEST_NOW + 60_000),
+                },
+            );
+        }
+        let records = trust.current_revocations(TEST_NOW);
+        assert_eq!(records.len(), MAX_REVOCATIONS_PER_MESSAGE);
+        assert_eq!(records[0].revoked_at, format_time(TEST_NOW + 128));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn persisted_observations_merge_relay_and_direct_address() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = Identity::generate();
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        let id = iroh::SecretKey::from_bytes(&[25; 32]).public();
+        let direct = serde_json::to_string(
+            &iroh::EndpointAddr::new(id).with_ip_addr("127.0.0.1:4242".parse().unwrap()),
+        )
+        .unwrap();
+        let relay = serde_json::to_string(
+            &iroh::EndpointAddr::new(id)
+                .with_relay_url("https://relay.example.test".parse().unwrap()),
+        )
+        .unwrap();
+        let mut trusted = full_peer(&peer);
+        trusted.addresses = vec![direct.clone()];
+        trust.insert(trusted).unwrap();
+        trust
+            .update_addresses(peer.peer_id(), vec![relay.clone()])
+            .unwrap();
+        let addresses = &trust.get(&peer.peer_id()).unwrap().addresses;
+        assert_eq!(addresses.len(), 1);
+        assert!(crate::transport::peer_address_has_direct_hint(
+            &addresses[0]
+        ));
+        assert!(crate::transport::peer_address_has_relay_hint(&addresses[0]));
     }
 }

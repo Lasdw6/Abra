@@ -69,7 +69,32 @@ function storageRestoreScript(originState) {
 }
 
 function idbRestoreScript(indexedDBState) {
-  return `(() => new Promise(async (resolve,reject) => { try { for(const d of ${JSON.stringify(indexedDBState?.databases || [])}) { await new Promise((ok,bad)=>{const r=indexedDB.open(d.name,d.version||1);r.onupgradeneeded=()=>{for(const s of d.stores)if(!r.result.objectStoreNames.contains(s.name))r.result.createObjectStore(s.name,{keyPath:s.keyPath??null,autoIncrement:!!s.autoIncrement})};r.onsuccess=async()=>{const db=r.result;try{for(const s of d.stores){if(!db.objectStoreNames.contains(s.name))continue;const tx=db.transaction(s.name,'readwrite'),store=tx.objectStore(s.name);for(const row of s.records||[]){if(store.keyPath==null)store.put(row.value,row.key);else store.put(row.value)}await new Promise((a,b)=>{tx.oncomplete=a;tx.onerror=()=>b(tx.error)})}db.close();ok()}catch(e){bad(e)}};r.onerror=()=>bad(r.error)}) } resolve(true) } catch(e){reject(e)} }))()`;
+  return `(() => new Promise(async (resolve,reject) => { try { for(const d of ${JSON.stringify(indexedDBState?.databases || [])}) { const create=db=>{for(const s of d.stores)if(!db.objectStoreNames.contains(s.name))db.createObjectStore(s.name,{keyPath:s.keyPath??null,autoIncrement:!!s.autoIncrement})};const open=version=>new Promise((ok,bad)=>{const r=version===undefined?indexedDB.open(d.name):indexedDB.open(d.name,version);r.onupgradeneeded=()=>create(r.result);r.onsuccess=()=>ok(r.result);r.onerror=()=>bad(r.error)});let db;try{db=await open(d.version||1)}catch(e){if(e?.name!=='VersionError')throw e;db=await open(undefined)}if(d.stores.some(s=>!db.objectStoreNames.contains(s.name))){const next=db.version+1;db.close();db=await open(next)}try{for(const s of d.stores){if(!db.objectStoreNames.contains(s.name))continue;const tx=db.transaction(s.name,'readwrite'),store=tx.objectStore(s.name);for(const row of s.records||[]){if(store.keyPath==null)store.put(row.value,row.key);else store.put(row.value)}await new Promise((a,b)=>{tx.oncomplete=a;tx.onerror=()=>b(tx.error)})}}finally{db.close()} } resolve(true) } catch(e){reject(e)} }))()`;
+}
+
+async function openBlankOrigin(cdp, sessionId, origin) {
+  const body = Buffer.from('<!doctype html><title>Abra import</title>').toString('base64');
+  let resolvePaused, rejectPaused;
+  const paused = new Promise((resolve, reject) => { resolvePaused = resolve; rejectPaused = reject; });
+  const timer = setTimeout(() => rejectPaused(new Error('origin bootstrap timed out')), 10000);
+  const off = cdp.on('Fetch.requestPaused', (params, eventSessionId) => {
+    if (eventSessionId && eventSessionId !== sessionId) return;
+    cdp.send('Fetch.fulfillRequest', {
+      requestId: params.requestId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }],
+      body
+    }, sessionId).then(resolvePaused, rejectPaused);
+  });
+  try {
+    await cdp.send('Fetch.enable', { patterns: [{ resourceType: 'Document', requestStage: 'Request' }] }, sessionId);
+    await Promise.all([cdp.send('Page.navigate', { url: origin }, sessionId), paused]);
+  } finally {
+    clearTimeout(timer);
+    off();
+    await cdp.send('Fetch.disable', {}, sessionId).catch(() => {});
+  }
+  await waitForLoad(cdp, sessionId);
 }
 
 export async function install(wsUrl, state, policy = {}, options = {}) {
@@ -80,10 +105,10 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
     if (filtered.cookies.length) await cdp.send('Storage.setCookies', { cookies: filtered.cookies.map(cookieForCdp), browserContextId });
     const targetByOrigin = new Map();
     for (const origin of filtered.origins) {
-      const targetId = (await cdp.send('Target.createTarget', { url: origin.origin, browserContextId, background: false })).targetId;
+      const targetId = (await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId, background: false })).targetId;
       targetByOrigin.set(origin.origin, targetId);
       const session = await attachPage(cdp, targetId);
-      await waitForLoad(cdp, session);
+      await openBlankOrigin(cdp, session, origin.origin);
       await evalValue(cdp, session, storageRestoreScript(origin));
       try { await evalValue(cdp, session, idbRestoreScript(origin.indexedDB)); } catch { /* best effort */ }
       await cdp.send('Page.reload', {}, session);

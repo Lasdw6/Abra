@@ -26,6 +26,8 @@ HOST_LOG="$RUN_ROOT/host-daemon.log"
 HOST_PID=""
 HOST_PID_B=""
 FRESH_PID=""
+RICH_IMAGE_TOOLS=null
+SECOND_DEVICE_NATIVE=null
 
 cleanup() {
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
@@ -92,7 +94,13 @@ if [[ "${ABRA_FC_E2E_REBUILD_IMAGE:-1}" == "1" ]]; then
   MUSL="$REPO_ROOT/target/x86_64-unknown-linux-musl/release"
   ROOTFS="$RUN_ROOT/rootfs-headless-abra.ext4"
   cp -f "$BASE_ROOTFS" "$ROOTFS"
-  sudo bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+  if [[ "${ABRA_FC_E2E_RICH_IMAGE:-0}" == "1" ]]; then
+    sudo -E bash "$REPO_ROOT/adapters/firecracker/guest/provision-rootfs.sh" \
+      "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+  else
+    sudo bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" \
+      "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+  fi
 fi
 
 UP_STARTED="$(now_ms)"
@@ -100,6 +108,25 @@ UP_STARTED="$(now_ms)"
 UP_MS="$(( $(now_ms) - UP_STARTED ))"
 GUEST_PEER="$(guest 'abra --root /var/lib/abra --json status' | jq -r .peer_id)"
 guest "test \"\$(stat -c '%U:%G:%a' /etc/abra/token)\" = root:root:600; ! grep -Fq 'abra.token=' /proc/cmdline"
+if [[ "${ABRA_FC_E2E_RICH_IMAGE:-0}" == "1" ]]; then
+  guest "node --version | grep -q '^v22\\.'; google-chrome --version >/dev/null; codex --version >/dev/null; command -v abra-browser >/dev/null"
+  guest "abra --root /var/lib/abra --json adapters list" | jq -e \
+    '.adapters[] | select(.manifest.name == "dev.abra.browser-session")' >/dev/null
+  guest 'set -eu
+    profile="$(mktemp -d /tmp/abra-rich-chrome.XXXXXX)"
+    bundle="$(mktemp -d /tmp/abra-rich-bundle.XXXXXX)"
+    chrome_pid=""
+    cleanup_rich() { [ -z "$chrome_pid" ] || kill "$chrome_pid" 2>/dev/null || true; rm -rf "$profile" "$bundle"; }
+    trap cleanup_rich EXIT
+    google-chrome --headless=new --no-sandbox --disable-dev-shm-usage --user-data-dir="$profile" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run about:blank >/tmp/abra-rich-chrome.log 2>&1 &
+    chrome_pid=$!
+    cdp=""
+    for _ in $(seq 1 200); do cdp="$(curl -fsS http://127.0.0.1:9222/json/version 2>/dev/null | jq -r .webSocketDebuggerUrl 2>/dev/null || true)"; [ -z "$cdp" ] || break; sleep .05; done
+    [ -n "$cdp" ]
+    abra-browser export "$cdp" --from cdp --out "$bundle" >/dev/null
+    jq -e '\''.kind == "dev.abra.browser.session.v1" and .source == "cdp"'\'' "$bundle/manifest.json" >/dev/null'
+  RICH_IMAGE_TOOLS='{"node_22":true,"google_chrome":true,"codex_cli":true,"browser_session_adapter":true,"chrome_cdp_export":true}'
+fi
 ! grep -FR -- "$TOKEN" "$RUN_ROOT/up.json" "$RUN_ROOT/firecracker/slots/0/firecracker.log" \
   "$RUN_ROOT/firecracker/slots/0/stdout.log" "$RUN_ROOT/firecracker/slots/0/stderr.log"
 wait_until "guest enrollment visible on host" host_has_peer
@@ -140,17 +167,22 @@ diff -q "$WORKSPACE/marker.txt" "$RECEIVED_B/marker.txt"
 grep -qx native-marker "$RECEIVED_B/native-marker.txt"
 test -s "$RECEIVED_B/.abra/recipes.json"
 
-# Matching host B receives the native child and restores it from its own CAS.
-"$ABRA" --root "$RUN_ROOT" send "$PEER_B" --capsule "$NATIVE_SNAPSHOT" >/dev/null
-wait_until "native snapshot at device B" log_has "$RUN_ROOT_B" "$CAPSULE" "$NATIVE_SNAPSHOT"
-"$ABRA_FC" --root "$RUN_ROOT" down --slot 0
-SECOND_NATIVE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT_B" --firecracker "$FC" --ssh-key "$KEY" restore \
-  --slot 0 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT" \
-  --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1)"
-[[ "$(jq -r .mode <<<"$SECOND_NATIVE_RESULT")" == native ]]
-guest "test -f /workspace/native-marker.txt; test -r /proc/$MARKER_PID/stat; test \"\$(awk '{print \$22}' /proc/$MARKER_PID/stat)\" = '$MARKER_START'"
-curl -sf --noproxy '*' http://172.30.0.2:8123/native-marker.txt | grep -qx native-marker
-"$ABRA_FC" --root "$RUN_ROOT_B" down --slot 0
+# A rich image makes the native disk object several GiB. The default minimal
+# run proves cross-device native transfer; rich runs exercise local native
+# restore plus portable transfers and report this large transfer as skipped.
+if [[ "${ABRA_FC_E2E_RICH_IMAGE:-0}" != "1" ]]; then
+  "$ABRA" --root "$RUN_ROOT" send "$PEER_B" --capsule "$NATIVE_SNAPSHOT" >/dev/null
+  wait_until "native snapshot at device B" log_has "$RUN_ROOT_B" "$CAPSULE" "$NATIVE_SNAPSHOT"
+  "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
+  SECOND_NATIVE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT_B" --firecracker "$FC" --ssh-key "$KEY" restore \
+    --slot 0 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT" \
+    --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1)"
+  [[ "$(jq -r .mode <<<"$SECOND_NATIVE_RESULT")" == native ]]
+  guest "test -f /workspace/native-marker.txt; test -r /proc/$MARKER_PID/stat; test \"\$(awk '{print \$22}' /proc/$MARKER_PID/stat)\" = '$MARKER_START'"
+  curl -sf --noproxy '*' http://172.30.0.2:8123/native-marker.txt | grep -qx native-marker
+  "$ABRA_FC" --root "$RUN_ROOT_B" down --slot 0
+  SECOND_DEVICE_NATIVE=true
+fi
 
 # A third empty root acts as a fresh compatible host. It receives the portable
 # parent, so native blobs are absent even though host A still owns them.
@@ -197,4 +229,6 @@ jq -n \
   --argjson total_ms "$(( $(now_ms) - STARTED ))" --argjson up_ms "$UP_MS" \
   --argjson snapshot_ms "$SNAPSHOT_MS" --argjson restore_ms "$RESTORE_MS" \
   --argjson native "$(jq -c .native "$MANIFEST")" \
-  '{ok:true,capsule:$capsule,portable_snapshot:$portable,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,second_device_transfer:true,second_device_files:true,second_device_recipes:true,native_transfer:true,second_root_native_restore:true,fresh_root_config:true,fresh_host_portable_fallback:true,zero_firecracker_processes:true,zero_taps:true}}' | tee "$REPORT"
+  --argjson rich_image_tools "$RICH_IMAGE_TOOLS" \
+  --argjson second_device_native "$SECOND_DEVICE_NATIVE" \
+  '{ok:true,capsule:$capsule,portable_snapshot:$portable,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,second_device_transfer:true,second_device_files:true,second_device_recipes:true,native_transfer:$second_device_native,second_root_native_restore:$second_device_native,fresh_root_config:true,fresh_host_portable_fallback:true,zero_firecracker_processes:true,zero_taps:true,rich_image_tools:$rich_image_tools}}' | tee "$REPORT"

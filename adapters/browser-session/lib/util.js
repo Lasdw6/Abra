@@ -93,7 +93,7 @@ function cookieAllowed(cookie, includes, excludes) {
 }
 export function filterState(state, includes = [], excludes = []) {
   includes = includes.map(normalizeHost); excludes = excludes.map(normalizeHost);
-  const originAllowed = origin => { try { const h = normalizeHost(new URL(origin).hostname); return !isPublicSuffix(h) && allowedDomain(h, includes, excludes); } catch { return false; } };
+  const originAllowed = origin => { try { const url = new URL(origin), h = normalizeHost(url.hostname); return ['http:','https:'].includes(url.protocol) && !isPublicSuffix(h) && allowedDomain(h, includes, excludes); } catch { return false; } };
   return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
 }
 

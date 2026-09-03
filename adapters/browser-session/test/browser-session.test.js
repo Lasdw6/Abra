@@ -32,9 +32,9 @@ async function adapterRequest(request) {
 test('domain policy is label-boundary based at both ends', () => {
   assert.equal(allowedDomain('a.example.com', ['example.com'], []), true);
   assert.equal(allowedDomain('badexample.com', ['example.com'], []), false);
-  const state = { cookies: [{ domain: '.example.com' }, { domain: 'blocked.test' }], origins: [{ origin: 'https://a.example.com' }, { origin: 'https://blocked.test' }], tabs: [] };
+  const state = { cookies: [{ domain: '.example.com' }, { domain: 'blocked.test' }], origins: [{ origin: 'https://a.example.com' }, { origin: 'https://blocked.test' }, { origin: 'ftp://a.example.com/file' }], tabs: [{ url: 'file:///tmp/secret' }] };
   const filtered = filterState(state, ['example.com', 'blocked.test'], ['blocked.test']);
-  assert.equal(filtered.cookies.length, 1); assert.equal(filtered.origins.length, 1);
+  assert.equal(filtered.cookies.length, 1); assert.equal(filtered.origins.length, 1); assert.equal(filtered.tabs.length, 0);
 });
 
 test('receiver policy closes URL, parent-domain, case, mismatch, IDN, and public-suffix bypasses', () => {
@@ -202,6 +202,37 @@ async function fixtureServer() {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { port: server.address().port, close: () => new Promise(resolve => server.close(resolve)) };
 }
+
+async function conflictingDatabaseServer() {
+  const server = createServer((req, res) => {
+    if (req.url === '/hold') {
+      setTimeout(() => { res.end('ok'); }, 300);
+      return;
+    }
+    res.setHeader('content-type', 'text/html');
+    res.end(`<!doctype html><title>conflict</title><script>indexedDB.open('abra-db',1)</script><img src="/hold">`);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { port: server.address().port, close: () => new Promise(resolve => server.close(resolve)) };
+}
+
+test('CDP import restores storage before origin scripts can create a conflicting database', { timeout: 30000 }, async t => {
+  if (skipChromeTest(t)) return;
+  const fixture = await conflictingDatabaseServer();
+  let browser;
+  try { browser = await chrome(); }
+  catch (error) { await fixture.close(); t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  t.after(async () => { await browser.close(); await fixture.close(); });
+  const origin = `http://127.0.0.1:${fixture.port}`;
+  const state = { cookies: [], origins: [{ origin, localStorage: [], sessionStorage: [], indexedDB: { databases: [{ name: 'abra-db', version: 1, stores: [{ name: 'things', keyPath: null, autoIncrement: false, records: [{ key: 'record', value: { restored: true } }] }] }] } }], tabs: [] };
+  const receipt = await install(browser.ws, state);
+  const cdp = await new CDP(browser.ws).connect();
+  const target = (await cdp.send('Target.getTargets')).targetInfos.find(x => x.browserContextId === receipt.browser_context_id && x.url.startsWith(origin));
+  const session = await attachPage(cdp, target.targetId); await waitForLoad(cdp, session);
+  assert.deepEqual(await evalValue(cdp, session, `new Promise((ok,bad)=>{const r=indexedDB.open('abra-db');r.onsuccess=()=>{const q=r.result.transaction('things').objectStore('things').get('record');q.onsuccess=()=>ok(q.result);q.onerror=()=>bad(q.error)}})`), { restored: true });
+  cdp.close();
+  await revoke(browser.ws, receipt.browser_context_id, receipt.origins);
+});
 
 test('CDP export/import, receiver deny, inspect secrecy, and revoke', { timeout: 60000 }, async t => {
   if (skipChromeTest(t)) return;

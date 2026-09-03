@@ -20,6 +20,55 @@ sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
 
 The installer adds `cadabra.service`, an observer, `/workspace`, the two
 binaries, and the `os-desktop-init.sh` PID 1 handoff named in the boot arguments.
+It does not install network packages.
+
+For an agent image, use `provision-rootfs.sh` instead. It grows images smaller
+than 4 GiB, installs Google Chrome, Node 22, and Codex CLI, then copies and
+registers the browser-session adapter:
+
+```sh
+sudo -E adapters/firecracker/guest/provision-rootfs.sh rootfs.ext4 \
+  target/x86_64-unknown-linux-musl/release/abra \
+  target/x86_64-unknown-linux-musl/release/cadabra
+```
+
+The package step needs outbound HTTPS and currently supports amd64 Debian or
+Ubuntu images. Set `ABRA_GUEST_ROOTFS_SIZE=6G` to choose another minimum image
+size. Set `ABRA_CODEX_PACKAGE=@openai/codex@<version>` to pin Codex. The default
+installs the current npm release.
+
+Treat the input rootfs, Abra binaries, and browser-session directory as trusted.
+The provisioner runs the image's shell and package maintainer scripts as root.
+It also installs packages from the NodeSource, Google, and npm repositories.
+Google publishes a stable full fingerprint for its active Linux package key, so
+the provisioner checks it. NodeSource's current setup script publishes a key URL
+but no stable full fingerprint for that current key; apt still verifies the
+repository metadata with the downloaded key.
+
+Provisioning starts the chroot with an empty environment and never copies a
+host home directory, npm config, Codex config, or browser profile. It installs
+the CLI but does not sign it in. Package scripts run with a reduced capability
+set that excludes host mount, device-node, raw-I/O, tracing, and network-admin
+rights. Authenticate after boot with `codex login` or
+pipe an API key to `codex login --with-api-key`; do not put credentials in the
+base image. The browser-session signing key is also created on first use inside
+the running guest.
+
+The guest exposes `abra-browser`. To capture a session, start a dedicated
+headless Chrome profile and export its CDP state through Abra:
+
+```sh
+google-chrome --headless=new --no-sandbox \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+  --user-data-dir=/var/lib/abra/agent-chrome about:blank >/tmp/chrome.log 2>&1 &
+CDP_URL="$(curl -fsS http://127.0.0.1:9222/json/version | \
+  node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).webSocketDebuggerUrl))')"
+abra --root /var/lib/abra send <peer> --kind dev.abra.browser.session.v1 \
+  --source "cdp:$CDP_URL"
+```
+
+`--no-sandbox` is needed when Chrome runs as root. Use a non-root guest user if
+the browser will open untrusted pages. CDP stays on loopback in this example.
 Before boot, the adapter injects the enrollment token into the private
 per-slot disk as root-owned `/etc/abra/token` mode `0600`. The service reads only
 that file. Tokens never appear in kernel arguments, adapter JSON, or Firecracker
@@ -133,4 +182,8 @@ E2B and other self-hosted orchestrators map directly onto this shim: allocate a
 slot, inject an enrollment token, call the same Firecracker endpoints listed
 above, and persist the resulting Abra snapshot id. Run the real-host proof with
 `adapters/firecracker/tests/e2e.sh`; it writes `e2e-report.json` with cold boot,
-capture, native restore, and total timings.
+capture, native restore, and total timings. Set `ABRA_FC_E2E_RICH_IMAGE=1` to
+provision and check the browser and agent tools as part of that run. Rich runs
+skip the cross-device native disk transfer because that object is several GiB;
+run the default minimal-image test for that check. Local native restore and
+cross-device portable transfer still run in both modes.

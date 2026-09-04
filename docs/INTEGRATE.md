@@ -61,7 +61,9 @@ $ abra accept --latest --kind dev.abra.workspace ./work
 `--latest` requires exactly one matching delivery. Pass a snapshot id instead
 when several match. With no unread inbox match, it falls back to a capsule
 `main` head of that kind sent by another peer, which is what the workspace
-quickstart relies on.
+quickstart relies on. Replacing an existing workspace keeps local edits unless
+you pass `--discard-local`, and refuses a snapshot that does not descend from
+the recorded one unless you pass `--allow-divergence`.
 
 ## Watch progress
 

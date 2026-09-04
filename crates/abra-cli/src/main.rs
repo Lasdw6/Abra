@@ -351,7 +351,9 @@ struct AcceptArgs {
     #[arg(long)]
     from: Option<String>,
     /// Replace the files of an existing workspace for the same capsule,
-    /// preserving its .abra directory.
+    /// preserving its .abra directory. Local edits since the recorded snapshot
+    /// require --discard-local; a snapshot that does not descend from it
+    /// requires --allow-divergence.
     #[arg(long)]
     replace: bool,
     /// Restore the workspace this delivery's provenance names into <dir>
@@ -363,6 +365,12 @@ struct AcceptArgs {
     /// Do not take the capsule lease while materializing a workspace.
     #[arg(long)]
     no_lease: bool,
+    /// Overwrite local workspace files that differ from the recorded snapshot.
+    #[arg(long)]
+    discard_local: bool,
+    /// Replace even when the incoming snapshot does not descend from the recorded one.
+    #[arg(long)]
+    allow_divergence: bool,
     #[arg(long)]
     destination: Option<String>,
     #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
@@ -533,7 +541,7 @@ async fn main() -> cadabra::Result<()> {
                 .adapter_options
                 .into_iter()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            json!({"op":"accept","id":args.id,"to":absolute,"replace":args.replace,"latest":args.latest,"kind":args.kind,"from":args.from,"workspace":workspace,"timeout_ms":args.timeout,"no_lease":args.no_lease,"destination":args.destination,"options":options})
+            json!({"op":"accept","id":args.id,"to":absolute,"replace":args.replace,"latest":args.latest,"kind":args.kind,"from":args.from,"workspace":workspace,"timeout_ms":args.timeout,"no_lease":args.no_lease,"discard_local":args.discard_local,"allow_divergence":args.allow_divergence,"destination":args.destination,"options":options})
         }
         Command::Handoffs { kind, peer } => json!({"op":"handoffs","kind":kind,"peer":peer}),
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
@@ -1285,6 +1293,21 @@ mod tests {
         assert!(Cli::try_parse_from(["abra", "accept", "id"]).is_err());
         assert!(Cli::try_parse_from(["abra", "accept", "id", "new"]).is_ok());
         assert!(Cli::try_parse_from(["abra", "accept", "id", "existing", "--replace"]).is_ok());
+        let parsed = Cli::try_parse_from([
+            "abra",
+            "accept",
+            "id",
+            "existing",
+            "--replace",
+            "--discard-local",
+            "--allow-divergence",
+        ])
+        .unwrap();
+        let Command::Accept(args) = parsed.command else {
+            panic!("expected accept");
+        };
+        assert!(args.discard_local);
+        assert!(args.allow_divergence);
     }
 
     #[test]

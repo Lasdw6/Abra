@@ -1954,6 +1954,8 @@ impl Daemon {
             .and_then(Value::as_bool)
             .unwrap_or_else(|| flag(request, "into"));
         let no_lease = flag(request, "no_lease");
+        let discard_local = flag(request, "discard_local");
+        let allow_divergence = flag(request, "allow_divergence");
         let workspace = request
             .get("workspace")
             .and_then(Value::as_str)
@@ -1961,6 +1963,7 @@ impl Daemon {
         let inbox_entry = self.locked_node().await?.store.inbox.get(&id).cloned();
         let mut linked_capsule = None;
         let mut remote_peer = None;
+        let mut imported = None;
         if let Some(entry) = inbox_entry {
             remote_peer = Some(entry.from.parse::<PeerId>()?);
             let raw = RawManifest::parse(entry.manifest)?;
@@ -1981,26 +1984,31 @@ impl Daemon {
                             dir,
                             wait_timeout(request),
                             no_lease,
+                            discard_local,
+                            allow_divergence,
                         )
                         .await?,
                     )
                 }
                 None => None,
             };
-            let outcome = self
+            match self
                 .import_partial(&raw, destination, workspace.as_deref(), request)
-                .await;
-            if let Err(error) = outcome {
-                if let Some(restore) = restore {
-                    let node = self.locked_node().await?;
-                    if let Err(rollback) = restore.apply(&self.root, &node.store.cas) {
-                        return Err(
-                            format!("{error}; workspace rollback failed: {rollback}").into()
-                        );
+                .await
+            {
+                Ok(import) => imported = import,
+                Err(error) => {
+                    if let Some(restore) = restore {
+                        let node = self.locked_node().await?;
+                        if let Err(rollback) = restore.apply(&self.root, &node.store.cas) {
+                            return Err(
+                                format!("{error}; workspace rollback failed: {rollback}").into()
+                            );
+                        }
+                        return Err(format!("{error}; workspace was restored").into());
                     }
-                    return Err(format!("{error}; workspace was restored").into());
+                    return Err(error);
                 }
-                return Err(error);
             }
             self.locked_node().await?.store.mark_inbox_read(id)?;
         } else {
@@ -2014,8 +2022,18 @@ impl Daemon {
                 if identity_path.exists() && read_capsule_id(destination)? != capsule_id {
                     return Err("destination belongs to a different capsule".into());
                 }
-                if replace && !no_lease {
-                    ensure_lease(&mut node, &self.root, capsule_id)?;
+                if replace {
+                    replacement_guards(
+                        &node,
+                        destination,
+                        id,
+                        capsule_id,
+                        discard_local,
+                        allow_divergence,
+                    )?;
+                    if !no_lease {
+                        ensure_lease(&mut node, &self.root, capsule_id)?;
+                    }
                 }
             }
             if let Some(files) = raw.manifest().files {
@@ -2039,6 +2057,9 @@ impl Daemon {
             }
         }
         let mut result = json!({"accepted":id,"to":destination,"replace":replace});
+        if let Some(import) = imported {
+            result["import"] = import;
+        }
         if let Some(dir) = workspace {
             record_event(
                 &self.root,
@@ -2051,13 +2072,14 @@ impl Daemon {
     }
 
     /// Materialize a partial's files and hand them to a registered importer.
+    /// Returns the adapter's `{result, deep_link?}` reply when one ran.
     async fn import_partial(
         &self,
         raw: &RawManifest,
         destination: &Path,
         workspace: Option<&Path>,
         request: &Value,
-    ) -> Result<()> {
+    ) -> Result<Option<Value>> {
         if let Some(files) = raw.manifest().files {
             let node = self.locked_node().await?;
             materialize(&node.store.cas, &files, destination)?;
@@ -2069,7 +2091,7 @@ impl Daemon {
             .for_kind(&raw.manifest().kind)
             .is_some_and(|adapter| adapter.supports("import"))
         {
-            return Ok(());
+            return Ok(None);
         }
         secure_adapter_tree(destination)?;
         let options = adapter_options(request)?;
@@ -2082,7 +2104,7 @@ impl Daemon {
         if let (Some(workspace), Some(object)) = (workspace, destination_value.as_object_mut()) {
             object.insert("workspace".into(), json!(workspace));
         }
-        registry
+        let import = registry
             .import_with_workspace(
                 &raw.manifest().kind,
                 Value::Object(raw.manifest().payload.clone()),
@@ -2100,7 +2122,7 @@ impl Daemon {
                 )
                 .into()
             })?;
-        Ok(())
+        Ok(Some(import))
     }
 
     /// Wait for the referenced full snapshot, then put that workspace on disk.
@@ -2112,6 +2134,8 @@ impl Daemon {
         workspace: &Path,
         timeout: Duration,
         no_lease: bool,
+        discard_local: bool,
+        allow_divergence: bool,
     ) -> Result<WorkspaceRestore> {
         validate_destination(workspace)?;
         let deadline = tokio::time::Instant::now() + timeout;
@@ -2150,6 +2174,14 @@ impl Daemon {
             if read_capsule_id(workspace)? != provenance.capsule_id {
                 return Err("workspace belongs to a different capsule".into());
             }
+            replacement_guards(
+                &node,
+                workspace,
+                provenance.snapshot_id,
+                provenance.capsule_id,
+                discard_local,
+                allow_divergence,
+            )?;
             WorkspaceRestore::Replace {
                 path: workspace.to_path_buf(),
                 capsule: provenance.capsule_id,
@@ -2393,22 +2425,25 @@ impl Daemon {
             validate_destination(&destination)?;
             // The same materialize-then-import path `accept` runs, so a grant
             // leaves the adapter's work done rather than only files on disk.
-            if let Err(error) = self
+            let import = match self
                 .import_partial(&raw, &destination, None, &json!({}))
                 .await
             {
-                record_grant_error(&self.root, entry.snapshot_id, &error.to_string())?;
-                continue;
-            }
+                Ok(import) => import,
+                Err(error) => {
+                    record_grant_error(&self.root, entry.snapshot_id, &error.to_string())?;
+                    continue;
+                }
+            };
             self.locked_node()
                 .await?
                 .store
                 .mark_inbox_read(entry.snapshot_id)?;
-            record_event(
-                &self.root,
-                "auto-accepted",
-                json!({"snapshot_id":entry.snapshot_id,"kind":raw.manifest().kind,"to":destination,"peer":from}),
-            )?;
+            let mut accepted = json!({"snapshot_id":entry.snapshot_id,"kind":raw.manifest().kind,"to":destination,"peer":from});
+            if let Some(import) = import {
+                accepted["import"] = import;
+            }
+            record_event(&self.root, "auto-accepted", accepted)?;
             self.forward_grant(grant, &raw, from).await?;
         }
         // Capsule heads are collected first: materializing and forwarding both
@@ -2457,7 +2492,10 @@ impl Daemon {
             let result = {
                 let node = self.locked_node().await?;
                 if destination.join(".abra/capsule_id").exists() {
-                    replace_workspace(&node.store.cas, files, &destination, capsule_id)
+                    replacement_guards(&node, &destination, head, capsule_id, false, false)
+                        .and_then(|()| {
+                            replace_workspace(&node.store.cas, files, &destination, capsule_id)
+                        })
                 } else {
                     materialize(&node.store.cas, &files, &destination).map_err(Into::into)
                 }
@@ -3019,6 +3057,46 @@ fn materialize_recipes(
         return Ok(());
     };
     write_metadata_file(destination, "recipes.json", &serde_json::to_vec(recipes)?)?;
+    Ok(())
+}
+
+fn replacement_guards(
+    node: &DeliveryNode,
+    destination: &Path,
+    incoming: Hash,
+    capsule: Hash,
+    discard_local: bool,
+    allow_divergence: bool,
+) -> Result<()> {
+    let recorded = match fs::read_to_string(destination.join(".abra/snapshot_id")) {
+        Ok(value) => value.trim().parse::<Hash>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(cap) = node.store.capsules.get(&capsule) else {
+        return Ok(());
+    };
+    if !discard_local {
+        // Skip when the recorded snapshot is not in the local store: nothing
+        // to compare against.
+        if let Some(files) = cap
+            .snapshot(&recorded)
+            .and_then(|record| record.raw.manifest().files)
+        {
+            if snapshot_dir(&node.store.cas, destination)? != files {
+                return Err(format!(
+                    "workspace has local changes since snapshot {recorded}; pass --discard-local to overwrite them"
+                )
+                .into());
+            }
+        }
+    }
+    if !allow_divergence && !cap.descends_from(incoming, recorded) {
+        return Err(format!(
+            "snapshot {incoming} does not descend from workspace snapshot {recorded}; pass --allow-divergence to replace anyway"
+        )
+        .into());
+    }
     Ok(())
 }
 

@@ -602,7 +602,20 @@ async fn invoke(
                 }
                 value
             }
-            "import" | "control" => value
+            "import" => {
+                let result = value
+                    .get("result")
+                    .cloned()
+                    .ok_or("adapter import response requires result")?;
+                let mut import = json!({"result": result});
+                if let Some(deep_link) = value.get("deep_link") {
+                    if !deep_link.is_null() {
+                        import["deep_link"] = deep_link.clone();
+                    }
+                }
+                import
+            }
+            "control" => value
                 .get("result")
                 .cloned()
                 .ok_or_else(|| format!("adapter {verb} response requires result"))?,

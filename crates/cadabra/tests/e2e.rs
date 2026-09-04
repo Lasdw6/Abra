@@ -268,7 +268,7 @@ async fn capsule_round_trip_and_replace_workspace() {
     );
     fs::write(b_workspace.join(".abra/capsule_id"), correct_capsule).unwrap();
     let replaced = b
-        .handle(json!({"op":"accept","id":third["snapshot_id"],"to":b_workspace,"replace":true}))
+        .handle(json!({"op":"accept","id":third["snapshot_id"],"to":b_workspace,"replace":true,"discard_local":true}))
         .await
         .unwrap();
     assert_eq!(replaced["replace"], true);
@@ -380,7 +380,6 @@ async fn full_snapshot_grant_materializes_and_updates_capsule_workspace() {
     })
     .await;
     fs::write(workspace.join("value"), "second").unwrap();
-    fs::write(destination.join("stale"), "old").unwrap();
     let second = a
         .handle(json!({"op":"snapshot","path":workspace}))
         .await
@@ -397,7 +396,6 @@ async fn full_snapshot_grant_materializes_and_updates_capsule_workspace() {
         .ok_or_else(|| "full grant update pending".into())
     })
     .await;
-    assert!(!destination.join("stale").exists());
     // The mirror leaves the lease with the driving peer.
     let lease = b
         .handle(json!({"op":"lease-status","capsule":capsule}))
@@ -1532,7 +1530,8 @@ printf '{"request_id":"%s","ok":false,"error":{"code":"internal","message":"no"}
             "kind":"com.test.session",
             "to":b_root.path().join("materialized"),
             "workspace":b_workspace,
-            "timeout_ms":30_000
+            "timeout_ms":30_000,
+            "discard_local":true
         }))
         .await
         .unwrap_err()
@@ -1648,7 +1647,7 @@ async fn sending_a_workspace_path_sends_the_capsule_snapshot_and_leases_follow_t
         .unwrap();
     assert_eq!(forked["forked"], true);
     // Replacing the workspace takes the lease back, so the next snapshot is a head.
-    a.handle(json!({"op":"accept","id":second["snapshot_id"],"to":workspace,"replace":true}))
+    a.handle(json!({"op":"accept","id":second["snapshot_id"],"to":workspace,"replace":true,"allow_divergence":true}))
         .await
         .unwrap();
     assert_eq!(fs::read_to_string(workspace.join("turn")).unwrap(), "b2");
@@ -2211,4 +2210,353 @@ async fn inspect_runs_the_verb_on_its_own() {
         .unwrap()
         .iter()
         .any(|event| event["event"] == "adapter-inspect" && event["blocked"] == json!(1)));
+}
+
+#[tokio::test]
+async fn accept_returns_the_adapter_import_result() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    a.handle(json!({"op":"adapters-add","dir":shell_adapter(
+        &a_root.path().join("export-adapter"),
+        "test.importresult",
+        "com.test.importresult",
+        &["export"],
+        EXPORT_BODY
+    )}))
+    .await
+    .unwrap();
+    b.handle(json!({"op":"adapters-add","dir":shell_adapter(
+        &b_root.path().join("import-adapter"),
+        "test.importresult",
+        "com.test.importresult",
+        &["import"],
+        r###"read line
+id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"request_id":"%s","ok":true,"result":{"context":"ctx-1"},"deep_link":"app://x"}\n' "$id"
+"###
+    )}))
+    .await
+    .unwrap();
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+
+    a.handle(json!({
+        "op":"send",
+        "peer":b.peer_id().await,
+        "kind":"com.test.importresult",
+        "source":"session-1",
+        "wait":true,
+        "timeout_ms":30_000
+    }))
+    .await
+    .unwrap();
+    let inbox = wait_for(|| async {
+        let rows = b
+            .handle(json!({"op":"inbox","kind":"com.test.importresult"}))
+            .await?;
+        (!rows.as_array().unwrap().is_empty())
+            .then_some(rows)
+            .ok_or_else(|| "delivery not in inbox".into())
+    })
+    .await;
+    let accepted = b
+        .handle(json!({
+            "op":"accept",
+            "id":inbox[0]["id"],
+            "to":b_root.path().join("materialized")
+        }))
+        .await
+        .unwrap();
+    assert_eq!(accepted["import"]["result"], json!({"context":"ctx-1"}));
+    assert_eq!(accepted["import"]["deep_link"], json!("app://x"));
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn replace_refuses_local_changes_unless_discard_local() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+
+    let workspace = a_root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "a1").unwrap();
+    let capsule = a
+        .handle(json!({"op":"capsule-create","path":workspace}))
+        .await
+        .unwrap()["capsule_id"]
+        .clone();
+    let first = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":first["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    let b_workspace = b_root.path().join("workspace");
+    b.handle(json!({"op":"accept","id":first["snapshot_id"],"to":b_workspace}))
+        .await
+        .unwrap();
+
+    fs::write(workspace.join("turn"), "a2").unwrap();
+    let second = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":second["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = b.handle(json!({"op":"log","capsule":capsule})).await?;
+        (log.as_array().unwrap().len() == 2)
+            .then_some(log)
+            .ok_or_else(|| "second snapshot pending".into())
+    })
+    .await;
+    fs::write(b_workspace.join("local"), "keep").unwrap();
+    let dirty = b
+        .handle(json!({"op":"accept","id":second["snapshot_id"],"to":b_workspace,"replace":true}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dirty.contains(&format!(
+            "workspace has local changes since snapshot {}; pass --discard-local to overwrite them",
+            first["snapshot_id"].as_str().unwrap()
+        )),
+        "{dirty}"
+    );
+    assert_eq!(
+        fs::read_to_string(b_workspace.join("local")).unwrap(),
+        "keep"
+    );
+    b.handle(json!({"op":"accept","id":second["snapshot_id"],"to":b_workspace,"replace":true,"discard_local":true}))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(b_workspace.join("turn")).unwrap(), "a2");
+    assert!(!b_workspace.join("local").exists());
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn replace_refuses_a_diverged_snapshot_unless_allow_divergence() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+
+    let workspace = a_root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "a1").unwrap();
+    a.handle(json!({"op":"capsule-create","path":workspace}))
+        .await
+        .unwrap();
+    let first = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":first["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    let b_workspace = b_root.path().join("workspace");
+    b.handle(json!({"op":"accept","id":first["snapshot_id"],"to":b_workspace}))
+        .await
+        .unwrap();
+    fs::write(workspace.join("turn"), "a2").unwrap();
+    let second = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":second["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = b
+            .handle(json!({"op":"log","capsule":first["capsule_id"]}))
+            .await?;
+        (log.as_array().unwrap().len() == 2)
+            .then_some(log)
+            .ok_or_else(|| "second snapshot pending".into())
+    })
+    .await;
+    b.handle(json!({"op":"accept","id":second["snapshot_id"],"to":b_workspace,"replace":true}))
+        .await
+        .unwrap();
+    let diverged = b
+        .handle(json!({"op":"accept","id":first["snapshot_id"],"to":b_workspace,"replace":true}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        diverged.contains(&format!(
+            "snapshot {} does not descend from workspace snapshot {}; pass --allow-divergence to replace anyway",
+            first["snapshot_id"].as_str().unwrap(),
+            second["snapshot_id"].as_str().unwrap()
+        )),
+        "{diverged}"
+    );
+    assert_eq!(fs::read_to_string(b_workspace.join("turn")).unwrap(), "a2");
+    b.handle(json!({"op":"accept","id":first["snapshot_id"],"to":b_workspace,"replace":true,"allow_divergence":true}))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(b_workspace.join("turn")).unwrap(), "a1");
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn replace_skips_guards_when_snapshot_id_is_absent() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+
+    let workspace = a_root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "a1").unwrap();
+    let capsule = a
+        .handle(json!({"op":"capsule-create","path":workspace}))
+        .await
+        .unwrap()["capsule_id"]
+        .clone();
+    let first = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":first["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    wait_for(|| async {
+        let log = b.handle(json!({"op":"log","capsule":capsule})).await?;
+        (!log.as_array().unwrap().is_empty())
+            .then_some(log)
+            .ok_or_else(|| "snapshot pending".into())
+    })
+    .await;
+    let dest = b_root.path().join("fresh");
+    fs::create_dir_all(dest.join(".abra")).unwrap();
+    fs::write(dest.join(".abra/capsule_id"), capsule.as_str().unwrap()).unwrap();
+    fs::write(dest.join("extra"), "local").unwrap();
+    b.handle(json!({"op":"accept","id":first["snapshot_id"],"to":dest,"replace":true}))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(dest.join("turn")).unwrap(), "a1");
+    assert!(!dest.join("extra").exists());
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
+async fn linked_accept_refuses_a_dirty_workspace() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    a.handle(json!({"op":"adapters-add","dir":shell_adapter(
+        &a_root.path().join("export-adapter"),
+        "test.session",
+        "com.test.session",
+        &["export"],
+        EXPORT_BODY
+    )}))
+    .await
+    .unwrap();
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+
+    let workspace = a_root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "a1").unwrap();
+    let first = a
+        .handle(json!({"op":"capsule-create","path":workspace}))
+        .await
+        .unwrap();
+    let snapshot = a
+        .handle(json!({"op":"snapshot","path":workspace}))
+        .await
+        .unwrap();
+    a.handle(json!({"op":"send","peer":b.peer_id().await,"snapshot_id":snapshot["snapshot_id"],"wait":true,"timeout_ms":30_000}))
+        .await
+        .unwrap();
+    let b_workspace = b_root.path().join("received-workspace");
+    b.handle(json!({"op":"accept","id":snapshot["snapshot_id"],"to":b_workspace}))
+        .await
+        .unwrap();
+    fs::write(b_workspace.join("local-only"), "keep me").unwrap();
+
+    a.handle(json!({
+        "op":"send",
+        "peer":b.peer_id().await,
+        "kind":"com.test.session",
+        "source":"session-1",
+        "workspace":workspace,
+        "wait":true,
+        "timeout_ms":30_000
+    }))
+    .await
+    .unwrap();
+    wait_for(|| async {
+        let rows = b
+            .handle(json!({"op":"inbox","kind":"com.test.session"}))
+            .await?;
+        (!rows.as_array().unwrap().is_empty())
+            .then_some(rows)
+            .ok_or_else(|| "handoff not delivered".into())
+    })
+    .await;
+    let error = b
+        .handle(json!({
+            "op":"accept",
+            "latest":true,
+            "kind":"com.test.session",
+            "to":b_root.path().join("materialized"),
+            "workspace":b_workspace,
+            "timeout_ms":30_000
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "workspace has local changes since snapshot {}; pass --discard-local to overwrite them",
+            snapshot["snapshot_id"].as_str().unwrap()
+        )),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(b_workspace.join("local-only")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(
+        fs::read_to_string(b_workspace.join(".abra/capsule_id")).unwrap(),
+        first["capsule_id"].as_str().unwrap()
+    );
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
 }

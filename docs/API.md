@@ -45,7 +45,7 @@ Operations and request fields:
 | `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | list returns `{adapters:[...],errors:[...]}`; add/remove return the registration change |
 | `inspect` | `kind`, `source`, `options?` | `{summary?,warnings:[...],blocked:[...]}` from the adapter |
 | `inbox` | `kind?`, `from?`, `wait?`, `timeout_ms?` | partial floor cards, read state, and `provenance` |
-| `accept` | `to`; `id` or `latest:true` + `kind`; optional `from`, `replace`, `workspace`, `timeout_ms`, `no_lease`, `destination`, `options`; legacy `into` aliases `replace` | materializes, imports, marks read, and returns `replace` |
+| `accept` | `to`; `id` or `latest:true` + `kind`; optional `from`, `replace`, `workspace`, `timeout_ms`, `no_lease`, `discard_local`, `allow_divergence`, `destination`, `options`; legacy `into` aliases `replace` | materializes, imports, marks read, and returns `replace` plus `import` (`{result, deep_link?}`) when an adapter ran |
 | `handoffs` | `kind?`, `peer?` | rows shaped `{kind,last_acked_send,last_pending_send,last_unread_receive,last_read_receive,capsule}`; missing values are `null` |
 | `log` | `capsule?` | capsule snapshot history |
 | `capsules` | none | capsule ids, kinds, titles, and current main/fork heads |
@@ -78,9 +78,12 @@ CLI resolves them in the caller's working directory before making the request;
 Adapter `source` and `destination` values parse as JSON only when they are JSON
 objects; all other values stay strings. Adapter options are string maps. `to`
 always names the materialization directory. The CLI form is
-`abra accept <id> <path> [--replace]`, where `--replace` sets `replace` and
-replaces the files in an existing workspace only when `.abra/capsule_id`
-matches; it preserves `.abra` and overwrites local file changes. `<id>` is
+`abra accept <id> <path> [--replace] [--discard-local] [--allow-divergence]`,
+where `--replace` sets `replace` and replaces the files in an existing
+workspace only when `.abra/capsule_id` matches; it preserves `.abra`. Local
+files that differ from the recorded `.abra/snapshot_id` are refused unless
+`--discard-local` is set. An incoming snapshot that does not descend from that
+recorded snapshot is refused unless `--allow-divergence` is set. `<id>` is
 optional when `--latest --kind <k>` is given. When the inbox has no unread
 match of that kind, `--latest` falls back to a capsule `main` head of that
 kind authored by another peer.
@@ -125,11 +128,13 @@ must carry `provenance` or it is an error. The daemon waits (`--timeout`,
 default 120s) for the referenced snapshot to reach the local capsule store,
 because the two deliveries are independent. It materializes the snapshot into
 `<dir>`, either as a fresh directory or by using `--replace` on an existing
-directory whose `.abra/capsule_id` matches. It writes `.abra` metadata, then
+directory whose `.abra/capsule_id` matches. The same dirty and ancestry guards
+as `accept --replace` apply (`--discard-local`, `--allow-divergence`). It writes `.abra` metadata, then
 takes the lease. It runs the partial's adapter import last. When `--destination` is a JSON
 object, the daemon inserts `workspace:<dir>` into it so the adapter can find the
 restored tree. Any failure after the workspace was replaced restores the
-previous contents, and the inbox entry stays unread.
+previous contents, and the inbox entry stays unread. The accept result includes
+the adapter's `{result, deep_link?}` under `import` when one ran.
 
 `snapshot`, `accept --replace`, and linked accept take the capsule lease on a
 full peer unless `--no-lease` is set. Linked accept takes it after materialization
@@ -201,7 +206,7 @@ Every event record has `event` and `at`.
 | `adapter-inspect` | `kind`, warning count in `warnings`, blocked count in `blocked` |
 | `send-acked` | `outbox_id`, `snapshot_id`, `peer` |
 | `linked-accept` | `snapshot_id`, `capsule_id`, `workspace`, `peer` |
-| `auto-accepted` | `snapshot_id`, `kind`, `to`, `peer`; full snapshots also have `capsule_id` |
+| `auto-accepted` | `snapshot_id`, `kind`, `to`, `peer`; full snapshots also have `capsule_id`; an adapter import adds `import` |
 | `auto-forwarded` | `capsule_id`, `snapshot_id`, `peer`, `outbox_id` |
 | `auto-forward-skipped` | `snapshot_id`, `peer`, `reason`; the target was the delivering peer or origin, or that snapshot was already forwarded there |
 | `auto-accepted-full` | `capsule_id`, `snapshot_id`, `to`, `peer` |
@@ -255,18 +260,23 @@ expired, mismatched, and invalid certificates leave the origin untrusted. Offer
 rejections preserve a bounded receiver reason in the sender's outbox
 `last_error`.
 
-`accept` runs a matching adapter before it marks the inbox entry read. If the
-adapter starts and then fails, Abra keeps the entry unread and returns an error
-with `files_materialized_at=<path>`, where `<path>` is the accept path. The
-files remain there so the user can inspect or recover the partial import.
+`accept` runs a matching adapter before it marks the inbox entry read. The
+result includes the adapter's `{result, deep_link?}` under `import` when one
+ran. If the adapter starts and then fails, Abra keeps the entry unread and
+returns an error with `files_materialized_at=<path>`, where `<path>` is the
+accept path. The files remain there so the user can inspect or recover the
+partial import.
 
 `abra policy clear` empties `policy/grant-errors.json`, removing saved
 auto-accept errors.
 
 `policy-grant` with `auto_accept:true` requires `to`. It materializes a matching
 partial and runs its importer before marking it read. It also materializes full
-snapshots below `to`. With `forward`, the daemon then enqueues the same signed
-snapshot to that peer and records `auto-forwarded`.
+snapshots below `to`. A matching `.abra/capsule_id` is replaced only when the
+tree still matches the recorded snapshot and the incoming snapshot descends from
+it; otherwise the grant records an error and leaves the files alone. With
+`forward`, the daemon then enqueues the same signed snapshot to that peer and
+records `auto-forwarded`.
 
 Direct delivery streams CAS objects above 8 MiB in 1 MiB chunks. Smaller objects
 keep the single-stream path. Ordinary blobs and trees are limited to 256 MiB

@@ -481,7 +481,7 @@ impl Capsule {
         Ok(wins)
     }
 
-    fn descends_from(&self, candidate: Hash, ancestor: Hash) -> bool {
+    pub fn descends_from(&self, candidate: Hash, ancestor: Hash) -> bool {
         let mut pending = vec![candidate];
         let mut seen = BTreeSet::new();
         while let Some(id) = pending.pop() {

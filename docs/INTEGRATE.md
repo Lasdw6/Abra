@@ -1,6 +1,7 @@
 # Add Abra to your sandbox
 
 This path builds one binary, pairs two devices, and adds an adapter.
+For live sandbox checks, see the [provider tests](../tests/providers/README.md).
 
 ## Install one binary
 

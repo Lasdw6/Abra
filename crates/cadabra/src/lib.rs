@@ -44,6 +44,8 @@ use tokio::{
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const MAX_CONTROL_LINE: u64 = 1024 * 1024;
+const MAX_OBSERVED_READ: u64 = 1024 * 1024;
+const MAX_OBSERVED_EXTENSION: usize = 256 * 1024;
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONTROL_CLIENTS: usize = 64;
 
@@ -1229,11 +1231,25 @@ impl Daemon {
         let path = PathBuf::from(required_str(request, "path")?);
         let label = request.get("label").and_then(Value::as_str);
         let no_lease = flag(request, "no_lease");
+        let barrier = request
+            .get("observation_barrier")
+            .filter(|value| !value.is_null())
+            .map(|value| value.as_str().ok_or("observation_barrier must be a string"))
+            .transpose()?;
         let snapshot = self
-            .snapshot_workspace(&path, label, no_lease, false)
+            .snapshot_workspace(
+                &path,
+                label,
+                no_lease,
+                false,
+                barrier,
+                request
+                    .get("observation_host")
+                    .filter(|value| !value.is_null()),
+            )
             .await?;
         Ok(
-            json!({"capsule_id":snapshot.capsule_id,"snapshot_id":snapshot.snapshot_id,"forked":snapshot.forked}),
+            json!({"capsule_id":snapshot.capsule_id,"snapshot_id":snapshot.snapshot_id,"forked":snapshot.forked,"observation_barrier":request.get("observation_barrier")}),
         )
     }
 
@@ -1247,6 +1263,8 @@ impl Daemon {
         label: Option<&str>,
         no_lease: bool,
         initialize: bool,
+        observation_barrier: Option<&str>,
+        observation_host: Option<&Value>,
     ) -> Result<WorkspaceSnapshot> {
         if !path.is_absolute() {
             return Err("snapshot path must be absolute".into());
@@ -1259,6 +1277,15 @@ impl Daemon {
         if !no_lease {
             ensure_lease(&mut node, &self.root, capsule)?;
         }
+        // Read the selected ledger before walking a potentially large file tree.
+        let mut observation =
+            base_manifest(&node, Scope::Full, "dev.abra.workspace", "observation");
+        load_workspace_observation(
+            path,
+            &mut observation,
+            observation_barrier,
+            observation_host,
+        )?;
         let files = snapshot_dir(&node.store.cas, path)?;
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
         let parents = cap
@@ -1286,11 +1313,8 @@ impl Daemon {
         manifest.capsule_id = Some(capsule);
         manifest.parents = Some(parents);
         manifest.files = Some(files);
-        let recipes_path = path.join(".abra/recipes.json");
-        if recipes_path.is_file() {
-            let recipes: Vec<Recipe> = serde_json::from_slice(&fs::read(&recipes_path)?)?;
-            manifest.recipes = Some(recipes);
-        }
+        manifest.recipes = observation.recipes;
+        manifest.extensions = observation.extensions;
         manifest.payload = payload;
         if let Some(label) = label {
             manifest.labels = Some(vec![abra_core::manifest::Label {
@@ -1492,7 +1516,7 @@ impl Daemon {
         // first so the receiver can resolve the partial's provenance.
         let linked = match &workspace {
             Some(dir) => Some(
-                self.snapshot_workspace(dir, Some("handoff"), no_lease, true)
+                self.snapshot_workspace(dir, Some("handoff"), no_lease, true, None, None)
                     .await?,
             ),
             None => None,
@@ -1500,7 +1524,7 @@ impl Daemon {
         // `--path` on an initialized workspace sends the capsule snapshot.
         let path_workspace = match request.get("path").and_then(Value::as_str) {
             Some(path) if is_workspace_dir(Path::new(path)) => Some(
-                self.snapshot_workspace(Path::new(path), None, no_lease, false)
+                self.snapshot_workspace(Path::new(path), None, no_lease, false, None, None)
                     .await?,
             ),
             _ => None,
@@ -2050,7 +2074,7 @@ impl Daemon {
                     materialize(&node.store.cas, &files, destination)?;
                 }
             }
-            materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
+            materialize_recipes(destination, raw.manifest())?;
             if let Some(capsule_id) = raw.manifest().capsule_id {
                 write_workspace_metadata(destination, capsule_id, id)?;
                 record_workspace(&self.root, capsule_id, destination, Some(id))?;
@@ -2084,7 +2108,7 @@ impl Daemon {
             let node = self.locked_node().await?;
             materialize(&node.store.cas, &files, destination)?;
         }
-        materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
+        materialize_recipes(destination, raw.manifest())?;
         let registry = self.registry()?;
         // The adapter runs unlocked: an import may take minutes.
         if !registry
@@ -2203,7 +2227,7 @@ impl Daemon {
         } else {
             materialize(&node.store.cas, &files, workspace)?;
         }
-        materialize_recipes(workspace, raw.manifest().recipes.as_ref())?;
+        materialize_recipes(workspace, raw.manifest())?;
         write_workspace_metadata(workspace, provenance.capsule_id, provenance.snapshot_id)?;
         record_workspace(
             &self.root,
@@ -3049,14 +3073,125 @@ fn adapter_options(request: &Value) -> Result<BTreeMap<String, String>> {
         .map_err(Into::into)
 }
 
-fn materialize_recipes(
-    destination: &Path,
-    recipes: Option<&Vec<abra_core::manifest::Recipe>>,
+fn valid_observation_barrier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn load_workspace_observation(
+    path: &Path,
+    manifest: &mut Manifest,
+    barrier: Option<&str>,
+    host: Option<&Value>,
 ) -> Result<()> {
-    let Some(recipes) = recipes else {
-        return Ok(());
+    if host.is_some() && barrier.is_none() {
+        return Err("observation_host requires observation_barrier".into());
+    }
+    let filename = match barrier {
+        Some(id) if valid_observation_barrier(id) => format!("observed-{id}.json"),
+        Some(_) => return Err("invalid observation barrier: use 1 to 64 ASCII letters, digits, underscores or hyphens".into()),
+        None => "observed.json".into(),
     };
-    write_metadata_file(destination, "recipes.json", &serde_json::to_vec(recipes)?)?;
+    let observed_path = path.join(".abra").join(&filename);
+    if barrier.is_some() || fs::symlink_metadata(&observed_path).is_ok() {
+        let mut bytes = Vec::new();
+        open_metadata_file(path, &filename)?
+            .take(MAX_OBSERVED_READ + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_OBSERVED_READ {
+            return Err("observed.json exceeds 1 MiB".into());
+        }
+        let mut observed = serde_json::from_slice::<Value>(&bytes)?
+            .as_object()
+            .cloned()
+            .ok_or("observed.json must be a JSON object")?;
+        if let Some(id) = barrier {
+            if observed.get("schema").and_then(Value::as_str) != Some("dev.abra.observed/3")
+                || observed
+                    .get("observer")
+                    .and_then(|o| o.get("version"))
+                    .and_then(Value::as_u64)
+                    != Some(3)
+                || observed["observer"]["mode"].as_str() != Some("once")
+                || observed["observer"]["barrier"].as_str() != Some(id)
+            {
+                return Err("observer capture schema, mode or barrier mismatch".into());
+            }
+            let start = observed["observer"]["capture_started_at"]
+                .as_str()
+                .ok_or("observer capture lacks start time")?;
+            let end = observed["observer"]["capture_finished_at"]
+                .as_str()
+                .ok_or("observer capture lacks finish time")?;
+            if abra_net::parse_time(start)? > abra_net::parse_time(end)? {
+                return Err("observer capture ends before it starts".into());
+            }
+        }
+        if let Some(host) = host {
+            if !host.is_object() || serde_json::to_vec(host)?.len() > 16 * 1024 {
+                return Err("observation_host must be an object of at most 16 KiB".into());
+            }
+            observed.insert(
+                "host".into(),
+                json!({"source":"host-adapter", "facts":host}),
+            );
+        }
+        let recipes: Vec<Recipe> = serde_json::from_value(
+            observed
+                .remove("recipes")
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?;
+        if !recipes.is_empty() {
+            manifest.recipes = Some(recipes);
+        }
+        if serde_json::to_vec(&observed)?.len() <= MAX_OBSERVED_EXTENSION {
+            manifest
+                .extensions
+                .get_or_insert_with(Map::new)
+                .insert("dev.abra.observed".into(), Value::Object(observed));
+        } else if barrier.is_some() {
+            return Err("checkpoint observation exceeds 256 KiB".into());
+        } else {
+            eprintln!(
+                "cadabra: WARNING: observed.json ledger exceeds 256 KiB; embedding recipes only"
+            );
+        }
+        return Ok(());
+    }
+
+    let recipes_path = path.join(".abra/recipes.json");
+    if recipes_path.is_file() {
+        let recipes: Vec<Recipe> = serde_json::from_slice(&fs::read(&recipes_path)?)?;
+        manifest.recipes = Some(recipes);
+    }
+    Ok(())
+}
+
+fn materialize_recipes(destination: &Path, manifest: &Manifest) -> Result<()> {
+    if let Some(recipes) = &manifest.recipes {
+        write_metadata_file(destination, "recipes.json", &serde_json::to_vec(recipes)?)?;
+    } else if manifest
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.contains_key("dev.abra.observed"))
+    {
+        // A capture with no complete recipe must not leave a previous recipe runnable.
+        write_metadata_file(destination, "recipes.json", b"[]")?;
+    }
+    if let Some(observed) = manifest
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("dev.abra.observed"))
+    {
+        write_metadata_file(
+            destination,
+            "received-observed.json",
+            &serde_json::to_vec(observed)?,
+        )?;
+    }
     Ok(())
 }
 
@@ -3449,6 +3584,7 @@ fn open_metadata_file(destination: &Path, name: &str) -> Result<File> {
 #[cfg(unix)]
 fn write_metadata_file(destination: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     use rustix::fs::{openat, Mode, OFlags};
+    use std::os::unix::fs::PermissionsExt;
     let directory = open_metadata_dir(destination, true)?;
     let mut file = File::from(openat(
         directory,
@@ -3456,6 +3592,7 @@ fn write_metadata_file(destination: &Path, name: &str, bytes: &[u8]) -> Result<(
         OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?);
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -3569,6 +3706,244 @@ pub async fn control_call(root: impl AsRef<Path>, request: &Value) -> Result<Val
 mod tests {
     use super::*;
     use abra_core::cas::{BlobStore, EntryMode, Tree, TreeEntry};
+
+    fn observation_manifest(root: &Path) -> Manifest {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let node = DeliveryNode::open(root).unwrap();
+        base_manifest(&node, Scope::Full, "dev.abra.workspace", "workspace")
+    }
+
+    fn recipe_json() -> Value {
+        json!({"argv":["python3","-m","http.server","8123"],"cwd":".","ports":[8123]})
+    }
+
+    fn checkpoint_ledger(barrier: &str) -> Value {
+        json!({"schema":"dev.abra.observed/3", "observer":{
+            "version":3, "mode":"once", "barrier":barrier,
+            "capture_started_at":"2026-09-04T00:00:00.000Z",
+            "capture_finished_at":"2026-09-04T00:00:01.000Z"
+        }, "service_candidates":[{"restartability":"blocked"}], "recipes":[]})
+    }
+
+    #[test]
+    fn checkpoint_uses_selected_capture_despite_periodic_updates() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".abra")).unwrap();
+        fs::write(
+            root.path().join(".abra/observed-chosen.json"),
+            serde_json::to_vec(&checkpoint_ledger("chosen")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".abra/observed.json"),
+            b"invalid live data",
+        )
+        .unwrap();
+        let mut manifest = observation_manifest(root.path());
+        let host = json!({"configured_resources":{"cpus":2}});
+        load_workspace_observation(root.path(), &mut manifest, Some("chosen"), Some(&host))
+            .unwrap();
+        let observed = &manifest.extensions.as_ref().unwrap()["dev.abra.observed"];
+        assert_eq!(observed["observer"]["barrier"], "chosen");
+        assert_eq!(observed["host"]["facts"], host);
+        assert_eq!(
+            observed["service_candidates"][0]["restartability"],
+            "blocked"
+        );
+        assert!(manifest.recipes.is_none());
+    }
+
+    #[test]
+    fn checkpoint_rejects_missing_mismatched_and_invalid_captures() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".abra")).unwrap();
+        fs::write(
+            root.path().join(".abra/observed.json"),
+            serde_json::to_vec(&checkpoint_ledger("chosen")).unwrap(),
+        )
+        .unwrap();
+        let mut manifest = observation_manifest(root.path());
+        for id in ["chosen", "../observed", "", "é", "invalid/name"] {
+            assert!(
+                load_workspace_observation(root.path(), &mut manifest, Some(id), None).is_err()
+            );
+        }
+        let path = root.path().join(".abra/observed-chosen.json");
+        for (field, value) in [
+            ("barrier", json!("wrong")),
+            ("mode", json!("periodic")),
+            ("version", json!(2)),
+            ("capture_finished_at", json!("2025-01-01T00:00:00.000Z")),
+        ] {
+            let mut ledger = checkpoint_ledger("chosen");
+            ledger["observer"][field] = value;
+            fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+            assert!(
+                load_workspace_observation(root.path(), &mut manifest, Some("chosen"), None)
+                    .is_err()
+            );
+        }
+        let mut ledger = checkpoint_ledger("chosen");
+        ledger["padding"] = json!("x".repeat(MAX_OBSERVED_EXTENSION));
+        fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(
+            load_workspace_observation(root.path(), &mut manifest, Some("chosen"), None).is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_refuses_symlink_and_clears_stale_received_recipes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".abra")).unwrap();
+        let mut manifest = observation_manifest(root.path());
+        #[cfg(unix)]
+        {
+            let target = root.path().join("ledger.json");
+            fs::write(
+                &target,
+                serde_json::to_vec(&checkpoint_ledger("chosen")).unwrap(),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&target, root.path().join(".abra/observed-chosen.json"))
+                .unwrap();
+            assert!(
+                load_workspace_observation(root.path(), &mut manifest, Some("chosen"), None)
+                    .is_err()
+            );
+        }
+        manifest.extensions = Some(Map::from_iter([(
+            "dev.abra.observed".into(),
+            checkpoint_ledger("chosen"),
+        )]));
+        fs::write(
+            root.path().join(".abra/recipes.json"),
+            serde_json::to_vec(&json!([recipe_json()])).unwrap(),
+        )
+        .unwrap();
+        materialize_recipes(root.path(), &manifest).unwrap();
+        assert_eq!(
+            fs::read(root.path().join(".abra/recipes.json")).unwrap(),
+            b"[]"
+        );
+    }
+
+    #[test]
+    fn observed_json_adds_recipes_and_ledger_extension() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".abra")).unwrap();
+        fs::write(
+            root.path().join(".abra/observed.json"),
+            serde_json::to_vec(&json!({
+                "observer":{"version":2},
+                "platform":{"arch":"x86_64"},
+                "recipes":[recipe_json()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manifest = observation_manifest(root.path());
+
+        load_workspace_observation(root.path(), &mut manifest, None, None).unwrap();
+
+        assert_eq!(manifest.recipes.as_ref().unwrap()[0].ports, vec![8123]);
+        let observed = &manifest.extensions.as_ref().unwrap()["dev.abra.observed"];
+        assert_eq!(observed["observer"]["version"], 2);
+        assert!(observed.get("recipes").is_none());
+
+        let node = DeliveryNode::open(root.path()).unwrap();
+        manifest.capsule_id = Some(Hash::from_bytes([1; 32]));
+        manifest.parents = Some(Vec::new());
+        manifest.files = Some(
+            node.store
+                .cas
+                .put_tree(&Tree::new(Vec::new()).unwrap())
+                .unwrap(),
+        );
+        manifest.sign(&node.store.keys.identity).unwrap();
+        let raw = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(
+            raw.manifest().extensions.as_ref().unwrap()["dev.abra.observed"]["platform"]["arch"],
+            "x86_64"
+        );
+    }
+
+    #[test]
+    fn recipes_json_is_the_observer_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".abra")).unwrap();
+        fs::write(
+            root.path().join(".abra/recipes.json"),
+            serde_json::to_vec(&json!([recipe_json()])).unwrap(),
+        )
+        .unwrap();
+        let mut manifest = observation_manifest(root.path());
+
+        load_workspace_observation(root.path(), &mut manifest, None, None).unwrap();
+
+        assert_eq!(manifest.recipes.unwrap()[0].ports, vec![8123]);
+        assert!(manifest.extensions.is_none());
+    }
+
+    #[test]
+    fn oversized_observed_ledger_keeps_recipes_only() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".abra")).unwrap();
+        fs::write(
+            root.path().join(".abra/observed.json"),
+            serde_json::to_vec(&json!({
+                "platform":{"padding":"x".repeat(MAX_OBSERVED_EXTENSION + 1)},
+                "recipes":[recipe_json()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manifest = observation_manifest(root.path());
+
+        load_workspace_observation(root.path(), &mut manifest, None, None).unwrap();
+
+        assert_eq!(manifest.recipes.unwrap()[0].ports, vec![8123]);
+        assert!(manifest.extensions.is_none());
+    }
+
+    #[test]
+    fn materialize_writes_received_recipes_and_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manifest = observation_manifest(root.path());
+        manifest.recipes = Some(vec![serde_json::from_value(recipe_json()).unwrap()]);
+        manifest.extensions = Some(Map::from_iter([(
+            "dev.abra.observed".into(),
+            json!({"platform":{"arch":"x86_64"}}),
+        )]));
+
+        materialize_recipes(root.path(), &manifest).unwrap();
+
+        assert!(root.path().join(".abra/recipes.json").is_file());
+        assert!(root.path().join(".abra/received-observed.json").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.path().join(".abra/recipes.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(root.path().join(".abra/received-observed.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn daemon_config_defaults_to_n0_and_persists_relay_mode() {

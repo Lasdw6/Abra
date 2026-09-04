@@ -14,3 +14,5 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
+blake3.workspace = true
+rand.workspace = true

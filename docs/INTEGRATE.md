@@ -51,6 +51,11 @@ $ abra send <peer-b> --path ./work --wait
 
 An initialized directory has `.abra/capsule_id`. Sending that path creates and
 sends its next full snapshot. `--wait` returns after B acknowledges it.
+Sandbox observers write live facts to `.abra/observed.json`. Abra sends derived
+recipes and the `dev.abra.observed` ledger with the snapshot. On receipt,
+`.abra/recipes.json` and `.abra/received-observed.json` hold that data. Abra does
+not execute either file. See the [observation contract](OBSERVATION.md) for
+service candidates, missing requirements and pinned checkpoint captures.
 
 On B:
 

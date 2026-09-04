@@ -124,6 +124,7 @@ After=abra-daemon.service
 
 [Service]
 Type=simple
+UMask=0077
 ExecStart=/usr/local/libexec/abra-observer --workspace /workspace
 Restart=always
 RestartSec=2

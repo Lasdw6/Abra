@@ -4,6 +4,10 @@ Adapters are separate executables. They speak UTF-8 NDJSON over stdin/stdout,
 one object per line and at most 1 MiB per object; stderr is diagnostics. The
 daemon owns CAS, identity, hashing, recipes, and signed manifests. An adapter
 never selects snapshot ids or origins and never supplies recipes.
+For sandbox workspaces, the daemon gets recipes from the observer ledger. The
+ledger and recipes are data only and adapters must not execute them implicitly.
+The [observation contract](OBSERVATION.md) separates observed facts from inferred
+service candidates and lists the requirements an application must resolve.
 
 ## Registration
 

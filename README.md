@@ -12,6 +12,8 @@ The receiver chooses how to use each snapshot.
 - A full snapshot updates a capsule. A partial snapshot lands in the inbox as a
   one-time handoff.
 - An adapter imports or exports one app's state through an NDJSON process.
+- A sandbox observer records runtime facts and derives service recipes. Abra
+  transports this ledger as data and never executes it.
 
 ## Repo layout
 
@@ -26,6 +28,7 @@ The receiver chooses how to use each snapshot.
 | `adapters/reference-folder` | Python protocol reference adapter |
 | `adapters/codex-session` | Codex session adapter |
 | `adapters/browser-session` | Browser session adapter |
+| `adapters/firecracker` | Firecracker VM adapter and sandbox observer |
 
 ## Quickstart
 
@@ -43,6 +46,7 @@ $ target/release/abra --root /tmp/abra-b accept --latest --kind dev.abra.workspa
 See [Add Abra to your sandbox](docs/INTEGRATE.md) for setup steps.
 [Local API](docs/API.md) lists commands, fields, results, and events.
 [Adapters](docs/ADAPTERS.md) defines the adapter process contract.
+[Sandbox observations](docs/OBSERVATION.md) describes the ledger and capture contract.
 [Design](DESIGN.md) explains design choices. The [protocol specification](SPEC.md)
 defines the wire format.
 

@@ -72,10 +72,14 @@ Before boot, the adapter injects the enrollment token into the private
 per-slot disk as root-owned `/etc/abra/token` mode `0600`. The service reads only
 that file. Tokens never appear in kernel arguments, adapter JSON, or Firecracker
 configuration/logs; `/proc/cmdline` is treated as public.
-The observer derives recipes from `/proc` (argv, workspace-relative cwd, a small
-environment allowlist, listening TCP ports, and start time) and atomically writes
-`/workspace/.abra/recipes.json`. The daemon validates and embeds those recipes
-when the workspace is snapshotted. Recipes are data and are never executed.
+The observer records platform, resources, runtimes, mounts, and the process tree
+in `/workspace/.abra/observed.json`. It derives service recipes from that process
+tree, grouping ordinary workers under their parent service. Candidates remain
+unverified or blocked and retain missing requirements. Only complete unredacted
+candidates enter the legacy recipes array. The daemon embeds the remaining
+version 3 ledger as `dev.abra.observed`. See the
+[observation contract](../../docs/OBSERVATION.md) for scope, environment facts,
+redaction, and collection errors. These fields never cause automatic execution.
 
 ## Lifecycle
 
@@ -109,8 +113,17 @@ suitable only for a dedicated trusted test host.
 The cold-boot API sequence is `PUT /logger`, `PUT /machine-config` (dirty-page
 tracking enabled), `PUT /boot-source`, `PUT /drives/rootfs`,
 `PUT /network-interfaces/net1`, and `PUT /actions` with `InstanceStart`.
-Snapshot is guest `sync`, `PATCH /vm` to `Paused`, `PUT /snapshot/create`, CAS
-ingestion, signed native-child creation, then `PATCH /vm` to `Resumed`. Restore
+Snapshot creates a random barrier and collects configured base-image/kernel
+digests and machine resources on the host. In one SSH round trip it writes an
+immutable `observed-<barrier>.json` and asks the daemon to consume that capture
+with `--observation-barrier`. The daemon checks and echoes the barrier. The host
+checks the response, then pauses the VM. Periodic observations use a separate
+file. The SSH command removes its capture file after the snapshot attempt. While paused, it creates the VM state
+and memory files and copies the live disk. It resumes the VM before portable
+transfer and CAS ingestion. Native state can only be ahead of the portable file
+tree by the gap between that SSH command and the pause. This remains best-effort:
+applications can change files during the portable tree walk, and a barrier does
+not flush databases or quiesce applications. Restore
 starts a blank Firecracker process, performs `PUT /snapshot/load` with a File
 memory backend, `resume_vm:false`, and `network_overrides`, patches the rootfs
 drive while paused, then resumes and waits for SSH.
@@ -144,7 +157,8 @@ cold boot, full capture, File-backed native restore, and portable fallback.
 Every capture is full; there is no differential capture until chained restore
 is implemented.
 
-`snapshot` prints both `portable_snapshot_id` and `native_snapshot_id`. Send the
+`snapshot` prints `portable_snapshot_id`, `native_snapshot_id`, and the observer
+`barrier` that ties the portable ledger to the capture. Send the
 native child to a compatible host. Abra streams its memory and disk objects and
 the receiver verifies them on disk:
 
@@ -181,7 +195,9 @@ without execution. Native blobs are never treated as source of truth.
 E2B and other self-hosted orchestrators map directly onto this shim: allocate a
 slot, inject an enrollment token, call the same Firecracker endpoints listed
 above, and persist the resulting Abra snapshot id. Run the real-host proof with
-`adapters/firecracker/tests/e2e.sh`; it writes `e2e-report.json` with cold boot,
+`adapters/firecracker/tests/e2e.sh` on a dedicated, idle Linux KVM host. It refuses
+to start if Firecracker processes or its test TAPs already exist. It writes
+`e2e-report.json` with cold boot,
 capture, native restore, and total timings. Set `ABRA_FC_E2E_RICH_IMAGE=1` to
 provision and check the browser and agent tools as part of that run. Rich runs
 skip the cross-device native disk transfer because that object is several GiB;

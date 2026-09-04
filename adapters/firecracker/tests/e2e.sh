@@ -28,6 +28,15 @@ FRESH_PID=""
 RICH_IMAGE_TOOLS=null
 SECOND_DEVICE_NATIVE=null
 
+# This suite owns slots 0/1 and their TAPs. Refuse a busy host before installing
+# the cleanup trap, which deliberately tears down those test resources.
+if pgrep -x firecracker >/dev/null 2>&1 \
+  || ip link show osdtap0 >/dev/null 2>&1 \
+  || ip link show osdtap1 >/dev/null 2>&1; then
+  echo "Firecracker e2e requires an idle host: existing VMs or test TAPs found" >&2
+  exit 1
+fi
+
 cleanup() {
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
   "$ABRA_FC" --root "$RUN_ROOT" down --slot 1 >/dev/null 2>&1 || true
@@ -147,9 +156,17 @@ NATIVE_RESULT="$("$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$K
 SNAPSHOT_MS="$(( $(now_ms) - SNAP_STARTED ))"
 PORTABLE_SNAPSHOT="$(jq -r .portable_snapshot_id <<<"$NATIVE_RESULT")"
 NATIVE_SNAPSHOT="$(jq -r .native_snapshot_id <<<"$NATIVE_RESULT")"
+BARRIER="$(jq -r .barrier <<<"$NATIVE_RESULT")"
 [[ "$PORTABLE_SNAPSHOT" != null && "$NATIVE_SNAPSHOT" != null ]]
 MANIFEST="$RUN_ROOT/capsules/$CAPSULE/snapshots/$NATIVE_SNAPSHOT.cjson"
+PORTABLE_MANIFEST="$RUN_ROOT/capsules/$CAPSULE/snapshots/$PORTABLE_SNAPSHOT.cjson"
 jq -e '.native | length == 3 and all(.fingerprint.hypervisor == "firecracker")' "$MANIFEST" >/dev/null
+jq -e --arg barrier "$BARRIER" '.extensions["dev.abra.observed"].observer.barrier == $barrier' "$PORTABLE_MANIFEST" >/dev/null
+jq -e '.recipes[] | select(.ports | index(8123))' "$PORTABLE_MANIFEST" >/dev/null
+jq -e '.extensions["dev.abra.observed"] | .schema == "dev.abra.observed/3" and .observer.version == 3 and .coverage.consistency == "best-effort" and .host.facts.configured_resources.memory_mb == 512 and (.host.facts.base_image.digest | startswith("blake3:"))' "$PORTABLE_MANIFEST" >/dev/null
+jq -e '.extensions["dev.abra.observed"].service_candidates[] | select(.recipe.ports | index(8123)) | .restartability == "unverified" and .requires_adapter_confirmation == true' "$PORTABLE_MANIFEST" >/dev/null
+guest "test ! -e '/workspace/.abra/observed-$BARRIER.json'"
+
 
 # Device B receives only the portable parent, then materializes files and recipes.
 "$ABRA" --root "$RUN_ROOT_B" daemon --yes >"$RUN_ROOT_B/daemon.log" 2>&1 &
@@ -160,11 +177,13 @@ PAIR_TICKET_B="$("$ABRA" --root "$RUN_ROOT_B" pair ticket)"
 PEER_B="$("$ABRA" --root "$RUN_ROOT_B" --json status | jq -r .peer_id)"
 "$ABRA" --root "$RUN_ROOT" send "$PEER_B" --capsule "$PORTABLE_SNAPSHOT" >/dev/null
 wait_until "portable snapshot at device B" log_has "$RUN_ROOT_B" "$CAPSULE" "$PORTABLE_SNAPSHOT"
-"$ABRA" --root "$RUN_ROOT_B" accept "$PORTABLE_SNAPSHOT" --to "$RECEIVED_B" >/dev/null
+"$ABRA" --root "$RUN_ROOT_B" accept "$PORTABLE_SNAPSHOT" "$RECEIVED_B" >/dev/null
 # B holds the guest-authored snapshot: the original marker plus the file the guest wrote.
 diff -q "$WORKSPACE/marker.txt" "$RECEIVED_B/marker.txt"
 grep -qx native-marker "$RECEIVED_B/native-marker.txt"
-test -s "$RECEIVED_B/.abra/recipes.json"
+jq -e '.[] | select(.ports | index(8123))' "$RECEIVED_B/.abra/recipes.json" >/dev/null
+test -s "$RECEIVED_B/.abra/received-observed.json"
+jq -e '.platform.arch == "x86_64"' "$RECEIVED_B/.abra/received-observed.json" >/dev/null
 
 # A rich image makes the native disk object several GiB. The default minimal
 # run proves cross-device native transfer; rich runs exercise local native
@@ -198,8 +217,17 @@ FRESH_RESULT="$("$ABRA_FC" --root "$FRESH_ROOT" --firecracker "$FC" --ssh-key "$
   --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1)"
 [[ "$(jq -r .mode <<<"$FRESH_RESULT")" == portable-fallback ]]
 ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 \
-  'test -f /workspace/native-marker.txt && test -s /workspace/.abra/recipes.json'
+  'test -f /workspace/native-marker.txt && python3 -c '\''import json,sys; sys.exit(0 if any(8123 in r.get("ports", []) for r in json.load(open("/workspace/.abra/recipes.json"))) else 1)'\'''
+FRESH_RECIPES_SHA="$(ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 sha256sum /workspace/.abra/recipes.json | awk '{print $1}')"
+sleep 5
+ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 \
+  "test \"\$(sha256sum /workspace/.abra/recipes.json | awk '{print \$1}')\" = '$FRESH_RECIPES_SHA'; test -f /workspace/.abra/observed.json; test \"\$(stat -c %a /workspace/.abra/observed.json)\" = 600; test \"\$(stat -c %a /workspace/.abra)\" = 700"
 test -s "$FRESH_ROOT/firecracker/config.json"
+ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 \
+  'cd /workspace; nohup python3 -m http.server 8123 >/tmp/abra-portable-server.log 2>&1 </dev/null &'
+wait_until "explicit portable service restart" curl -fsS --noproxy '*' http://172.30.1.2:8123/native-marker.txt
+curl -fsS --noproxy '*' http://172.30.1.2:8123/native-marker.txt | grep -qx native-marker
+
 "$ABRA_FC" --root "$FRESH_ROOT" down --slot 1
 
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
@@ -230,4 +258,4 @@ jq -n \
   --argjson native "$(jq -c .native "$MANIFEST")" \
   --argjson rich_image_tools "$RICH_IMAGE_TOOLS" \
   --argjson second_device_native "$SECOND_DEVICE_NATIVE" \
-  '{ok:true,capsule:$capsule,portable_snapshot:$portable,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,second_device_transfer:true,second_device_files:true,second_device_recipes:true,native_transfer:$second_device_native,second_root_native_restore:$second_device_native,fresh_root_config:true,fresh_host_portable_fallback:true,zero_firecracker_processes:true,zero_taps:true,rich_image_tools:$rich_image_tools}}' | tee "$REPORT"
+  '{ok:true,capsule:$capsule,portable_snapshot:$portable,native_snapshot:$snapshot,timings_ms:{total:$total_ms,up:$up_ms,snapshot:$snapshot_ms,native_restore:$restore_ms},native:$native,checks:{token_file_root_0600:true,token_absent_from_cmdline_and_logs:true,enrollment:true,transfer:true,native_manifest:true,barrier_matches:true,observer_schema_v3:true,host_environment:true,explicit_portable_service_restart:true,received_ledger:true,received_recipes_kept:true,cached_fingerprint_ignored:true,same_pid:true,same_starttime:true,http_after_resume:true,portable_fallback:true,fallback_marker_process_absent:true,second_device_transfer:true,second_device_files:true,second_device_recipes:true,native_transfer:$second_device_native,second_root_native_restore:$second_device_native,fresh_root_config:true,fresh_host_portable_fallback:true,zero_firecracker_processes:true,zero_taps:true,rich_image_tools:$rich_image_tools}}' | tee "$REPORT"

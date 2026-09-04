@@ -391,21 +391,65 @@ fn start_vm(
     finish_start(root, slot, vm, &config, rootfs, Duration::from_secs(90))
 }
 
+fn file_digest(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(fs::File::open(path)?)?;
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn artifact_observation(path: &Path) -> Value {
+    match file_digest(path) {
+        Ok(digest) => json!({"digest":digest,"captured":false,"available":true}),
+        Err(_) => json!({"captured":false,"available":false,"error":"digest_unavailable"}),
+    }
+}
+
+fn host_observation(state: &SlotState, config: &Config) -> Value {
+    json!({
+        "collector":"firecracker-host",
+        "observed_at_unix_ms":abra_core::now_ms(),
+        "architecture":std::env::consts::ARCH,
+        "base_image":artifact_observation(&config.base_rootfs),
+        "kernel":artifact_observation(&state.kernel),
+        "configured_resources":{"memory_mb":state.mem_mib,"cpus":state.vcpus},
+        "consistency":{"mode":"best-effort","applications_quiesced":false}
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn capture_command(barrier: &str, host: &Value) -> Result<String> {
+    if barrier.is_empty()
+        || barrier.len() > 64
+        || !barrier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("invalid observation barrier".into());
+    }
+    let host = shell_quote(&serde_json::to_string(host)?);
+    // Cleanup only this capture. The observer creates it without overwriting an existing file.
+    Ok(format!(
+        "set -e; /usr/local/libexec/abra-observer --workspace /workspace --once --barrier '{barrier}' >/dev/null; trap 'rm -f /workspace/.abra/observed-{barrier}.json' EXIT; abra --root /var/lib/abra --json snapshot /workspace --observation-barrier '{barrier}' --observation-host {host}; sync"
+    ))
+}
+
+fn validate_capture_response(response: &Value, barrier: &str) -> Result<()> {
+    if response.get("observation_barrier").and_then(Value::as_str) != Some(barrier) {
+        return Err("guest snapshot did not confirm the observation barrier".into());
+    }
+    Ok(())
+}
+
 fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
     let state = read_state(root, slot)?;
     ensure_running(&state)?;
     let config: Config =
         serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
-    let portable = ssh_output(
-        &state,
-        &config.ssh_key,
-        "abra --root /var/lib/abra --json snapshot /workspace; sync",
-    )?;
-    let portable: Value = serde_json::from_str(&portable)?;
-    let portable_snapshot = portable
-        .get("snapshot_id")
-        .and_then(Value::as_str)
-        .ok_or("guest snapshot response lacks snapshot_id")?;
+    let barrier = format!("fc-{slot}-{:032x}", rand::random::<u128>());
+    let host = host_observation(&state, &config);
     let host_status = Command::new(std::env::current_exe()?.with_file_name("abra"))
         .args([
             "--root",
@@ -422,40 +466,26 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
         .get("peer_id")
         .and_then(Value::as_str)
         .ok_or("host status lacks peer_id")?;
-    ssh(&state, &config.ssh_key,
-        &format!("abra --root /var/lib/abra send '{host_peer}' --capsule '{portable_snapshot}' >/dev/null"))?;
-    let portable_hash: Hash = portable_snapshot.parse()?;
-    let receive_started = Instant::now();
-    while receive_started.elapsed() < Duration::from_secs(30) {
-        if AbraStore::open(root)?
-            .capsules
-            .get(&capsule.parse()?)
-            .and_then(|cap| cap.snapshot(&portable_hash))
-            .is_some()
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    if AbraStore::open(root)?
-        .capsules
-        .get(&capsule.parse()?)
-        .and_then(|cap| cap.snapshot(&portable_hash))
-        .is_none()
-    {
-        return Err("portable guest snapshot was not received before native capture".into());
-    }
+    let portable = ssh_output(&state, &config.ssh_key, &capture_command(&barrier, &host)?)?;
+    let portable: Value = serde_json::from_str(&portable)?;
+    validate_capture_response(&portable, &barrier)?;
+    let portable_snapshot = portable
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or("guest snapshot response lacks snapshot_id")?
+        .to_owned();
     api(
         &state.api_socket,
         "PATCH",
         "/vm",
         &json!({"state":"Paused"}),
     )?;
-    let result = (|| {
+    let captured = (|| {
         let snap_dir = slot_dir(root, slot).join("snapshots").join(epoch_id());
         fs::create_dir_all(&snap_dir)?;
         let vmstate = snap_dir.join("vmstate");
         let memory = snap_dir.join("memory");
+        let disk = snap_dir.join("disk");
         api(
             &state.api_socket,
             "PUT",
@@ -466,14 +496,9 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
                 "mem_file_path": memory
             }),
         )?;
+        fs::copy(&state.rootfs, &disk)?;
         let fp = fingerprint_for_snapshot(fc, &vmstate)?;
-        let response = control(
-            root,
-            &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
-            "parent_snapshot":portable_snapshot,"snapshot_type":"Full","artifact_root":slot_dir(root, slot),
-            "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":state.rootfs}]}),
-        )?;
-        snapshot_output(portable_snapshot, &response)
+        Ok::<_, Box<dyn std::error::Error>>((vmstate, memory, disk, fp))
     })();
     let resumed = api(
         &state.api_socket,
@@ -484,7 +509,51 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
     if let Err(error) = resumed {
         eprintln!("warning: failed to resume slot {slot}: {error}");
     }
-    result
+    let (vmstate, memory, disk, fp) = captured?;
+
+    // The guest sends the portable parent only after resume; the paused-time
+    // disk copy is attached once it arrives, then dropped whatever happened.
+    let attached = (|| {
+        ssh(
+            &state,
+            &config.ssh_key,
+            &format!(
+                "abra --root /var/lib/abra send '{host_peer}' --capsule '{portable_snapshot}' >/dev/null"
+            ),
+        )?;
+        let portable_hash: Hash = portable_snapshot.parse()?;
+        let capsule_hash: Hash = capsule.parse()?;
+        let receive_started = Instant::now();
+        while receive_started.elapsed() < Duration::from_secs(30) {
+            if AbraStore::open(root)?
+                .capsules
+                .get(&capsule_hash)
+                .and_then(|cap| cap.snapshot(&portable_hash))
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if AbraStore::open(root)?
+            .capsules
+            .get(&capsule_hash)
+            .and_then(|cap| cap.snapshot(&portable_hash))
+            .is_none()
+        {
+            return Err("portable guest snapshot was not received before native attach".into());
+        }
+        control(
+            root,
+            &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
+            "parent_snapshot":portable_snapshot,"snapshot_type":"Full","artifact_root":slot_dir(root, slot),
+            "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":disk}]}),
+        )
+    })();
+    if let Err(error) = fs::remove_file(&disk) {
+        eprintln!("warning: failed to remove snapshot disk copy: {error}");
+    }
+    snapshot_output(&portable_snapshot, &barrier, &attached?)
 }
 
 fn restore(
@@ -560,8 +629,30 @@ fn restore(
         &record.raw.manifest().files.ok_or("snapshot lacks files")?,
         temp.path(),
     )?;
-    rsync_guest(temp.path(), &state, &config.ssh_key, "/workspace/")?;
+    let metadata = temp.path().join(".abra");
+    fs::create_dir_all(&metadata)?;
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o700))?;
     let recipes = record.raw.manifest().recipes.clone().unwrap_or_default();
+    let recipes_path = metadata.join("recipes.json");
+    fs::write(&recipes_path, serde_json::to_vec(&recipes)?)?;
+    fs::set_permissions(&recipes_path, fs::Permissions::from_mode(0o600))?;
+    if let Some(observed) = record
+        .raw
+        .manifest()
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("dev.abra.observed"))
+    {
+        let observed_path = metadata.join("received-observed.json");
+        fs::write(&observed_path, serde_json::to_vec(observed)?)?;
+        fs::set_permissions(&observed_path, fs::Permissions::from_mode(0o600))?;
+    }
+    rsync_guest(temp.path(), &state, &config.ssh_key, "/workspace/")?;
+    ssh(
+        &state,
+        &config.ssh_key,
+        "chmod 700 /workspace/.abra && chmod 600 /workspace/.abra/*.json",
+    )?;
     eprintln!(
         "recipes (data only; not executed): {}",
         serde_json::to_string_pretty(&recipes)?
@@ -583,7 +674,11 @@ fn matching_native<'a>(
     ))
 }
 
-fn snapshot_output(portable_snapshot: &str, native_response: &Value) -> Result<Value> {
+fn snapshot_output(
+    portable_snapshot: &str,
+    barrier: &str,
+    native_response: &Value,
+) -> Result<Value> {
     let native_snapshot = native_response
         .get("snapshot_id")
         .and_then(Value::as_str)
@@ -591,6 +686,7 @@ fn snapshot_output(portable_snapshot: &str, native_response: &Value) -> Result<V
     Ok(json!({
         "portable_snapshot_id": portable_snapshot,
         "native_snapshot_id": native_snapshot,
+        "barrier": barrier,
     }))
 }
 
@@ -1261,6 +1357,53 @@ mod tests {
     }
 
     #[test]
+    fn capture_command_quotes_host_facts_and_pins_barrier() {
+        let host = json!({"note":"a' $(do-not-execute) `literal`"});
+        let command = capture_command("capture_1", &host).unwrap();
+        assert!(command.contains("--observation-barrier 'capture_1'"));
+        assert!(command.contains("observed-capture_1.json"));
+        assert!(capture_command("../escape", &host).is_err());
+        assert!(
+            validate_capture_response(&json!({"observation_barrier":"wrong"}), "capture_1")
+                .is_err()
+        );
+        assert!(validate_capture_response(
+            &json!({"observation_barrier":"capture_1"}),
+            "capture_1"
+        )
+        .is_ok());
+        let quoted = shell_quote(&serde_json::to_string(&host).unwrap());
+        let echoed = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .unwrap();
+        assert!(echoed.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&echoed.stdout).unwrap(),
+            host
+        );
+    }
+
+    #[test]
+    fn environment_digest_identifies_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("image");
+        fs::write(&path, b"base-image").unwrap();
+        assert_eq!(
+            file_digest(&path).unwrap(),
+            format!("blake3:{}", blake3::hash(b"base-image").to_hex())
+        );
+        assert_eq!(
+            artifact_observation(&root.path().join("missing"))["error"],
+            "digest_unavailable"
+        );
+        let before = file_digest(&path).unwrap();
+        fs::write(&path, b"different-image").unwrap();
+        assert_ne!(before, file_digest(&path).unwrap());
+    }
+
+    #[test]
     fn token_install_uses_root_ownership_and_private_mode() {
         let args = token_install_args(Path::new("/tmp/source"), Path::new("/mnt/etc/abra/token"));
         assert_eq!(
@@ -1391,12 +1534,14 @@ mod tests {
 
     #[test]
     fn snapshot_output_names_portable_and_native_ids() {
-        let output = snapshot_output("portable", &json!({"snapshot_id":"native"})).unwrap();
+        let output =
+            snapshot_output("portable", "fc-0-123", &json!({"snapshot_id":"native"})).unwrap();
         assert_eq!(
             output,
             json!({
                 "portable_snapshot_id":"portable",
-                "native_snapshot_id":"native"
+                "native_snapshot_id":"native",
+                "barrier":"fc-0-123"
             })
         );
     }

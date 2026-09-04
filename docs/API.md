@@ -75,6 +75,22 @@ Paths sent to `capsule-create`, `snapshot`, and `accept` must be absolute. The
 CLI resolves them in the caller's working directory before making the request;
 `capsule-create` creates a missing directory.
 
+For a workspace snapshot, the daemon reads `.abra/observed.json` first. It puts
+derived recipes in `manifest.recipes` and the remaining ledger in
+`extensions["dev.abra.observed"]`. If `observed.json` is absent, it reads
+`.abra/recipes.json` as a manual fallback. On materialization it writes received
+recipes to `.abra/recipes.json` and the received ledger to
+`.abra/received-observed.json`. These files are data only. A ledger with no complete recipes clears the received
+recipe file instead of retaining earlier suggestions.
+
+For a pinned capture, `snapshot` accepts `observation_barrier` and optional
+`observation_host`. The CLI flags are `--observation-barrier <id>` and
+`--observation-host '<JSON object>'`. The daemon strictly reads
+`.abra/observed-<id>.json`, checks schema, mode, barrier and capture times, and
+returns `observation_barrier`. It never falls back to live data for this request.
+Host facts require a barrier and are limited to 16 KiB. See the
+[observation contract](OBSERVATION.md) for fields, limits and consistency.
+
 Adapter `source` and `destination` values parse as JSON only when they are JSON
 objects; all other values stay strings. Adapter options are string maps. `to`
 always names the materialization directory. The CLI form is

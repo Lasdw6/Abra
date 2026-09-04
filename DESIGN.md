@@ -111,8 +111,8 @@ still a card, and `link` is still clickable. Namespacing `kind` (`dev.abra.*`,
 
 ## 5. Recipes
 
-A recipe is **how to recreate a process**, derived by an observer, not declared
-by a user:
+A recipe is an observed suggestion for recreating a process. It is derived by
+an observer and remains unverified until the receiving application checks it:
 
 ```
 { argv, cwd (relative to workspace root), env (map), ports (list), started_at }
@@ -120,11 +120,11 @@ by a user:
 
 Two rules:
 
-1. **Derived, not declared.** _Later:_ the sandbox runs an observer that watches
-   what actually ran and writes recipes from observation. Nobody maintains a
-   manifest by hand; nobody's `dev.sh` drifts.
-2. **Data in core.** Core stores and transports recipes. Only the daemon's
-   explicit receive-policy layer may execute them. `cwd` is
+1. **Derived, not declared.** The sandbox observer records a process tree and
+   infers service candidates. It retains missing requirements and omits blocked
+   candidates from the compatibility recipes array.
+2. **Data in core.** Core stores and transports recipes. The daemon never
+   executes them. `cwd` is
    relative to the workspace root precisely so the receiver stays in control of
    where that root lands.
 
@@ -142,9 +142,10 @@ linux-kvm-x86_64/fc-snap-v11/cpu-template-none
 
 Restoring from a native blob is only valid on a host whose fingerprint matches.
 So native blobs are an **evictable cache, never the source of truth**. The file
-tree plus recipes is always the portable representation; the native blob is the
-fast path when the receiver happens to be a compatible host. A receiver that
-can't use them deletes them and loses nothing but time.
+tree, ledger and app checkpoints form the portable representation; native blobs
+provide a fast path on compatible hosts. Portable continuation still requires
+compatible dependencies, external data and credentials. State present only in
+native memory or disk cannot be reconstructed from process observations.
 
 ## 7. Identity and authorization
 
@@ -257,8 +258,12 @@ adapter's code.
 
 ### Observer-based recipe capture
 
-Inside a sandbox, an observer process watches what actually runs and emits
-recipes. See §5.
+Inside a sandbox, an observer records platform and runtime facts, mounts, and a
+process tree. It derives unverified service candidates and records missing
+requirements, collector failures and capture timing. Unique capture files bind
+one ledger to a snapshot without periodic overwrites. This is best-effort
+capture unless the application is quiesced separately. See §5 and the
+[observation contract](docs/OBSERVATION.md).
 
 ### Flat receiver model
 

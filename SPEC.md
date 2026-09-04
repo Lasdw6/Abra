@@ -109,11 +109,27 @@ one only on explicit user/integrator action.
 
 `argv`: non-empty, 1..256 entries. `cwd`: **relative** path from the workspace root,
 `/`-separated, no leading `/`, no `..`, no NUL (`"."` allowed). Processes whose cwd
-cannot be expressed relative to the captured root are omitted by the observer.
+cannot be expressed relative to the captured root are omitted from recipes, but
+may remain as facts in the observed ledger.
 `env`: string→string map (canonically key-sorted like all objects); entries whose
 name or value is not valid UTF-8 are omitted — recipes are lossy where files are
 not, and this is stated rather than hidden. `ports`: sorted unique integers
 1..65535 (TCP listen ports observed). `started_at`: optional canonical time.
+
+### 1.2.1 Observed ledger extension
+
+`extensions["dev.abra.observed"]` carries the sandbox ledger captured with a
+workspace snapshot. It is observational data and MUST NOT be executed. The value
+is at most 256 KiB. It records observer version and time, platform, resources,
+runtimes, mounts, processes, and drop counts when available. Version 3 uses
+`schema: "dev.abra.observed/3"` and distinguishes process facts from inferred
+`service_candidates`, which retain their recipes and missing requirements.
+The top-level ledger `recipes` projection moves to the manifest's `recipes`
+field. It contains only complete unredacted candidates with portable cwd, and
+is still unverified. See [the observation contract](docs/OBSERVATION.md) for
+capture selection, collector sources, timestamps, coverage, and limits.
+A matching capture barrier identifies the selected ledger; it does not prove
+application consistency or simultaneous portable and native capture.
 
 ### 1.3 Native blob ref
 
@@ -258,7 +274,8 @@ Local layout of a materialized capsule (folder = the local sandbox):
 
 ```
 <folder>/            # tree contents
-<folder>/.abra/      # daemon-owned: capsule id, lease cache, recipes.json,
+<folder>/.abra/      # observed.json, received recipes.json and
+                     # received-observed.json, capsule id, lease cache,
                      # native/<digest> blobs for matching hosts
 ```
 

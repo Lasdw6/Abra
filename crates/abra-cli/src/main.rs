@@ -64,6 +64,12 @@ enum Command {
         /// Do not take the capsule lease before snapshotting.
         #[arg(long)]
         no_lease: bool,
+        /// Read the immutable observer capture with this barrier ID.
+        #[arg(long)]
+        observation_barrier: Option<String>,
+        /// Host-supplied environment facts as JSON, attached to that capture.
+        #[arg(long, requires = "observation_barrier")]
+        observation_host: Option<String>,
     },
     Send(SendArgs),
     Inbox(InboxArgs),
@@ -498,8 +504,13 @@ async fn main() -> cadabra::Result<()> {
             label,
             path,
             no_lease,
+            observation_barrier,
+            observation_host,
         } => {
-            json!({"op":"snapshot","path":std::fs::canonicalize(path)?,"label":label,"no_lease":no_lease})
+            let observation_host = observation_host
+                .map(|value| serde_json::from_str::<Value>(&value))
+                .transpose()?;
+            json!({"op":"snapshot","path":std::fs::canonicalize(path)?,"label":label,"no_lease":no_lease,"observation_barrier":observation_barrier,"observation_host":observation_host})
         }
         Command::Send(args) => {
             let path = args.path.map(std::fs::canonicalize).transpose()?;
@@ -1273,6 +1284,33 @@ fn print_human(value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_host_facts_require_a_capture_barrier() {
+        assert!(
+            Cli::try_parse_from(["abra", "snapshot", ".", "--observation-host", "{}"]).is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "abra",
+            "snapshot",
+            ".",
+            "--observation-barrier",
+            "capture_1",
+            "--observation-host",
+            "{}",
+        ])
+        .unwrap();
+        let Command::Snapshot {
+            observation_barrier,
+            observation_host,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected snapshot")
+        };
+        assert_eq!(observation_barrier.as_deref(), Some("capture_1"));
+        assert_eq!(observation_host.as_deref(), Some("{}"));
+    }
 
     #[test]
     fn capability_url_substitutes_ciphertext_hash() {

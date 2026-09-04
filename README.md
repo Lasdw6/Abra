@@ -1,177 +1,58 @@
-Abra is infrastructure for teleportation.
+# Abra
 
-Abra moves typed snapshots between trusted peers. The default iroh transport is
-end-to-end encrypted over QUIC/TLS and uses n0's public relay and discovery
-service, so paired devices can connect across NATs.
-
-The core principle is **carry the data, don't prescribe the experience**. A
-snapshot carries the maximal amount of structured, parsable data about what it
-is; the receiver decides what to do with it — render a card, open a deep link,
-sync a workspace, resume a sandbox. The sender authors nothing extra.
+Abra moves typed snapshots between a user's trusted devices. It sends files,
+workspaces, app state, and links over an authenticated, encrypted connection.
+The receiver chooses how to use each snapshot.
 
 ## Concepts
 
-- **Snapshot** is the noun: a typed, self-describing, content-addressed bundle.
-  Its manifest is always JSON — a snapshot is never an opaque blob.
-- **Teleport** is the verb: moving a snapshot within a trusted mesh over the
-  authenticated, encrypted iroh transport.
-- **Capsule** is a continuing thing (a workspace, a sandbox) with a history DAG
-  of snapshots. A **lease** says which device is currently driving it.
-- **Scope** splits the one envelope format two ways. `full` is a new version of
-  a capsule and syncs into the capsule store. `partial` is a delivery — a file,
-  a folder, a browser session, a handoff link — and lands in an inbox.
-
-See [DESIGN.md](DESIGN.md) for the settled design and [SPEC.md](SPEC.md) for the
-wire format.
+- A snapshot is a typed, content-addressed JSON manifest plus its data.
+- A capsule is a continuing workspace or sandbox with snapshot history.
+- A lease records which device is driving a capsule.
+- A full snapshot updates a capsule. A partial snapshot lands in the inbox as a
+  one-time handoff.
+- An adapter imports or exports one app's state through an NDJSON process.
 
 ## Repo layout
 
-```
-crates/abra-core   library: identity, CAS, snapshots, capsule store, links
-crates/abra-cli    thin `abra` UDS client
-crates/cadabra     library-first daemon and `cadabra` binary
-docs/API.md        local NDJSON control protocol
-docs/ADAPTERS.md   external adapter contract
-```
-
-`abra-core` modules:
-
-| module     | what it owns                                                        |
-| ---------- | ------------------------------------------------------------------- |
-| `identity` | Ed25519 device keypairs, `PeerId`, signing and verification          |
-| `cas`      | blake3 blob store, tree objects, `snapshot_dir`, `materialize`       |
-| `snapshot` | `Manifest`, scope, provenance, recipes, native blob refs, hashing    |
-| `store`    | `SnapshotStore` (DAG walk) and `CapsuleRegistry` (local bookkeeping) |
-| `enroll`   | scoped enrollment certificates                                      |
-| `link`     | capability links: mint, parse, seal, open                           |
+| Path | Contents |
+|---|---|
+| `crates/abra-core` | Identity, CAS, manifests, capsules, leases, and links |
+| `crates/abra-net` | Pairing, authorization, transport, delivery, and control |
+| `crates/abra-cli` | The `abra` command, including `abra daemon` |
+| `crates/cadabra` | Daemon library used by `abra daemon` |
+| `crates/abra-relay` | Sealed offline store-and-forward relay |
+| `adapters/lib` | Shared JavaScript adapter helper |
+| `adapters/reference-folder` | Python protocol reference adapter |
+| `adapters/codex-session` | Codex session adapter |
+| `adapters/browser-session` | Browser session adapter |
 
 ## Quickstart
 
-Build the binaries, then start a daemon in the first terminal:
-
 ```console
-$ cargo build --workspace
-$ target/debug/abra --root /tmp/abra-a daemon --yes
+$ cargo build --release -p abra-cli
+$ target/release/abra --root /tmp/abra-a daemon --background --yes
+$ target/release/abra --root /tmp/abra-b daemon --background --yes
+$ TICKET=$(target/release/abra --root /tmp/abra-b pair ticket)
+$ target/release/abra --root /tmp/abra-a pair add "$TICKET"
+$ target/release/abra --root /tmp/abra-a init ./work
+$ target/release/abra --root /tmp/abra-a send <peer-b> --path ./work --wait
+$ target/release/abra --root /tmp/abra-b accept --latest --kind dev.abra.workspace ./work
 ```
 
-Use a second terminal as the client:
-
-```console
-$ target/debug/abra --root /tmp/abra-a status
-$ target/debug/abra --root /tmp/abra-a pair ticket
-$ target/debug/abra --root /tmp/abra-a init ./my-workspace
-$ target/debug/abra --root /tmp/abra-a snapshot ./my-workspace -m first
-$ target/debug/abra --root /tmp/abra-a outbox
-```
-
-For a two-device demo, start a second daemon with a different root, copy the
-bare ticket printed by B, and redeem it on A:
-
-```console
-$ target/debug/abra --root /tmp/abra-b daemon --yes
-$ TICKET=$(target/debug/abra --root /tmp/abra-b pair ticket)
-$ target/debug/abra --root /tmp/abra-a pair add "$TICKET"
-```
-
-Then use `send <B-peer-id> --capsule <snapshot-id>`. On B,
-`inbox` shows partial handoffs and `accept <id> --to <empty-path>` materializes
-them; full capsule snapshots appear in `log` and can also be accepted by id.
-
-The default `--iroh-relay n0` mode is the right choice across the Internet. For
-a LAN-only setup with no iroh relay or discovery traffic, start once with
-`--iroh-relay none`. The daemon saves explicit relay choices in
-`config/daemon.json`. You can also pass one custom HTTPS relay URL. Custom
-mode keeps n0 DNS/pkarr discovery enabled but sends relay traffic only through
-that URL.
-
-An iroh relay can see the devices' IP addresses and iroh node ids. It cannot
-read Abra payloads. QUIC/TLS encrypts the connection end to end between the
-devices. The `n0` and custom modes also publish endpoint ids through iroh's
-DNS/pkarr discovery; `none` does not. Abra's separate `abra-relay` service below is for sealed offline
-store-and-forward delivery, not NAT traversal.
-
-Mint a zero-install capability link for any stored snapshot and serve the blob
-plus static viewer locally (use an HTTPS+CORS object host in production):
-
-```console
-$ mkdir -p ./link-build ./shared
-$ cp -R viewer ./shared/viewer
-$ target/debug/abra --root /tmp/abra-a link mint <snapshot-id> --ttl 7d --full --out ./link-build --url http://127.0.0.1:8080/{hash}.abracap --upload-command "cp {file} $(pwd)/shared/{hash}.abracap" --revoke-command "rm -f $(pwd)/shared/{hash}.abracap" --viewer http://127.0.0.1:8080/viewer/
-$ target/debug/abra link serve ./shared --listen 127.0.0.1:8080
-```
-
-`--upload-command 'command {file} {hash} {url}'` provides the pluggable uploader
-hook; remote uploads require a paired `--revoke-command` using the same
-placeholders. Pair it with `--url https://objects.example/...`. Neither command receives a
-bearer key. `link list` stores only fragment-free URLs, and `link revoke <id>`
-tombstones local ciphertext and invokes the recorded remote tombstone hook.
-
-Without `--yes`, leave `pair add` running, inspect `pair pending` on the ticket
-issuer, and run `pair confirm <peer-id>`. Confirmation completes the existing
-bootstrap connection; the joiner does not retry the ticket.
-
-For a scoped guest, mint explicit scopes on the full peer and redeem the token:
-
-```console
-$ TOKEN=$(target/debug/abra --root /tmp/abra-a enroll --capsule <id> --kind <kind> --ttl 1d --send --receive | head -1)
-$ target/debug/abra --root /tmp/abra-b daemon --token "$TOKEN"
-```
-
-Human-mode enrollment also prints `abra://join/<token>`. `abra join <token>`
-redeems through an already-running daemon. TCP is retained explicitly as
-`daemon --transport tcp`; it is loopback-only, authenticated, and not encrypted.
-The default iroh transport persists complete peer addresses, including relay
-URLs, across daemon restarts. Use `--iroh-relay none` only when direct LAN
-addresses are enough. Capability links
-are limited to 64 MiB sealed, with a 32 MiB limit per object. The `abra-relay`
-binary provides blind sealed store-and-forward delivery primitives. Recipes and
-control messages are carried/surfaced as data; Abra does not execute them.
-
-`abra daemon --skip-native` skips optional native cache blobs, except blobs also
-used by the portable tree. `abra daemon --offer-budget <bytes>` sets the
-per-offer byte limit. Both settings persist in `config/daemon.json`.
-
-### Self-hosted relay quickstart
-
-```console
-$ ABRA_RELAY_SECRET=change-me target/debug/abra-relay --listen 127.0.0.1:8787
-$ target/debug/abra --root /tmp/abra-a relay add http://127.0.0.1:8787 --secret change-me
-$ target/debug/abra --root /tmp/abra-b relay add http://127.0.0.1:8787 --secret change-me
-$ target/debug/abra --root /tmp/abra-a send <peer-b> --link https://example.test/offline
-# start B later; startup (or `abra inbox`) polls, commits, and returns a signed ack
-$ target/debug/abra --root /tmp/abra-b daemon
-```
-
-Put the HTTP relay behind TLS for Internet deployment. Relay items expose only
-rotating tags, expiry metadata, and recipient-sealed ciphertext. Deposit leaves
-the outbox `awaiting_ack`; only a verified receiver signature makes it `acked`.
+See [Add Abra to your sandbox](docs/INTEGRATE.md) for setup steps.
+[Local API](docs/API.md) lists commands, fields, results, and events.
+[Adapters](docs/ADAPTERS.md) defines the adapter process contract.
+[Design](DESIGN.md) explains design choices. The [protocol specification](SPEC.md)
+defines the wire format.
 
 ## Status
 
-Stages 1–4 include local primitives, encrypted iroh transport, scoped guests,
-receive grants, durable delivery, the daemon, CLI, and cross-process tests. A
-static capability-link viewer ships in `viewer/`; Cadabra runs external adapters,
-the reference folder adapter lives under `adapters/`, and `abra-relay` provides
-the minimal self-hosted relay service.
-Paired iroh addresses survive restarts. The default n0 mode supports cross-NAT
-connections. Capability links have a 64 MiB sealed-bundle
-limit and a 32 MiB per-object limit.
-
-## Building
-
-```console
-$ cargo test
-$ cargo clippy --all-targets -- -D warnings
-```
+Abra has local snapshot storage, encrypted iroh delivery, pairing, scoped guest
+enrollment, receive policies, leases, capability links, external adapters, and
+a sealed offline relay. The default n0 mode supports connections across NATs.
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option. Unless you explicitly state otherwise, any contribution
-intentionally submitted for inclusion in this work by you, as defined in the
-Apache-2.0 license, shall be dual licensed as above, without any additional
-terms or conditions.
+Licensed under either Apache License 2.0 or MIT, at your option. See
+[LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).

@@ -5,6 +5,7 @@ use crate::{
     identity::{Identity, Signature},
     manifest::{closure, RawManifest},
     store::AbraStore,
+    util::atomic_write,
     Error, Result,
 };
 use aes_gcm::{
@@ -14,7 +15,7 @@ use aes_gcm::{
 use data_encoding::BASE64URL_NOPAD;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::Path};
+use std::{fs, path::Path};
 
 pub const MAGIC: &[u8; 8] = b"ABRACAP1";
 pub const REVOKED_MAGIC: &[u8; 8] = b"ABRACAPX";
@@ -323,21 +324,4 @@ pub fn revoke_record(store: &AbraStore, id: &str) -> Result<MintRecord> {
         }
     }
     Ok(record)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid("capability path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    let temporary = parent.join(format!(".tmp-{}", rand::random::<u64>()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|e| Error::io(&temporary, e))?;
-    file.write_all(bytes)
-        .map_err(|e| Error::io(&temporary, e))?;
-    file.sync_all().map_err(|e| Error::io(&temporary, e))?;
-    fs::rename(&temporary, path).map_err(|e| Error::io(path, e))
 }

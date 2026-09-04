@@ -1,0 +1,11 @@
+{
+  "name": "@abra/adapter-lib",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./adapter.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" }
+}

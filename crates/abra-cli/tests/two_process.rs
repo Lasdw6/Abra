@@ -42,17 +42,19 @@ fn start_daemon(root: &Path, transport: &str) -> Result<Child, String> {
 }
 
 fn start_daemon_with_relay(root: &Path, transport: &str, relay: &str) -> Result<Child, String> {
+    let config = Command::new(env!("CARGO_BIN_EXE_abra"))
+        .arg("--root")
+        .arg(root)
+        .args(["config", "set", "iroh_relay", relay])
+        .output()
+        .unwrap();
+    if !config.status.success() {
+        return Err(String::from_utf8_lossy(&config.stderr).into_owned());
+    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_abra"))
         .arg("--root")
         .arg(root)
-        .args([
-            "daemon",
-            "--yes",
-            "--transport",
-            transport,
-            "--iroh-relay",
-            relay,
-        ])
+        .args(["daemon", "--yes", "--transport", transport])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -196,13 +198,7 @@ fn paired_daemons_restart_then_send_and_ack_both_directions() {
     let destination = temp.path().join("accepted");
     json(
         &b,
-        &[
-            "--json",
-            "accept",
-            &snapshot,
-            "--to",
-            destination.to_str().unwrap(),
-        ],
+        &["--json", "accept", &snapshot, destination.to_str().unwrap()],
     );
     assert_eq!(fs::read(destination.join("payload.bin")).unwrap(), expected);
 
@@ -415,18 +411,15 @@ fn relay_delivers_to_restarted_offline_daemon_and_returns_ack() {
     for root in [&a, &b] {
         json(
             root,
-            &[
-                "--json",
-                "relay",
-                "add",
-                &relay_url,
-                "--secret",
-                secret,
-                "--relay-after-attempts",
-                "0",
-                "--poll-seconds",
-                "5",
-            ],
+            &["--json", "config", "set", "relay_after_attempts", "0"],
+        );
+        json(
+            root,
+            &["--json", "config", "set", "relay_poll_seconds", "5"],
+        );
+        json(
+            root,
+            &["--json", "relay", "add", &relay_url, "--secret", secret],
         );
     }
 
@@ -477,4 +470,134 @@ fn relay_delivers_to_restarted_offline_daemon_and_returns_ack() {
         thread::sleep(Duration::from_millis(25));
     }
     wait_for_outbox_state(&a, &snapshot, "acked", Duration::from_secs(30));
+}
+
+/// Always stop a backgrounded daemon, including when an assertion panics.
+struct Background(std::path::PathBuf);
+impl Drop for Background {
+    fn drop(&mut self) {
+        let _ = abra(&self.0, &["--json", "stop"]);
+    }
+}
+
+#[test]
+fn background_daemon_records_a_pid_file_and_stop_terminates_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("background");
+    let started = json(
+        &root,
+        &[
+            "--json",
+            "daemon",
+            "--background",
+            "--yes",
+            "--transport",
+            "tcp",
+        ],
+    );
+    let guard = Background(root.clone());
+    let pid = started["pid"].as_i64().unwrap();
+    assert!(started["peer_id"].as_str().unwrap().len() == 64);
+
+    // The daemon answers on its own, and the CLI recorded who it is.
+    assert_eq!(
+        json(&root, &["--json", "status"])["peer_id"],
+        started["peer_id"]
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(root.join("daemon.pid")).unwrap()).unwrap();
+    assert_eq!(record["pid"], pid);
+    assert_eq!(record["root"], root.to_str().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(root.join("daemon.pid"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root.join("daemon.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    // A second --background refuses rather than racing the first.
+    let again = abra(
+        &root,
+        &["daemon", "--background", "--yes", "--transport", "tcp"],
+    );
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already running"));
+
+    let stopped = json(&root, &["--json", "stop"]);
+    assert_eq!(stopped["stopped"], true);
+    assert_eq!(stopped["pid"], pid);
+    assert!(!root.join("daemon.pid").exists());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while abra(&root, &["--json", "status"]).status.success() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon still answering after stop"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    // Stopping again reports there is nothing recorded.
+    let missing = abra(&root, &["--json", "stop"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no daemon pid file"));
+    std::mem::forget(guard);
+}
+
+#[test]
+fn one_command_sends_a_workspace_and_the_other_side_accepts_the_latest() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    let mut daemons = Daemons(Vec::new());
+    for root in [&a, &b] {
+        daemons.0.push(start_daemon(root, "tcp").unwrap());
+    }
+    pair(&a, &b);
+
+    let workspace = temp.path().join("my-workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("turn"), "one").unwrap();
+    json(&a, &["--json", "init", workspace.to_str().unwrap()]);
+    let peer = peer_id(&b);
+    let sent = json(
+        &a,
+        &[
+            "--json",
+            "send",
+            &peer,
+            "--path",
+            workspace.to_str().unwrap(),
+            "--wait",
+        ],
+    );
+    assert_eq!(sent["workspace_detected"], true);
+    assert_eq!(sent["entry"]["state"], "acked");
+
+    let here = temp.path().join("here");
+    let accepted = json(
+        &b,
+        &[
+            "--json",
+            "accept",
+            "--latest",
+            "--kind",
+            "dev.abra.workspace",
+            here.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(accepted["accepted"], sent["snapshot_id"]);
+    assert_eq!(fs::read_to_string(here.join("turn")).unwrap(), "one");
 }

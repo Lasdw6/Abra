@@ -1,14 +1,14 @@
 use abra_core::{
-    capsule::{Genesis, LeaseMode, LeaseRecord},
+    capsule::{Genesis, LabelOp, LeaseMode, LeaseRecord},
     cas::{materialize, snapshot_dir, Hash},
     identity::{Identity, PeerId, Signature},
     manifest::{Fingerprint, Manifest, NativeBlobRef, Origin, RawManifest, Scope},
 };
 use abra_net::{
-    bootstrap_allowed, check_hello, Ack, BindCertificate, DeliveryNode, DeliveryOutcome,
-    EnrollmentToken, Hello, LoopbackNetwork, LoopbackTransport, Offer, OutboxState, PairRequest,
-    PairTicket, Ping, Revocation, Role, Scopes, Transport, TrustedPeer, MAX_LEASE_CHAIN_LEN,
-    WIRE_VERSION,
+    bootstrap_allowed, check_hello, Ack, BindCertificate, ControlHandler, ControlMessage,
+    ControlOp, DeliveryNode, DeliveryOutcome, EnrollmentToken, Hello, LoopbackNetwork,
+    LoopbackTransport, Offer, OutboxState, PairRequest, PairTicket, Ping, Revocation, Role, Scopes,
+    Transport, TrustedPeer, MAX_LEASE_CHAIN_LEN, WIRE_VERSION,
 };
 use serde_json::Map;
 use std::{fs, path::Path, time::Duration};
@@ -1562,4 +1562,430 @@ fn receiver_rejects_cross_capsule_and_oversized_state_bundles() {
         .validate_incoming_offer(&oversized, sender.peer_id(), NOW)
         .is_err());
     assert!(receiver.store.capsules.is_empty());
+}
+
+struct ValueHandler(serde_json::Value);
+#[async_trait::async_trait]
+impl ControlHandler for ValueHandler {
+    async fn handle(
+        &self,
+        _from: PeerId,
+        message: &ControlMessage,
+    ) -> abra_net::Result<serde_json::Value> {
+        Ok(serde_json::json!({"echo": message.text, "result": self.0}))
+    }
+}
+
+struct FailingHandler;
+#[async_trait::async_trait]
+impl ControlHandler for FailingHandler {
+    async fn handle(
+        &self,
+        _from: PeerId,
+        _message: &ControlMessage,
+    ) -> abra_net::Result<serde_json::Value> {
+        Err(abra_net::Error::Protocol("adapter refused".into()))
+    }
+}
+
+/// Fails the way a local adapter would: an `io::Error` whose message names a
+/// file on this machine.
+struct IoFailingHandler(String);
+#[async_trait::async_trait]
+impl ControlHandler for IoFailingHandler {
+    async fn handle(
+        &self,
+        _from: PeerId,
+        _message: &ControlMessage,
+    ) -> abra_net::Result<serde_json::Value> {
+        Err(abra_net::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no such file: {}", self.0),
+        )))
+    }
+}
+
+struct SleepingHandler(Duration);
+#[async_trait::async_trait]
+impl ControlHandler for SleepingHandler {
+    async fn handle(
+        &self,
+        _from: PeerId,
+        _message: &ControlMessage,
+    ) -> abra_net::Result<serde_json::Value> {
+        tokio::time::sleep(self.0).await;
+        Ok(serde_json::json!("never"))
+    }
+}
+
+fn control_message(sender: &DeliveryNode, nonce: u8) -> ControlMessage {
+    ControlMessage::new(
+        Hash::from_bytes([7; 32]),
+        ControlOp::Instruct,
+        Some("run the tests".into()),
+        abra_core::now_ms(),
+        [nonce; 16],
+        &sender.store.keys.identity,
+    )
+    .unwrap()
+}
+
+fn control_events(root: &Path) -> Vec<serde_json::Value> {
+    let path = root.join("net/events.ndjson");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("event").and_then(|x| x.as_str()) == Some("control"))
+        .collect()
+}
+
+/// Sends `message` over loopback and returns the acknowledgement as raw JSON.
+/// `features` is the dialer's hello feature list; `None` uses the ordinary
+/// handshake, which advertises everything this build supports.
+async fn control_exchange(
+    sender: &DeliveryNode,
+    receiver: &mut DeliveryNode,
+    message: &ControlMessage,
+    features: Option<Vec<String>>,
+) -> serde_json::Value {
+    let network = LoopbackNetwork::default();
+    let ts = LoopbackTransport::bind(&network, sender.peer_id());
+    let tr = LoopbackTransport::bind(&network, receiver.peer_id());
+    let mut outgoing = ts.dial(receiver.peer_id()).await.unwrap();
+    let mut incoming = tr.accept().await.unwrap();
+    let sender_id = sender.peer_id();
+    let (ack, handled) = tokio::join!(
+        async {
+            match features {
+                None => {
+                    abra_net::dial_handshake(&mut outgoing, sender_id, "sender".into())
+                        .await
+                        .unwrap();
+                }
+                Some(features) => {
+                    let hello = Hello {
+                        message_type: "hello".into(),
+                        wire: WIRE_VERSION,
+                        spec: abra_core::SPEC.into(),
+                        peer_id: sender_id,
+                        name: "old-peer".into(),
+                        features,
+                        nonce: "00".repeat(16),
+                        revocations: Vec::new(),
+                    };
+                    let (send, recv) = outgoing.control_mut();
+                    abra_net::write_frame(send, &hello).await.unwrap();
+                    let ok: serde_json::Value = abra_net::read_frame(recv).await.unwrap();
+                    assert_eq!(ok.get("type").and_then(|x| x.as_str()), Some("hello-ok"));
+                }
+            }
+            let (send, recv) = outgoing.control_mut();
+            abra_net::write_frame(send, message).await.unwrap();
+            let ack: serde_json::Value = abra_net::read_frame(recv).await.unwrap();
+            drop(outgoing);
+            ack
+        },
+        receiver.handle_connection(&mut incoming, abra_core::now_ms())
+    );
+    handled.unwrap();
+    ack
+}
+
+#[tokio::test]
+async fn control_handler_result_reaches_the_sender_and_the_event_is_recorded() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+    b.control_handler = Some(std::sync::Arc::new(ValueHandler(
+        serde_json::json!({"status": "queued"}),
+    )));
+    let message = control_message(&a, 1);
+    let ack = control_exchange(&a, &mut b, &message, None).await;
+    assert_eq!(ack["type"], "control-ack");
+    assert_eq!(ack["nonce"], message.nonce);
+    assert_eq!(ack["ok"], true);
+    assert_eq!(ack["result"]["echo"], "run the tests");
+    assert_eq!(ack["result"]["result"]["status"], "queued");
+    let ack: abra_net::ControlAck = serde_json::from_value(ack).unwrap();
+    assert!(ack.result.is_some());
+    assert_eq!(control_events(b_root.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn failing_control_handler_acks_not_ok_but_still_records_the_message() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+    b.control_handler = Some(std::sync::Arc::new(FailingHandler));
+    let ack = control_exchange(&a, &mut b, &control_message(&a, 2), None).await;
+    assert_eq!(ack["ok"], false);
+    assert!(ack["error"].as_str().unwrap().contains("adapter refused"));
+    assert!(ack.get("result").is_none());
+    assert_eq!(control_events(b_root.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn hung_control_handler_times_out_without_holding_the_session() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+    b.control_handler = Some(std::sync::Arc::new(SleepingHandler(Duration::from_secs(
+        60,
+    ))));
+    b.set_control_timeout_for_tests(Duration::from_millis(50));
+    let ack = control_exchange(&a, &mut b, &control_message(&a, 3), None).await;
+    assert_eq!(ack["ok"], false);
+    assert_eq!(ack["error"], "control handler timed out");
+    assert!(ack.get("result").is_none());
+    assert_eq!(control_events(b_root.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn dialer_without_control_result_feature_gets_an_ack_with_no_result_key() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+    b.control_handler = Some(std::sync::Arc::new(ValueHandler(serde_json::json!("x"))));
+    let ack = control_exchange(
+        &a,
+        &mut b,
+        &control_message(&a, 4),
+        Some(vec!["resume".into(), "control".into()]),
+    )
+    .await;
+    assert_eq!(ack["ok"], true);
+    assert!(ack.get("result").is_none(), "{ack}");
+    // The handler still ran and the message is still recorded.
+    assert_eq!(control_events(b_root.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn control_handler_io_error_is_scrubbed_before_it_reaches_the_sender() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+    let secret_path = b_root.path().join("adapters/secret-workspace.sock");
+    b.control_handler = Some(std::sync::Arc::new(IoFailingHandler(
+        secret_path.display().to_string(),
+    )));
+    let ack = control_exchange(&a, &mut b, &control_message(&a, 5), None).await;
+    assert_eq!(ack["ok"], false);
+    let error = ack["error"].as_str().unwrap();
+    assert!(
+        !error.contains(&secret_path.display().to_string()),
+        "{error}"
+    );
+    assert!(!error.contains("secret-workspace"), "{error}");
+    assert_eq!(error, "delivery validation failed");
+}
+
+/// A relayed capsule snapshot whose lease chain the receiver cannot authorize
+/// is shelved as a fork: the main move is withheld, a `fork/<8 hex>` label
+/// points at the snapshot, and the withheld main lands on a later delivery once
+/// the chain does apply.
+#[test]
+fn relay_delivery_with_unapplicable_main_label_records_a_fork_label() {
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let first_input = tempfile::tempdir().unwrap();
+    let second_input = tempfile::tempdir().unwrap();
+    fs::write(first_input.path().join("x"), b"first").unwrap();
+    fs::write(second_input.path().join("x"), b"second").unwrap();
+    let mut a = DeliveryNode::open(a_root.path()).unwrap();
+    let mut b = DeliveryNode::open(b_root.path()).unwrap();
+    trust_each_other(&mut a, &mut b);
+
+    let creator = Identity::generate();
+    let holder = Identity::generate();
+    let capsule_id = Hash::from_bytes([55; 32]);
+    let genesis = Genesis::new(
+        capsule_id,
+        abra_net::format_time(NOW),
+        "dev.abra.workspace".into(),
+        "capsule".into(),
+        &creator,
+    )
+    .unwrap();
+    let grant = LeaseRecord::new(
+        capsule_id,
+        creator.peer_id(),
+        1,
+        LeaseMode::Grant,
+        abra_net::format_time(NOW),
+        abra_net::format_time(NOW + 86_400_000),
+        genesis.hash().unwrap(),
+        &creator,
+    )
+    .unwrap();
+    a.store.add_capsule(genesis, grant.clone()).unwrap();
+
+    // The sender's capsule is at epoch 2 under a holder the receiver does not
+    // trust, so the receiver can adopt neither the lease chain nor the main
+    // move that depends on it.
+    let takeover = LeaseRecord::new(
+        capsule_id,
+        holder.peer_id(),
+        2,
+        LeaseMode::Takeover,
+        abra_net::format_time(NOW),
+        abra_net::format_time(NOW + 86_400_000),
+        grant.hash().unwrap(),
+        &holder,
+    )
+    .unwrap();
+    let first = full(&mut a, first_input.path(), capsule_id, "first");
+    a.store
+        .receive_full(first.clone(), abra_net::format_time(NOW), NOW, None)
+        .unwrap();
+    let main = LabelOp::new(
+        capsule_id,
+        1,
+        "main".into(),
+        first.snapshot_id(),
+        2,
+        abra_net::format_time(NOW),
+        &holder,
+    )
+    .unwrap();
+    assert!(a
+        .store
+        .adopt_capsule_state(capsule_id, &[takeover], Some(&main), &|_, _| true, NOW)
+        .unwrap());
+
+    let first_id = a.enqueue(b.peer_id(), &first, NOW).unwrap();
+    a.outbox.mark_relay_deposited(&first_id, NOW + 1).unwrap();
+    let main_before = b
+        .store
+        .capsules
+        .get(&capsule_id)
+        .and_then(|capsule| capsule.label("main").map(|label| label.snapshot_id));
+    let (_, ack) = b
+        .receive_relay_delivery(a.relay_delivery(&first_id, NOW + 1).unwrap(), NOW + 2)
+        .unwrap();
+    assert_eq!(ack.shelf, "capsule-fork");
+    let fork_label = format!("fork/{}", &first.snapshot_id().to_hex()[..8]);
+    let capsule = b.store.capsules.get(&capsule_id).unwrap();
+    assert_eq!(
+        capsule.label(&fork_label).unwrap().snapshot_id,
+        first.snapshot_id()
+    );
+    assert_eq!(
+        capsule.label("main").map(|label| label.snapshot_id),
+        main_before
+    );
+    let events = fs::read_to_string(b_root.path().join("net/events.ndjson")).unwrap();
+    assert!(events.lines().any(|line| {
+        line.contains(&first.snapshot_id().to_hex()) && line.contains(r#""via":"relay""#)
+    }));
+
+    // With the holder trusted the chain applies, and the main label the fork
+    // held back moves the receiver's head.
+    b.trust.insert(full_peer(holder.peer_id())).unwrap();
+    let mut manifest = full(&mut a, second_input.path(), capsule_id, "second")
+        .manifest()
+        .clone();
+    manifest.parents = Some(vec![first.snapshot_id()]);
+    manifest.sign(&a.store.keys.identity).unwrap();
+    let second = RawManifest::parse(manifest.to_canonical_bytes().unwrap()).unwrap();
+    let second_id = a.enqueue(b.peer_id(), &second, NOW).unwrap();
+    a.outbox.mark_relay_deposited(&second_id, NOW + 3).unwrap();
+    let (_, ack) = b
+        .receive_relay_delivery(a.relay_delivery(&second_id, NOW + 3).unwrap(), NOW + 4)
+        .unwrap();
+    assert_eq!(ack.shelf, "capsule-head");
+    let capsule = b.store.capsules.get(&capsule_id).unwrap();
+    assert_eq!(
+        capsule.label("main").unwrap().snapshot_id,
+        first.snapshot_id()
+    );
+    assert!(capsule.label(&fork_label).is_some());
+}
+
+#[test]
+fn pending_main_label_survives_reopen_until_parent_arrives() {
+    let sender_root = tempfile::tempdir().unwrap();
+    let receiver_root = tempfile::tempdir().unwrap();
+    let parent_input = tempfile::tempdir().unwrap();
+    let child_input = tempfile::tempdir().unwrap();
+    fs::write(parent_input.path().join("x"), b"parent").unwrap();
+    fs::write(child_input.path().join("x"), b"child").unwrap();
+    let mut sender = DeliveryNode::open(sender_root.path()).unwrap();
+    let mut receiver = DeliveryNode::open(receiver_root.path()).unwrap();
+    trust_each_other(&mut sender, &mut receiver);
+    let capsule_id = Hash::from_bytes([56; 32]);
+    add_test_capsule(&mut sender, capsule_id);
+
+    let parent = full(&mut sender, parent_input.path(), capsule_id, "parent");
+    sender
+        .store
+        .receive_full(parent.clone(), abra_net::format_time(NOW), NOW, None)
+        .unwrap();
+    let parent_id = sender.enqueue(receiver.peer_id(), &parent, NOW).unwrap();
+    sender
+        .outbox
+        .mark_relay_deposited(&parent_id, NOW + 1)
+        .unwrap();
+    let parent_delivery = sender.relay_delivery(&parent_id, NOW + 1).unwrap();
+
+    let mut child_manifest = full(&mut sender, child_input.path(), capsule_id, "child")
+        .manifest()
+        .clone();
+    child_manifest.parents = Some(vec![parent.snapshot_id()]);
+    child_manifest.sign(&sender.store.keys.identity).unwrap();
+    let child = RawManifest::parse(child_manifest.to_canonical_bytes().unwrap()).unwrap();
+    sender
+        .store
+        .receive_full(child.clone(), abra_net::format_time(NOW + 2), NOW + 2, None)
+        .unwrap();
+    let signer = Identity::from_secret_bytes(&sender.store.keys.identity.secret_bytes());
+    let main = LabelOp::new(
+        capsule_id,
+        1,
+        "main".into(),
+        child.snapshot_id(),
+        1,
+        abra_net::format_time(NOW + 2),
+        &signer,
+    )
+    .unwrap();
+    assert!(sender
+        .store
+        .adopt_capsule_state(capsule_id, &[], Some(&main), &|_, _| true, NOW + 2)
+        .unwrap());
+    let child_id = sender.enqueue(receiver.peer_id(), &child, NOW + 2).unwrap();
+    sender
+        .outbox
+        .mark_relay_deposited(&child_id, NOW + 3)
+        .unwrap();
+    let child_delivery = sender.relay_delivery(&child_id, NOW + 3).unwrap();
+
+    let (_, ack) = receiver
+        .receive_relay_delivery(child_delivery, NOW + 4)
+        .unwrap();
+    assert_eq!(ack.shelf, "capsule-fork");
+    drop(receiver);
+
+    let mut receiver = DeliveryNode::open(receiver_root.path()).unwrap();
+    receiver
+        .receive_relay_delivery(parent_delivery, NOW + 5)
+        .unwrap();
+    assert_eq!(
+        receiver.store.capsules[&capsule_id]
+            .label("main")
+            .unwrap()
+            .snapshot_id,
+        child.snapshot_id()
+    );
 }

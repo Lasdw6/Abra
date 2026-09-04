@@ -5,8 +5,8 @@ if [[ ${ABRA_INSTALL_PRIVATE_NS:-0} != 1 ]]; then
   exec env ABRA_INSTALL_PRIVATE_NS=1 unshare --mount --propagation private -- "$0" "$@"
 fi
 
-if [[ $# -lt 2 || $# -gt 4 ]]; then
-  echo "usage: sudo $0 ROOTFS_EXT4 ABRA_BIN [CADABRA_BIN [BROWSER_SESSION_DIR]]" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: sudo $0 ROOTFS_EXT4 ABRA_BIN [BROWSER_SESSION_DIR]" >&2
   exit 2
 fi
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -16,10 +16,9 @@ fi
 
 ROOTFS="$(realpath "$1")"
 ABRA_BIN="$(realpath "$2")"
-CADABRA_BIN="$(realpath "${3:-$2}")"
 BROWSER_SESSION_DIR=""
-if [[ $# -eq 4 ]]; then
-  BROWSER_SESSION_DIR="$(realpath "$4")"
+if [[ $# -eq 3 ]]; then
+  BROWSER_SESSION_DIR="$(realpath "$3")"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_DIR="$(mktemp -d)"
@@ -50,7 +49,7 @@ safe_dest() {
     fi
   done
 }
-for dest in usr/local/bin/abra usr/local/bin/cadabra usr/local/libexec/abra-observer \
+for dest in usr/local/bin/abra usr/local/libexec/abra-observer \
             usr/local/libexec/abra-start-guest usr/local/bin/os-desktop-init.sh \
             usr/local/bin/abra-browser var/lib/abra workspace etc/abra \
             var/lib/abra/adapters/browser-session var/lib/abra/browser-session-data \
@@ -63,13 +62,12 @@ for dest in usr/local/bin/abra usr/local/bin/cadabra usr/local/libexec/abra-obse
             var/lib/abra/adapters/browser-session/lib/cli.js \
             var/lib/abra/adapters/browser-session/lib/import.js \
             var/lib/abra/adapters/browser-session/lib/util.js \
-            etc/systemd/system/cadabra.service etc/systemd/system/abra-observer.service \
-            etc/systemd/system/multi-user.target.wants/cadabra.service \
+            etc/systemd/system/abra-daemon.service etc/systemd/system/abra-observer.service \
+            etc/systemd/system/multi-user.target.wants/abra-daemon.service \
             etc/systemd/system/multi-user.target.wants/abra-observer.service; do
   safe_dest "$MOUNT_DIR/$dest"
 done
 install -D -m 0755 "$ABRA_BIN" "$MOUNT_DIR/usr/local/bin/abra"
-install -D -m 0755 "$CADABRA_BIN" "$MOUNT_DIR/usr/local/bin/cadabra"
 install -D -m 0755 "$SCRIPT_DIR/observer.py" "$MOUNT_DIR/usr/local/libexec/abra-observer"
 install -D -m 0755 "$SCRIPT_DIR/start-guest.sh" "$MOUNT_DIR/usr/local/libexec/abra-start-guest"
 install -D -m 0755 "$SCRIPT_DIR/os-desktop-init.sh" "$MOUNT_DIR/usr/local/bin/os-desktop-init.sh"
@@ -102,7 +100,7 @@ exec /usr/bin/node /var/lib/abra/adapters/browser-session/bin/abra-browser.js "$
 EOF
 fi
 
-install -D -m 0644 /dev/stdin "$MOUNT_DIR/etc/systemd/system/cadabra.service" <<'EOF'
+install -D -m 0644 /dev/stdin "$MOUNT_DIR/etc/systemd/system/abra-daemon.service" <<'EOF'
 [Unit]
 Description=Abra guest daemon
 After=network-online.target
@@ -122,7 +120,7 @@ EOF
 install -D -m 0644 /dev/stdin "$MOUNT_DIR/etc/systemd/system/abra-observer.service" <<'EOF'
 [Unit]
 Description=Abra ambient process observer
-After=cadabra.service
+After=abra-daemon.service
 
 [Service]
 Type=simple
@@ -134,7 +132,7 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-ln -sfn /etc/systemd/system/cadabra.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/cadabra.service"
+ln -sfn /etc/systemd/system/abra-daemon.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/abra-daemon.service"
 ln -sfn /etc/systemd/system/abra-observer.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/abra-observer.service"
 sync
 echo "installed Abra guest payload into $ROOTFS"

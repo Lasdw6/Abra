@@ -1,26 +1,30 @@
 //! Library-first Abra daemon and its newline-delimited JSON control API.
 #![forbid(unsafe_code)]
 pub mod adapters;
+pub mod background;
 pub mod relay;
 
 use abra_core::{
     capsule::{random_capsule_id, Genesis, LabelOp, LeaseMode, LeaseRecord},
     cas::{materialize, snapshot_dir, EntryMode, Hash, Tree, TreeEntry},
     identity::{PeerId, Signature},
-    manifest::{Fingerprint, Manifest, NativeBlobRef, Origin, RawManifest, Recipe, Scope},
+    manifest::{
+        Fingerprint, Manifest, NativeBlobRef, Origin, Provenance, RawManifest, Recipe, Scope,
+    },
     now_ms,
 };
 #[cfg(feature = "tcp")]
 use abra_net::TcpTransport;
 use abra_net::{
-    dial_handshake, dial_handshake_with_trust, format_time, read_frame, write_frame, ControlAck,
+    dial_handshake, dial_handshake_with_trust, format_time, write_frame, ControlAck,
     ControlMessage, ControlOp, DeliveryNode, EnrollBind, EnrollmentToken, Intro, LocalRole,
-    LoopbackNetwork, LoopbackTransport, PairAccept, PairRequest, PairTicket, Role, Scopes,
-    Transport, TrustedPeer,
+    LoopbackNetwork, LoopbackTransport, OutboxEntry, OutboxState, PairAccept, PairRequest,
+    PairTicket, Role, Scopes, Transport, TrustedPeer,
 };
 #[cfg(feature = "iroh")]
 use abra_net::{IrohRelayMode, IrohTransport};
 use rand::Rng;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -91,16 +95,26 @@ impl DaemonConfig {
 }
 const MAX_INBOUND_SESSIONS: usize = 32;
 const MAX_WATCHERS: usize = 8;
-const MAX_EVENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
+/// Default for `send --wait`, `inbox --wait`, and `accept --workspace`.
+const DEFAULT_WAIT_MS: u64 = 120_000;
+/// Waiting polls durable state instead of holding the node mutex.
+const WAIT_POLL: Duration = Duration::from_millis(100);
+/// Inbox waiting also drives a relay poll, so it ticks slower.
+const INBOX_POLL: Duration = Duration::from_millis(250);
 
 /// A running daemon owns exactly one durable network/store node.
 pub struct Daemon {
     root: PathBuf,
+    config: DaemonConfig,
     node: Arc<Mutex<DeliveryNode>>,
     transport: Arc<dyn Transport>,
     shutdown: watch::Sender<bool>,
     yes: bool,
     watchers: Arc<Semaphore>,
+    adapter_sources: Vec<adapters::ExtraAdapterDir>,
+    /// Outbox ids whose ack already produced a `send-acked` event, so the
+    /// waiter and the outbox worker record it exactly once.
+    acked_events: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 pub struct RunningDaemon {
@@ -110,6 +124,8 @@ pub struct RunningDaemon {
     _lock: File,
 }
 
+/// Unknown fields are ignored on purpose: grants written before recipe
+/// auto-run was removed still carry `auto_run_recipes`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ReceiveGrant {
     id: String,
@@ -118,16 +134,19 @@ struct ReceiveGrant {
     #[serde(default)]
     capsule: Option<Hash>,
     auto_accept: bool,
-    auto_run_recipes: bool,
     destination: Option<PathBuf>,
+    /// Re-deliver every auto-accepted snapshot to this peer.
+    #[serde(default)]
+    forward: Option<PeerId>,
 }
 
+/// Where this device last put a capsule. Written by every materializing path so
+/// a control message can tell an adapter which directory to act in.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RecipeProcess {
-    capsule: String,
-    snapshot: Hash,
-    pid: u32,
-    argv: Vec<String>,
+struct WorkspaceRecord {
+    path: PathBuf,
+    snapshot_id: Option<Hash>,
+    at: String,
 }
 
 impl RunningDaemon {
@@ -164,12 +183,40 @@ impl Daemon {
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             root,
+            config,
             node: Arc::new(Mutex::new(node)),
             transport,
             shutdown,
             yes,
             watchers: Arc::new(Semaphore::new(MAX_WATCHERS)),
+            adapter_sources: Vec::new(),
+            acked_events: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
         })
+    }
+
+    /// Extra adapter discovery directories for this process only; nothing is
+    /// persisted. Call before starting the daemon.
+    pub fn set_adapter_sources(&mut self, sources: Vec<adapters::ExtraAdapterDir>) {
+        self.adapter_sources = sources;
+    }
+
+    fn registry(&self) -> Result<adapters::AdapterRegistry> {
+        adapters::AdapterRegistry::discover_with(&self.root, &self.adapter_sources)
+    }
+
+    fn detached_node(&self) -> Result<DeliveryNode> {
+        let mut node = DeliveryNode::open(&self.root)?;
+        node.skip_native = self.config.skip_native;
+        node.offer_budget = self.config.offer_budget;
+        node.auto_confirm_pairs = self.yes;
+        if let LocalRole::Guest { token } = node.trust.local_role() {
+            node.allow_agent_send = token.scopes.send;
+        }
+        node.control_handler = Some(Arc::new(ControlRouter {
+            root: self.root.clone(),
+            adapter_sources: self.adapter_sources.clone(),
+        }));
+        Ok(node)
     }
 
     pub fn loopback(root: impl AsRef<Path>, network: &LoopbackNetwork, yes: bool) -> Result<Self> {
@@ -203,21 +250,6 @@ impl Daemon {
     pub async fn iroh(root: impl AsRef<Path>, yes: bool) -> Result<Self> {
         let config = DaemonConfig::load(root.as_ref())?;
         let relay = config.iroh_relay.parse::<IrohRelayMode>()?;
-        Self::iroh_configured(root, yes, relay).await
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn iroh_with_relay(
-        root: impl AsRef<Path>,
-        yes: bool,
-        relay: IrohRelayMode,
-    ) -> Result<Self> {
-        let root = root.as_ref();
-        DaemonConfig {
-            iroh_relay: relay.to_string(),
-            ..DaemonConfig::load(root)?
-        }
-        .save(root)?;
         Self::iroh_configured(root, yes, relay).await
     }
 
@@ -268,11 +300,21 @@ impl Daemon {
     }
 
     pub async fn peer_id(&self) -> PeerId {
-        self.node.lock().await.peer_id()
+        self.locked_node()
+            .await
+            .expect("daemon node refresh")
+            .peer_id()
     }
 
-    fn fresh_node(&self) -> Result<DeliveryNode> {
-        DeliveryNode::open(&self.root).map_err(Into::into)
+    /// Lock the daemon's single node after refreshing the durable state that
+    /// detached network sessions may have written since the last use. Never
+    /// hold this guard across network, relay, adapter, or subprocess awaits.
+    async fn locked_node(&self) -> Result<tokio::sync::MutexGuard<'_, DeliveryNode>> {
+        let mut node = self.node.lock().await;
+        node.store = abra_core::store::AbraStore::open(&self.root)?;
+        node.trust.reload()?;
+        node.outbox = abra_net::Outbox::open(&self.root)?;
+        Ok(node)
     }
 
     pub async fn join(&self, encoded: &str) -> Result<Value> {
@@ -290,7 +332,7 @@ impl Daemon {
         let mut connection = self.transport.dial(intro.peer_id).await?;
         dial_handshake(&mut connection, self.peer_id().await, "abra".into()).await?;
         let bind = {
-            let node = self.node.lock().await;
+            let node = self.locked_node().await?;
             EnrollBind::sign(
                 token.clone(),
                 Some("guest".into()),
@@ -302,7 +344,12 @@ impl Daemon {
         };
         let (send, recv) = connection.control_mut();
         write_frame(send, &bind).await?;
-        let ok: abra_net::EnrollOk = read_frame(recv).await?;
+        let ok: abra_net::EnrollOk = abra_net::read_frame_timeout(recv, Duration::from_secs(630))
+            .await
+            .map_err(|error| match error {
+                abra_net::Error::Timeout => "enrollment timed out".into(),
+                error => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+            })?;
         if ok.message_type != "enroll-ok"
             || ok.certificate.guest_peer_id != self.peer_id().await
             || intro.peer_id != token.issuer
@@ -310,7 +357,7 @@ impl Daemon {
             return Err("invalid enrollment response".into());
         }
         ok.certificate.verify(token.issuer)?;
-        let mut node = self.node.lock().await;
+        let mut node = self.locked_node().await?;
         node.trust.insert(TrustedPeer {
             peer_id: intro.peer_id,
             name: intro.name.clone(),
@@ -348,6 +395,27 @@ impl Daemon {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<RunningDaemon> {
+        let (socket, listener, lock) = self.bind_control_socket().await?;
+        background::clear_stale_pid_file(&self.root);
+        if let Err(error) = self.poll_relays().await {
+            eprintln!("cadabra: startup relay poll error: {error}");
+        }
+        let mut tasks = vec![
+            self.spawn_control_server(listener),
+            self.spawn_relay_poller(),
+            self.spawn_lease_renewer(),
+        ];
+        tasks.extend(self.spawn_inbound_workers());
+        tasks.push(self.spawn_outbox_worker());
+        Ok(RunningDaemon {
+            shutdown: self.shutdown.clone(),
+            tasks,
+            socket,
+            _lock: lock,
+        })
+    }
+
+    async fn bind_control_socket(&self) -> Result<(PathBuf, UnixListener, File)> {
         let socket = self.root.join("cadabra.sock");
         if socket.exists()
             && tokio::time::timeout(
@@ -385,14 +453,14 @@ impl Daemon {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         }
-        let mut tasks = Vec::new();
-        if let Err(error) = self.poll_relays().await {
-            eprintln!("cadabra: startup relay poll error: {error}");
-        }
+        Ok((socket, listener, lock))
+    }
+
+    fn spawn_control_server(self: &Arc<Self>, listener: UnixListener) -> JoinHandle<()> {
         let daemon = Arc::clone(self);
         let clients = Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS));
         let mut stop = self.shutdown.subscribe();
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
@@ -415,10 +483,13 @@ impl Daemon {
                     }
                 }
             }
-        }));
+        })
+    }
+
+    fn spawn_relay_poller(self: &Arc<Self>) -> JoinHandle<()> {
         let daemon = Arc::clone(self);
         let mut stop = self.shutdown.subscribe();
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut last_poll = tokio::time::Instant::now();
             loop {
                 let seconds = relay::RelayConfig::load(&daemon.root)
@@ -435,11 +506,13 @@ impl Daemon {
                     }
                 }
             }
-        }));
+        })
+    }
+
+    fn spawn_lease_renewer(self: &Arc<Self>) -> JoinHandle<()> {
         let daemon = Arc::clone(self);
-        let sessions = Arc::new(Semaphore::new(MAX_INBOUND_SESSIONS));
         let mut stop = self.shutdown.subscribe();
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
@@ -450,107 +523,129 @@ impl Daemon {
                     }
                 }
             }
-        }));
-        // Multiple accept workers ensure transport wrapping/authentication never
-        // serializes the listener. Each handshake already has a transport-level
-        // timeout, and the session semaphore bounds total work.
-        for _ in 0..4 {
-            let daemon = Arc::clone(self);
-            let sessions = Arc::clone(&sessions);
-            let mut stop = self.shutdown.subscribe();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = stop.changed() => break,
-                        incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
-                            let peer = connection.peer_id();
-                            let addresses = connection.observed_addresses().to_vec();
-                            let Ok(_permit) = sessions.clone().acquire_owned().await else { break; };
-                            match DeliveryNode::open(&daemon.root) {
-                                Ok(mut node) => {
-                                    node.auto_confirm_pairs = daemon.yes;
-                                    let heads_before = main_heads(&node);
-                                    if let Err(error) = node.handle_connection(&mut connection, now_ms()).await {
-                                        eprintln!("cadabra: incoming session error: {error}");
-                                    } else {
-                                        let changed_heads = main_heads(&node)
-                                            .difference(&heads_before)
-                                            .copied()
-                                            .collect::<std::collections::BTreeSet<_>>();
-                                        if let Err(error) = node.trust.update_addresses(peer, addresses) {
-                                            eprintln!("cadabra: peer address persistence error: {error}");
-                                        }
-                                        if let Err(error) = daemon.apply_receive_grants(peer, &changed_heads).await {
-                                            eprintln!("cadabra: receive policy error: {error}");
+        })
+    }
+
+    // Multiple accept workers ensure transport wrapping/authentication never
+    // serializes the listener. Each handshake already has a transport-level
+    // timeout, and the session semaphore bounds total work.
+    fn spawn_inbound_workers(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
+        let sessions = Arc::new(Semaphore::new(MAX_INBOUND_SESSIONS));
+        (0..4)
+            .map(|_| {
+                let daemon = Arc::clone(self);
+                let sessions = Arc::clone(&sessions);
+                let mut stop = self.shutdown.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            incoming = daemon.transport.accept() => if let Ok(mut connection) = incoming {
+                                let peer = connection.peer_id();
+                                let addresses = connection.observed_addresses().to_vec();
+                                let Ok(_permit) = sessions.clone().acquire_owned().await else { break; };
+                                match daemon.detached_node() {
+                                    Ok(mut node) => {
+                                        let heads_before = main_heads(&node);
+                                        if let Err(error) = node.handle_connection(&mut connection, now_ms()).await {
+                                            eprintln!("cadabra: incoming session error: {error}");
+                                        } else {
+                                            let changed_heads = main_heads(&node)
+                                                .difference(&heads_before)
+                                                .copied()
+                                                .collect::<std::collections::BTreeSet<_>>();
+                                            if let Err(error) = node.trust.update_addresses(peer, addresses) {
+                                                eprintln!("cadabra: peer address persistence error: {error}");
+                                            }
+                                            if let Err(error) = daemon.apply_receive_grants(peer, &changed_heads).await {
+                                                eprintln!("cadabra: receive policy error: {error}");
+                                            }
                                         }
                                     }
+                                    Err(error) => eprintln!("cadabra: session store error: {error}"),
                                 }
-                                Err(error) => eprintln!("cadabra: session store error: {error}"),
                             }
                         }
                     }
-                }
-            }));
-        }
+                })
+            })
+            .collect()
+    }
+
+    fn spawn_outbox_worker(self: &Arc<Self>) -> JoinHandle<()> {
         let daemon = Arc::clone(self);
         let mut stop = self.shutdown.subscribe();
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(100)) => daemon.work_outbox().await,
                 }
             }
-        }));
-        Ok(RunningDaemon {
-            shutdown: self.shutdown.clone(),
-            tasks,
-            socket,
-            _lock: lock,
         })
     }
 
     async fn work_outbox(&self) {
-        let pending = self.node.lock().await.outbox.pending_ids(now_ms());
-        for id in pending {
-            let peer = {
-                let mut node = self.node.lock().await;
-                let Some(peer) = node.outbox.get(&id).map(|entry| entry.peer_id) else {
-                    continue;
-                };
-                let now = now_ms();
-                if node.trust.get(&peer).is_none() || node.trust.is_revoked_guest(&peer, now) {
-                    let _ =
-                        node.outbox
-                            .fail_attempt(&id, "recipient trust was revoked".into(), now);
-                    continue;
+        // Refresh once for this worker tick, then detach each network session.
+        let pending = match self.locked_node().await {
+            Ok(mut node) => {
+                let mut pending = Vec::new();
+                for id in node.outbox.pending_ids(now_ms()) {
+                    let Some(peer) = node.outbox.get(&id).map(|entry| entry.peer_id) else {
+                        continue;
+                    };
+                    let now = now_ms();
+                    if node.trust.get(&peer).is_none() || node.trust.is_revoked_guest(&peer, now) {
+                        let _ = node.outbox.fail_attempt(
+                            &id,
+                            "recipient trust was revoked".into(),
+                            now,
+                        );
+                        continue;
+                    }
+                    pending.push((id, peer, node.outgoing_session()));
                 }
-                peer
-            };
+                pending
+            }
+            Err(error) => {
+                eprintln!("cadabra: outbox reload error: {error}");
+                return;
+            }
+        };
+        for (id, peer, mut session) in pending {
             match self.transport.dial(peer).await {
                 Ok(mut connection) => {
                     let addresses = connection.observed_addresses().to_vec();
-                    let mut session = self.node.lock().await.outgoing_session();
                     let result = session.send_offer(&id, &mut connection, now_ms()).await;
                     if let Err(error) = &result {
                         eprintln!("cadabra: outgoing session error: {error}");
                     }
-                    if let Err(error) = self
-                        .node
-                        .lock()
-                        .await
-                        .outbox
-                        .sync_entry_from(&session.outbox, &id)
                     {
-                        eprintln!("cadabra: outbox session merge error: {error}");
+                        let mut node = match self.locked_node().await {
+                            Ok(node) => node,
+                            Err(error) => {
+                                eprintln!("cadabra: node refresh after send error: {error}");
+                                continue;
+                            }
+                        };
+                        if let Err(error) = node.outbox.sync_entry_from(&session.outbox, &id) {
+                            eprintln!("cadabra: outbox session merge error: {error}");
+                        }
+                        if let Some(entry) = node
+                            .outbox
+                            .get(&id)
+                            .filter(|entry| entry.state == OutboxState::Acked)
+                        {
+                            if let Err(error) = self.record_send_acked(entry) {
+                                eprintln!("cadabra: send-acked event error: {error}");
+                            }
+                        }
                     }
-                    if let Err(error) = self
-                        .node
-                        .lock()
-                        .await
-                        .trust
-                        .update_addresses(peer, addresses)
-                    {
+                    if let Err(error) = self.locked_node().await.and_then(|mut node| {
+                        node.trust
+                            .update_addresses(peer, addresses)
+                            .map_err(Into::into)
+                    }) {
                         eprintln!("cadabra: peer address persistence error: {error}");
                     }
                     if result.is_err() {
@@ -560,11 +655,9 @@ impl Daemon {
                     }
                 }
                 Err(error) => {
-                    let _ = self.node.lock().await.outbox.fail_attempt(
-                        &id,
-                        error.to_string(),
-                        now_ms(),
-                    );
+                    if let Ok(mut node) = self.locked_node().await {
+                        let _ = node.outbox.fail_attempt(&id, error.to_string(), now_ms());
+                    }
                     if let Err(relay_error) = self.deposit_if_due(&id).await {
                         eprintln!("cadabra: relay deposit error: {relay_error}");
                     }
@@ -575,7 +668,7 @@ impl Daemon {
 
     async fn deposit_if_due(&self, id: &str) -> Result<()> {
         let mut config = relay::RelayConfig::load(&self.root)?;
-        let node = self.node.lock().await;
+        let node = self.locked_node().await?;
         let entry = node.outbox.get(id).cloned().ok_or("unknown outbox id")?;
         if entry.attempts < config.relay_after_attempts || config.relays.is_empty() {
             return Ok(());
@@ -617,9 +710,8 @@ impl Daemon {
             deposited = true;
         }
         if deposited {
-            self.node
-                .lock()
-                .await
+            self.locked_node()
+                .await?
                 .outbox
                 .mark_relay_deposited(id, now_ms())?;
         }
@@ -635,16 +727,25 @@ impl Daemon {
         let config = relay::RelayConfig::load(&self.root)?;
         let mut count = 0;
         for endpoint in config.relays {
-            let mut node = self.node.lock().await;
+            let mut node = self.locked_node().await?.outgoing_session();
             let heads_before = main_heads(&node);
             let (handled, senders) =
                 relay::poll(&self.root, &mut node, &endpoint, now_ms()).await?;
-            let changed_heads = main_heads(&node)
+            let mut refreshed = self.locked_node().await?;
+            // Acks fetched from the relay landed in the detached outbox copy;
+            // carry them into the durable one.
+            for entry in node.outbox.entries() {
+                if entry.state == OutboxState::Acked {
+                    refreshed.outbox.sync_entry_from(&node.outbox, &entry.id)?;
+                }
+            }
+            drop(node);
+            let changed_heads = main_heads(&refreshed)
                 .difference(&heads_before)
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
             count += handled;
-            drop(node);
+            drop(refreshed);
             for sender in senders {
                 self.apply_receive_grants(sender, &changed_heads).await?;
             }
@@ -753,11 +854,37 @@ impl Daemon {
 
     /// Execute one control request. This is also the in-process test API.
     pub async fn handle(&self, request: Value) -> Result<Value> {
-        self.node.lock().await.trust.reload()?;
         let op = request
             .get("op")
             .and_then(Value::as_str)
             .ok_or("request lacks op")?;
+        // One refresh per request; every op below then uses the locked node.
+        drop(self.locked_node().await?);
+        self.authorize_op(op).await?;
+        match op {
+            "status" => self.status().await,
+            "events" => self.events(),
+            "control" => self.send_control(&request).await,
+            "pair-ticket" | "pair-add" | "pair-confirm" | "pending-pairs" | "peers"
+            | "enroll-mint" | "enroll-join" | "revoke" => self.handle_pairing(op, &request).await,
+            "adapters-list" | "adapters-add" | "adapters-remove" | "inspect" => {
+                self.handle_adapters(op, &request).await
+            }
+            "relay-list" | "relay-add" | "relay-remove" => self.handle_relays(op, &request).await,
+            "policy-grant" | "policy-list" | "policy-clear" | "policy-revoke" => {
+                self.handle_policy(op, &request).await
+            }
+            "capsule-create" | "capsules" | "log" | "snapshot" | "native-attach"
+            | "lease-status" | "lease-take" => self.handle_capsules(op, &request).await,
+            "send" | "inbox" | "accept" | "outbox" | "cancel" | "handoffs" => {
+                self.handle_delivery(op, &request).await
+            }
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    /// Mesh-wide authority stays on full devices; guests may only move data.
+    async fn authorize_op(&self, op: &str) -> Result<()> {
         if matches!(
             op,
             "pair-ticket"
@@ -769,30 +896,35 @@ impl Daemon {
                 | "policy-revoke"
                 | "policy-clear"
                 | "control"
-                | "lease-take"
-                | "mesh-profile"
-        ) && !matches!(self.node.lock().await.trust.local_role(), LocalRole::Full)
-        {
+        ) && !matches!(
+            self.locked_node().await?.trust.local_role(),
+            LocalRole::Full
+        ) {
             return Err("operation requires a full device; this daemon is a guest".into());
         }
+        Ok(())
+    }
+
+    async fn status(&self) -> Result<Value> {
+        let node = self.locked_node().await?;
+        let outbox_errors = node
+            .outbox
+            .entries()
+            .filter_map(|entry| {
+                entry
+                    .last_error
+                    .as_ref()
+                    .map(|error| json!({"id":entry.id,"error":error}))
+            })
+            .collect::<Vec<_>>();
+        let grant_errors = load_grant_errors(&self.root)?;
+        Ok(
+            json!({"running":true,"peer_id":node.peer_id(),"root":self.root,"peers":node.trust.peers().len(),"outbox_pending":node.outbox.entries().filter(|e| !e.state.terminal()).count(),"outbox_errors":outbox_errors,"grant_errors":grant_errors}),
+        )
+    }
+
+    async fn handle_pairing(&self, op: &str, request: &Value) -> Result<Value> {
         match op {
-            "status" => {
-                let node = self.fresh_node()?;
-                let outbox_errors = node
-                    .outbox
-                    .entries()
-                    .filter_map(|entry| {
-                        entry
-                            .last_error
-                            .as_ref()
-                            .map(|error| json!({"id":entry.id,"error":error}))
-                    })
-                    .collect::<Vec<_>>();
-                let grant_errors = load_grant_errors(&self.root)?;
-                Ok(
-                    json!({"running":true,"peer_id":node.peer_id(),"root":self.root,"peers":node.trust.peers().len(),"outbox_pending":node.outbox.entries().filter(|e| !e.state.terminal()).count(),"outbox_errors":outbox_errors,"grant_errors":grant_errors}),
-                )
-            }
             "pair-ticket" => {
                 let addresses = self.transport.wait_local_addresses().await?;
                 warn_if_lan_only(
@@ -800,9 +932,9 @@ impl Daemon {
                     self.transport.requires_relay_for_wide_area(),
                     &addresses,
                 );
-                let mut node = self.node.lock().await;
+                let mut node = self.locked_node().await?;
                 let ticket = PairTicket::mint(
-                    string_or(&request, "name", "device"),
+                    string_or(request, "name", "device"),
                     node.store.keys.x25519_public(),
                     Some(node.store.keys.relay_discovery_key),
                     addresses,
@@ -813,48 +945,85 @@ impl Daemon {
                 node.trust.register_ticket(ticket.clone())?;
                 Ok(json!({"ticket":ticket.encode()?}))
             }
-            "pair-add" => self.pair_add(required_str(&request, "ticket")?).await,
+            "pair-add" => self.pair_add(required_str(request, "ticket")?).await,
             "pair-confirm" => {
-                let peer: PeerId = required_str(&request, "id")?.parse()?;
-                self.node.lock().await.approve_pair(peer)?;
+                let peer: PeerId = required_str(request, "id")?.parse()?;
+                self.locked_node().await?.approve_pair(peer)?;
                 Ok(json!({"confirmed":peer}))
             }
             "pending-pairs" => {
-                let node = self.node.lock().await;
+                let node = self.locked_node().await?;
                 Ok(serde_json::to_value(node.durable_pending_pairs()?)?)
             }
             "peers" => {
-                let node = self.fresh_node()?;
+                let node = self.locked_node().await?;
                 Ok(serde_json::to_value(
                     node.trust.peers().values().collect::<Vec<_>>(),
                 )?)
             }
-            "capsule-create" => {
-                self.capsule_create(Path::new(required_str(&request, "path")?))
-                    .await
+            "enroll-mint" => self.enroll(request).await,
+            "enroll-join" => self.join(required_str(request, "token")?).await,
+            "revoke" => {
+                let token_id = required_str(request, "token_id")?;
+                let mut node = self.locked_node().await?;
+                let identity = node.store.keys.identity.clone();
+                node.trust.revoke_token(token_id, now_ms(), &identity)?;
+                Ok(json!({"revoked":token_id}))
             }
-            "snapshot" => self.snapshot(&request).await,
-            "native-attach" => self.native_attach(&request).await,
-            "send" => self.send(&request).await,
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    async fn handle_adapters(&self, op: &str, request: &Value) -> Result<Value> {
+        match op {
             "adapters-list" => {
-                let registry = adapters::AdapterRegistry::discover(&self.root)?;
+                let registry = self.registry()?;
                 Ok(serde_json::to_value(registry.list())?)
             }
             "adapters-add" => {
                 adapters::AdapterRegistry::add(
                     &self.root,
-                    Path::new(required_str(&request, "dir")?),
+                    Path::new(required_str(request, "dir")?),
+                    &self.adapter_sources,
                 )?;
-                Ok(json!({"added":required_str(&request, "dir")?}))
+                Ok(json!({"added":required_str(request, "dir")?}))
             }
             "adapters-remove" => {
-                adapters::AdapterRegistry::remove(&self.root, required_str(&request, "name")?)?;
-                Ok(json!({"removed":required_str(&request, "name")?}))
+                adapters::AdapterRegistry::remove(&self.root, required_str(request, "name")?)?;
+                Ok(json!({"removed":required_str(request, "name")?}))
             }
-            "inbox" => {
-                self.poll_relays().await?;
-                self.inbox().await
+            "inspect" => {
+                let kind = required_str(request, "kind")?;
+                let source = json_object_or_string(required_str(request, "source")?);
+                let options = adapter_options(request)?;
+                self.inspect_source(kind, source, &options).await
             }
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    /// Run only an adapter's `inspect` verb and report what it found.
+    async fn inspect_source(
+        &self,
+        kind: &str,
+        source: Value,
+        options: &BTreeMap<String, String>,
+    ) -> Result<Value> {
+        let report = self
+            .registry()?
+            .inspect(kind, source, options, None)
+            .await?;
+        let parsed: adapters::InspectResult = serde_json::from_value(report.clone())?;
+        record_event(
+            &self.root,
+            "adapter-inspect",
+            json!({"kind":kind,"warnings":parsed.warnings.len(),"blocked":parsed.blocked.len()}),
+        )?;
+        Ok(report)
+    }
+
+    async fn handle_relays(&self, op: &str, request: &Value) -> Result<Value> {
+        match op {
             "relay-list" => {
                 let config = relay::RelayConfig::load(&self.root)?;
                 Ok(Value::Array(
@@ -866,7 +1035,7 @@ impl Daemon {
                 ))
             }
             "relay-add" => {
-                let url = required_str(&request, "url")?
+                let url = required_str(request, "url")?
                     .trim_end_matches('/')
                     .to_owned();
                 let secret = request
@@ -875,13 +1044,6 @@ impl Daemon {
                     .unwrap_or("")
                     .to_owned();
                 let mut config = relay::RelayConfig::load(&self.root)?;
-                if let Some(n) = request.get("relay_after_attempts").and_then(Value::as_u64) {
-                    config.relay_after_attempts =
-                        u32::try_from(n).map_err(|_| "relay_after_attempts is too large")?;
-                }
-                if let Some(n) = request.get("poll_seconds").and_then(Value::as_u64) {
-                    config.relay_poll_seconds = n.max(5);
-                }
                 if let Some(existing) = config.relays.iter_mut().find(|r| r.url == url) {
                     existing.secret = secret;
                 } else {
@@ -899,71 +1061,74 @@ impl Daemon {
                 )
             }
             "relay-remove" => {
-                let url = required_str(&request, "url")?.trim_end_matches('/');
+                let url = required_str(request, "url")?.trim_end_matches('/');
                 let mut config = relay::RelayConfig::load(&self.root)?;
                 let before = config.relays.len();
                 config.relays.retain(|r| r.url != url);
                 config.save(&self.root)?;
                 Ok(json!({"removed":before != config.relays.len(),"url":url}))
             }
-            "accept" => self.accept(&request).await,
-            "log" => self.log(&request).await,
-            "capsules" => self.capsules().await,
-            "mesh-profile" => {
-                let mut node = self.node.lock().await;
-                if let Some(profile) = request.get("profile").and_then(Value::as_str) {
-                    let profile = match profile {
-                        "personal" => abra_net::MeshProfile::Personal,
-                        "fleet" => abra_net::MeshProfile::Fleet,
-                        _ => return Err("mesh profile must be personal or fleet".into()),
-                    };
-                    node.trust.set_mesh_profile(profile)?;
-                }
-                Ok(json!({"profile":node.trust.mesh_profile()}))
-            }
-            "enroll-mint" => self.enroll(&request).await,
-            "enroll-join" => self.join(required_str(&request, "token")?).await,
-            "revoke" => {
-                let token_id = required_str(&request, "token_id")?;
-                let mut node = self.node.lock().await;
-                let identity = node.store.keys.identity.clone();
-                node.trust.revoke_token(token_id, now_ms(), &identity)?;
-                Ok(json!({"revoked":token_id}))
-            }
-            "policy-grant" => self.policy_grant(&request).await,
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    async fn handle_policy(&self, op: &str, request: &Value) -> Result<Value> {
+        match op {
+            "policy-grant" => self.policy_grant(request).await,
             "policy-list" => Ok(serde_json::to_value(self.load_grants()?)?),
             "policy-clear" => {
                 clear_grant_errors(&self.root)?;
                 Ok(json!({"cleared":true}))
             }
             "policy-revoke" => {
-                let id = required_str(&request, "id")?;
-                let mut grants = self.load_grants()?;
-                if grants.remove(id).is_none() {
+                let id = required_str(request, "id")?;
+                let removed = update_json_file(
+                    &self.grants_path(),
+                    |grants: &mut BTreeMap<String, ReceiveGrant>| Ok(grants.remove(id).is_some()),
+                )?;
+                if !removed {
                     return Err("unknown policy grant".into());
                 }
-                self.save_grants(&grants)?;
                 Ok(json!({"revoked":id}))
             }
-            "ps" => Ok(serde_json::to_value(self.load_processes()?)?),
-            "stop-recipes" => self.stop_recipes(required_str(&request, "capsule")?),
-            "events" => self.events(),
-            "control" => self.send_control(&request).await,
-            "lease-status" => self.lease_status(&request).await,
-            "lease-take" => self.lease_take(&request).await,
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    async fn handle_capsules(&self, op: &str, request: &Value) -> Result<Value> {
+        match op {
+            "capsule-create" => {
+                self.capsule_create(Path::new(required_str(request, "path")?))
+                    .await
+            }
+            "capsules" => self.capsules().await,
+            "log" => self.log(request).await,
+            "snapshot" => self.snapshot(request).await,
+            "native-attach" => self.native_attach(request).await,
+            "lease-status" => self.lease_status(request).await,
+            "lease-take" => self.lease_take(request).await,
+            _ => Err(format!("unknown operation: {op}").into()),
+        }
+    }
+
+    async fn handle_delivery(&self, op: &str, request: &Value) -> Result<Value> {
+        match op {
+            "send" => self.send(request).await,
+            "inbox" => self.inbox(request).await,
+            "accept" => self.accept(request).await,
+            "handoffs" => self.handoffs(request).await,
             "outbox" => {
-                let node = self.fresh_node()?;
+                let node = self.locked_node().await?;
                 Ok(serde_json::to_value(
                     node.outbox.entries().collect::<Vec<_>>(),
                 )?)
             }
             "cancel" => {
-                self.node
-                    .lock()
-                    .await
+                self.locked_node()
+                    .await?
                     .outbox
-                    .cancel(required_str(&request, "id")?, now_ms())?;
-                Ok(json!({"cancelled":required_str(&request, "id")?}))
+                    .cancel(required_str(request, "id")?, now_ms())?;
+                Ok(json!({"cancelled":required_str(request, "id")?}))
             }
             _ => Err(format!("unknown operation: {op}").into()),
         }
@@ -977,19 +1142,19 @@ impl Daemon {
         }
         let mut connection = self.transport.dial(ticket.peer_id).await?;
         {
-            let mut node = self.node.lock().await;
-            let peer_id = node.peer_id();
+            let mut session = self.locked_node().await?.outgoing_session();
+            let peer_id = session.peer_id();
             dial_handshake_with_trust(
                 &mut connection,
                 peer_id,
                 "abra".into(),
-                &mut node.trust,
+                &mut session.trust,
                 now_ms(),
             )
             .await?;
         }
         let (request, nonce) = {
-            let node = self.node.lock().await;
+            let node = self.locked_node().await?;
             let nonce = rand::thread_rng().gen::<[u8; 16]>();
             let request = PairRequest::sign(
                 ticket.ticket_id.clone(),
@@ -1004,11 +1169,15 @@ impl Daemon {
         };
         let (send, recv) = connection.control_mut();
         write_frame(send, &request).await?;
-        let accept: PairAccept = read_frame(recv).await?;
-        let confirm = self
-            .node
-            .lock()
+        let accept: PairAccept = abra_net::read_frame_timeout(recv, Duration::from_secs(630))
             .await
+            .map_err(|error| match error {
+                abra_net::Error::Timeout => "pairing confirmation timed out".into(),
+                error => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+            })?;
+        let confirm = self
+            .locked_node()
+            .await?
             .trust
             .complete_pair_as_joiner(&ticket, &accept, &nonce)?;
         let (send, _) = connection.control_mut();
@@ -1029,8 +1198,7 @@ impl Daemon {
             .and_then(|x| x.to_str())
             .unwrap_or("workspace")
             .to_string();
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
+        let mut node = self.locked_node().await?;
         let id = random_capsule_id();
         let at = format_time(now_ms());
         let genesis = Genesis::new(
@@ -1053,18 +1221,45 @@ impl Daemon {
         node.store.add_capsule(genesis, grant)?;
         fs::create_dir_all(path.join(".abra"))?;
         fs::write(path.join(".abra/capsule_id"), id.to_hex())?;
+        record_workspace(&self.root, id, path, None)?;
         Ok(json!({"capsule_id":id}))
     }
 
     async fn snapshot(&self, request: &Value) -> Result<Value> {
         let path = PathBuf::from(required_str(request, "path")?);
+        let label = request.get("label").and_then(Value::as_str);
+        let no_lease = flag(request, "no_lease");
+        let snapshot = self
+            .snapshot_workspace(&path, label, no_lease, false)
+            .await?;
+        Ok(
+            json!({"capsule_id":snapshot.capsule_id,"snapshot_id":snapshot.snapshot_id,"forked":snapshot.forked}),
+        )
+    }
+
+    /// Snapshot a workspace directory. With `initialize`, a directory that has
+    /// no `.abra/capsule_id` becomes a capsule first, exactly as `abra init`
+    /// would. Unless `no_lease`, a device that may drive the capsule takes the
+    /// lease first so the new snapshot extends `main` instead of forking.
+    async fn snapshot_workspace(
+        &self,
+        path: &Path,
+        label: Option<&str>,
+        no_lease: bool,
+        initialize: bool,
+    ) -> Result<WorkspaceSnapshot> {
         if !path.is_absolute() {
             return Err("snapshot path must be absolute".into());
         }
-        let capsule = read_capsule_id(&path)?;
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
-        let files = snapshot_dir(&node.store.cas, &path)?;
+        if initialize && !path.join(".abra/capsule_id").exists() {
+            self.capsule_create(path).await?;
+        }
+        let capsule = read_capsule_id(path)?;
+        let mut node = self.locked_node().await?;
+        if !no_lease {
+            ensure_lease(&mut node, &self.root, capsule)?;
+        }
+        let files = snapshot_dir(&node.store.cas, path)?;
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
         let parents = cap
             .label("main")
@@ -1097,7 +1292,7 @@ impl Daemon {
             manifest.recipes = Some(recipes);
         }
         manifest.payload = payload;
-        if let Some(label) = request.get("label").and_then(Value::as_str) {
+        if let Some(label) = label {
             manifest.labels = Some(vec![abra_core::manifest::Label {
                 name: "checkpoint".into(),
                 value: Some(label.into()),
@@ -1136,14 +1331,19 @@ impl Daemon {
             let caller = node.peer_id();
             node.store.apply_label(op, caller, now_ms())?;
         }
-        Ok(json!({"capsule_id":capsule,"snapshot_id":result.snapshot_id,"forked":result.forked}))
+        record_workspace(&self.root, capsule, path, Some(result.snapshot_id))?;
+        Ok(WorkspaceSnapshot {
+            capsule_id: capsule,
+            snapshot_id: result.snapshot_id,
+            forked: result.forked,
+        })
     }
 
     async fn native_attach(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
         let head: Hash = required_str(request, "parent_snapshot")?.parse()?;
         if required_str(request, "snapshot_type")? != "Full" {
-            return Err("native-attach only accepts standalone Full snapshots".into());
+            return Err("native-attach only accepts standalone full snapshots".into());
         }
         let artifact_root = fs::canonicalize(required_str(request, "artifact_root")?)?;
         let fingerprint: Fingerprint = serde_json::from_value(
@@ -1156,8 +1356,7 @@ impl Daemon {
             .get("artifacts")
             .and_then(Value::as_array)
             .ok_or("request lacks artifacts")?;
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
+        let mut node = self.locked_node().await?;
         if node
             .store
             .capsules
@@ -1244,26 +1443,130 @@ impl Daemon {
 
     async fn send(&self, request: &Value) -> Result<Value> {
         let peer: PeerId = required_str(request, "peer")?.parse()?;
-        let adapter_export = if let Some(kind) = request.get("kind").and_then(Value::as_str) {
-            let source = json_object_or_string(required_str(request, "source")?);
-            let options = adapter_options(request)?;
-            Some((
-                kind.to_owned(),
-                adapters::AdapterRegistry::discover(&self.root)?
-                    .export(kind, source, &options, &self.root, None)
-                    .await?,
-            ))
-        } else {
-            None
+        let wait = flag(request, "wait");
+        let timeout = wait_timeout(request);
+        let no_lease = flag(request, "no_lease");
+        let kind = request
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let workspace = request
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        if workspace.is_some() && kind.is_none() {
+            return Err("--workspace links a workspace to an adapter --kind send".into());
+        }
+        // The adapter runs unlocked: an export may take minutes.
+        let mut inspection = None;
+        let adapter_export = match &kind {
+            Some(kind) => {
+                let source = json_object_or_string(required_str(request, "source")?);
+                let options = adapter_options(request)?;
+                let registry = self.registry()?;
+                if registry
+                    .for_kind(kind)
+                    .is_some_and(|adapter| adapter.supports("inspect"))
+                {
+                    let report = self.inspect_source(kind, source.clone(), &options).await?;
+                    let parsed: adapters::InspectResult = serde_json::from_value(report)?;
+                    if !parsed.blocked.is_empty() && !flag(request, "force") {
+                        return Err(format!(
+                            "adapter inspect blocked this send: {}; pass --force to send anyway",
+                            Value::Array(parsed.blocked.clone())
+                        )
+                        .into());
+                    }
+                    inspection = Some(parsed);
+                }
+                Some((
+                    kind.clone(),
+                    registry
+                        .export(kind, source, &options, &self.root, None)
+                        .await?,
+                ))
+            }
+            None => None,
         };
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
+        // A linked handoff carries the workspace it came out of. Snapshot it
+        // first so the receiver can resolve the partial's provenance.
+        let linked = match &workspace {
+            Some(dir) => Some(
+                self.snapshot_workspace(dir, Some("handoff"), no_lease, true)
+                    .await?,
+            ),
+            None => None,
+        };
+        // `--path` on an initialized workspace sends the capsule snapshot.
+        let path_workspace = match request.get("path").and_then(Value::as_str) {
+            Some(path) if is_workspace_dir(Path::new(path)) => Some(
+                self.snapshot_workspace(Path::new(path), None, no_lease, false)
+                    .await?,
+            ),
+            _ => None,
+        };
+
+        let mut node = self.locked_node().await?;
+        let mut extra = Map::new();
+        let mut ids = Vec::new();
+        let provenance = if let Some(snapshot) = &linked {
+            Some(Provenance {
+                capsule_id: snapshot.capsule_id,
+                snapshot_id: snapshot.snapshot_id,
+                turn: None,
+            })
+        } else if let Some(id) = request.get("provenance").and_then(Value::as_str) {
+            let raw = find_snapshot(&node, id)
+                .map_err(|_| "provenance names a snapshot this device does not have")?;
+            Some(Provenance {
+                capsule_id: raw
+                    .manifest()
+                    .capsule_id
+                    .ok_or("provenance snapshot has no capsule id")?,
+                snapshot_id: raw.snapshot_id(),
+                turn: None,
+            })
+        } else {
+            adapter_export
+                .as_ref()
+                .and_then(|(_, export)| export.provenance)
+                .map(|value| Provenance {
+                    capsule_id: value.capsule_id,
+                    snapshot_id: value.snapshot_id,
+                    turn: None,
+                })
+        };
+        if let Some(provenance) = &provenance {
+            let raw = find_snapshot(&node, &provenance.snapshot_id.to_hex())
+                .map_err(|_| "provenance names a snapshot this device does not have")?;
+            if raw.manifest().scope != Scope::Full
+                || raw.manifest().capsule_id != Some(provenance.capsule_id)
+            {
+                return Err("provenance names a snapshot this device does not have".into());
+            }
+            let id = node.enqueue(peer, &raw, now_ms())?;
+            ids.push(id.clone());
+            extra.insert("provenance_outbox_id".into(), json!(id.clone()));
+            extra.insert(
+                "provenance_snapshot_id".into(),
+                json!(provenance.snapshot_id),
+            );
+            if linked.is_some() {
+                extra.insert("workspace_outbox_id".into(), json!(id));
+                extra.insert(
+                    "workspace_snapshot_id".into(),
+                    json!(provenance.snapshot_id),
+                );
+                extra.insert("capsule_id".into(), json!(provenance.capsule_id));
+            }
+        }
         let raw = if let Some((kind, export)) = adapter_export {
             let adapters::ExportResult {
                 payload,
                 files_path,
                 floor,
                 staging,
+                ..
             } = export;
             let title = floor
                 .as_ref()
@@ -1284,10 +1587,14 @@ impl Daemon {
                     eprintln!("cadabra: adapter staging cleanup error: {error}");
                 }
             }
+            manifest.provenance = provenance;
             manifest.origin.adapter = Some(kind.clone());
             manifest.sign(&node.store.keys.identity)?;
             RawManifest::parse(manifest.to_canonical_bytes()?)?
         } else if let Some(id) = request.get("snapshot_id").and_then(Value::as_str) {
+            if provenance.is_some() {
+                return Err("provenance applies only to a partial send".into());
+            }
             find_snapshot_or_capsule_head(&node, id)?
         } else if let Some(link) = request.get("link").and_then(Value::as_str) {
             let title = request.get("title").and_then(Value::as_str).unwrap_or(link);
@@ -1297,8 +1604,16 @@ impl Daemon {
             if let Some(note) = request.get("note").and_then(Value::as_str) {
                 manifest.payload.insert("note".into(), json!(note));
             }
+            manifest.provenance = provenance;
             manifest.sign(&node.store.keys.identity)?;
             RawManifest::parse(manifest.to_canonical_bytes()?)?
+        } else if let Some(snapshot) = path_workspace {
+            if provenance.is_some() {
+                return Err("provenance applies only to a partial send".into());
+            }
+            extra.insert("capsule_id".into(), json!(snapshot.capsule_id));
+            extra.insert("workspace_detected".into(), json!(true));
+            find_snapshot(&node, &snapshot.snapshot_id.to_hex())?
         } else {
             let path = Path::new(required_str(request, "path")?);
             let files = capture_path(&node.store.cas, path)?;
@@ -1311,87 +1626,400 @@ impl Daemon {
                     .unwrap_or("handoff"),
             );
             manifest.files = Some(files);
+            manifest.provenance = provenance;
             manifest.sign(&node.store.keys.identity)?;
             RawManifest::parse(manifest.to_canonical_bytes()?)?
         };
         let id = node.enqueue(peer, &raw, now_ms())?;
-        Ok(json!({"outbox_id":id,"snapshot_id":raw.snapshot_id()}))
+        ids.push(id.clone());
+        drop(node);
+        let mut result = json!({"outbox_id":id,"snapshot_id":raw.snapshot_id()});
+        let object = result.as_object_mut().expect("send result is an object");
+        object.append(&mut extra);
+        if let Some(inspection) = inspection {
+            object.insert("summary".into(), json!(inspection.summary));
+            object.insert("warnings".into(), Value::Array(inspection.warnings));
+            object.insert("blocked".into(), Value::Array(inspection.blocked));
+        }
+        if wait {
+            let mut entries = self.wait_for_acks(&ids, timeout).await?;
+            object.insert(
+                "entry".into(),
+                entries.last().cloned().unwrap_or(Value::Null),
+            );
+            object.insert("entries".into(), Value::Array(std::mem::take(&mut entries)));
+        }
+        Ok(result)
     }
 
-    async fn inbox(&self) -> Result<Value> {
-        let node = self.fresh_node()?;
+    /// One `send-acked` line per outbox entry, whoever notices the ack first.
+    fn record_send_acked(&self, entry: &OutboxEntry) -> Result<()> {
+        {
+            let mut seen = self.acked_events.lock().expect("ack event set");
+            if !seen.insert(entry.id.clone()) {
+                return Ok(());
+            }
+        }
+        record_event(
+            &self.root,
+            "send-acked",
+            json!({"outbox_id":entry.id,"snapshot_id":entry.snapshot_id,"peer":entry.peer_id}),
+        )
+    }
+
+    /// Watch durable outbox state until every entry is acked. The node mutex is
+    /// only held for each poll, never across the sleep.
+    async fn wait_for_acks(&self, ids: &[String], timeout: Duration) -> Result<Vec<Value>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut acked: BTreeMap<String, Value> = BTreeMap::new();
+        loop {
+            let mut unfinished = None;
+            {
+                let node = self.locked_node().await?;
+                for id in ids {
+                    if acked.contains_key(id) {
+                        continue;
+                    }
+                    let entry = node.outbox.get(id).ok_or("unknown outbox id")?;
+                    match entry.state {
+                        OutboxState::Acked => {
+                            self.record_send_acked(entry)?;
+                            acked.insert(id.clone(), outbox_summary(entry));
+                        }
+                        OutboxState::Failed | OutboxState::Cancelled | OutboxState::Expired => {
+                            return Err(format!(
+                                "delivery {id} ended as {}: {}",
+                                state_name(entry.state),
+                                entry.last_error.as_deref().unwrap_or("no detail")
+                            )
+                            .into());
+                        }
+                        _ => {
+                            unfinished.get_or_insert_with(|| {
+                                (
+                                    id.clone(),
+                                    state_name(entry.state),
+                                    entry.last_error.clone(),
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            let Some((id, state, last_error)) = unfinished else {
+                return Ok(ids.iter().map(|id| acked[id].clone()).collect());
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "delivery {id} was not acknowledged within {}ms; state {state}: {}",
+                    timeout.as_millis(),
+                    last_error.as_deref().unwrap_or("no detail")
+                )
+                .into());
+            }
+            tokio::time::sleep(WAIT_POLL).await;
+        }
+    }
+
+    async fn inbox(&self, request: &Value) -> Result<Value> {
+        let kind = request.get("kind").and_then(Value::as_str);
+        let from = request.get("from").and_then(Value::as_str);
+        let wait = flag(request, "wait");
+        let timeout = wait_timeout(request);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.poll_relays().await?;
+            let rows = self.inbox_rows(kind, from).await?;
+            if !wait || rows.iter().any(|row| row["read"] == json!(false)) {
+                return Ok(Value::Array(rows));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "no unread {} delivery arrived within {}ms",
+                    kind.unwrap_or("inbox"),
+                    timeout.as_millis()
+                )
+                .into());
+            }
+            tokio::time::sleep(INBOX_POLL).await;
+        }
+    }
+
+    async fn inbox_rows(&self, kind: Option<&str>, from: Option<&str>) -> Result<Vec<Value>> {
+        let node = self.locked_node().await?;
         let mut rows = Vec::new();
         for entry in node.store.inbox.values() {
             let raw = RawManifest::parse(entry.manifest.clone())?;
             let m = raw.manifest();
-            rows.push(json!({"id":entry.snapshot_id,"from":entry.from,"received_at":entry.received_at,"read":entry.read,"kind":m.kind,"title":m.title,"origin":m.origin,"created_at":m.created_at,"link":m.link}));
+            if kind.is_some_and(|kind| kind != m.kind)
+                || from.is_some_and(|from| from != entry.from)
+            {
+                continue;
+            }
+            rows.push(json!({"id":entry.snapshot_id,"from":entry.from,"received_at":entry.received_at,"read":entry.read,"kind":m.kind,"title":m.title,"origin":m.origin,"created_at":m.created_at,"link":m.link,"provenance":m.provenance}));
         }
-        Ok(Value::Array(rows))
+        Ok(rows)
+    }
+
+    /// The single delivery of a kind waiting to be taken, the way an integrator
+    /// picking up a handoff means it. Unread inbox partials first; when a kind
+    /// has none, a capsule head that arrived from a peer. Zero or several is an
+    /// error, never a guess.
+    async fn latest_unread(&self, kind: &str, from: Option<&str>) -> Result<Hash> {
+        let node = self.locked_node().await?;
+        let mut matches = Vec::new();
+        for entry in node.store.inbox.values() {
+            if entry.read || from.is_some_and(|from| from != entry.from) {
+                continue;
+            }
+            if RawManifest::parse(entry.manifest.clone())?.manifest().kind != kind {
+                continue;
+            }
+            matches.push((entry.received_at.clone(), entry.snapshot_id));
+        }
+        if matches.is_empty() {
+            let local = node.peer_id();
+            for capsule in node.store.capsules.values() {
+                let Some(record) = capsule
+                    .label("main")
+                    .and_then(|label| capsule.snapshot(&label.snapshot_id))
+                else {
+                    continue;
+                };
+                let origin = record.raw.manifest().origin.peer_id;
+                if record.raw.manifest().kind != kind
+                    || origin == local
+                    || from.is_some_and(|from| from != origin.to_hex())
+                {
+                    continue;
+                }
+                matches.push((record.received_at.clone(), record.raw.snapshot_id()));
+            }
+        }
+        matches.sort_by(|left, right| right.0.cmp(&left.0));
+        match matches.len() {
+            0 => Err(format!("no unread {kind} delivery found").into()),
+            1 => Ok(matches[0].1),
+            _ => Err(format!(
+                "multiple unread {kind} deliveries match; pass one id: {}",
+                matches
+                    .iter()
+                    .map(|(_, id)| id.to_hex())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into()),
+        }
+    }
+
+    /// One row per kind: who last acked a send of it, what send is still
+    /// outstanding, what was last received, and, for a capsule kind, which
+    /// device is driving it now. This is the state integrators otherwise keep
+    /// in their own file.
+    async fn handoffs(&self, request: &Value) -> Result<Value> {
+        let kind_filter = request.get("kind").and_then(Value::as_str);
+        let peer_filter = request.get("peer").and_then(Value::as_str);
+        let node = self.locked_node().await?;
+        let mut rows: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+        let row = |rows: &mut BTreeMap<String, Map<String, Value>>, kind: &str| -> bool {
+            if kind_filter.is_some_and(|filter| filter != kind) {
+                return false;
+            }
+            rows.entry(kind.to_owned()).or_default();
+            true
+        };
+        for entry in node.outbox.entries() {
+            let Ok(raw) = RawManifest::parse(entry.manifest_raw.clone()) else {
+                continue;
+            };
+            let kind = raw.manifest().kind.clone();
+            if peer_filter.is_some_and(|peer| peer != entry.peer_id.to_hex())
+                || !row(&mut rows, &kind)
+            {
+                continue;
+            }
+            let field = if entry.state == OutboxState::Acked {
+                "last_acked_send"
+            } else {
+                "last_pending_send"
+            };
+            let record = outbox_summary(entry);
+            let current = rows.get_mut(&kind).expect("row exists");
+            if current
+                .get(field)
+                .and_then(|value| value["updated_at"].as_str().map(str::to_owned))
+                .is_none_or(|previous| previous <= entry.updated_at)
+            {
+                current.insert(field.into(), record);
+            }
+        }
+        for entry in node.store.inbox.values() {
+            let Ok(raw) = RawManifest::parse(entry.manifest.clone()) else {
+                continue;
+            };
+            let kind = raw.manifest().kind.clone();
+            if peer_filter.is_some_and(|peer| peer != entry.from) || !row(&mut rows, &kind) {
+                continue;
+            }
+            let field = if entry.read {
+                "last_read_receive"
+            } else {
+                "last_unread_receive"
+            };
+            let current = rows.get_mut(&kind).expect("row exists");
+            if current
+                .get(field)
+                .and_then(|value| value["received_at"].as_str().map(str::to_owned))
+                .is_none_or(|previous| previous <= entry.received_at)
+            {
+                current.insert(
+                    field.into(),
+                    json!({"id":entry.snapshot_id,"from":entry.from,"received_at":entry.received_at,"title":raw.manifest().title}),
+                );
+            }
+        }
+        // A full capsule snapshot lands in neither queue, so the workspace half
+        // of a handoff is reported from the capsule's own head and lease.
+        let local = node.peer_id();
+        let now = now_ms();
+        let workspaces = load_workspaces(&self.root)?;
+        for (capsule_id, capsule) in &node.store.capsules {
+            let Some(record) = capsule
+                .label("main")
+                .and_then(|label| capsule.snapshot(&label.snapshot_id))
+            else {
+                continue;
+            };
+            let kind = record.raw.manifest().kind.clone();
+            let origin = record.raw.manifest().origin.peer_id;
+            let holder = capsule.active_lease(now).map(|lease| lease.holder);
+            if peer_filter.is_some_and(|peer| {
+                peer != origin.to_hex() && Some(peer) != holder.map(|id| id.to_hex()).as_deref()
+            }) || !row(&mut rows, &kind)
+            {
+                continue;
+            }
+            let current = rows.get_mut(&kind).expect("row exists");
+            if current
+                .get("capsule")
+                .and_then(|value| value["received_at"].as_str().map(str::to_owned))
+                .is_none_or(|previous| previous <= record.received_at)
+            {
+                let workspace = workspaces.get(&capsule_id.to_hex());
+                let path = workspace.map(|record| record.path.clone());
+                let snapshot_id = workspace
+                    .and_then(|record| record.snapshot_id)
+                    .unwrap_or_else(|| record.raw.snapshot_id());
+                current.insert(
+                    "capsule".into(),
+                    json!({"capsule_id":capsule_id,"snapshot_id":snapshot_id,"origin":origin,"received_at":record.received_at,"lease_holder":holder,"driving":holder == Some(local),"path":path}),
+                );
+            }
+        }
+        Ok(Value::Array(
+            rows.into_iter()
+                .map(|(kind, mut fields)| {
+                    let mut object = Map::new();
+                    object.insert("kind".into(), json!(kind));
+                    for field in [
+                        "last_acked_send",
+                        "last_pending_send",
+                        "last_unread_receive",
+                        "last_read_receive",
+                        "capsule",
+                    ] {
+                        let value = fields.remove(field).unwrap_or(Value::Null);
+                        object.insert(field.into(), value);
+                    }
+                    Value::Object(object)
+                })
+                .collect(),
+        ))
     }
 
     async fn accept(&self, request: &Value) -> Result<Value> {
-        let id: Hash = required_str(request, "id")?.parse()?;
+        let id: Hash = if flag(request, "latest") {
+            self.latest_unread(
+                required_str(request, "kind")?,
+                request.get("from").and_then(Value::as_str),
+            )
+            .await?
+        } else {
+            required_str(request, "id")?.parse()?
+        };
         let destination = Path::new(required_str(request, "to")?);
         validate_destination(destination)?;
-        let mut node = self.fresh_node()?;
-        if let Some(entry) = node.store.inbox.get(&id).cloned() {
+        let replace = request
+            .get("replace")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| flag(request, "into"));
+        let no_lease = flag(request, "no_lease");
+        let workspace = request
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let inbox_entry = self.locked_node().await?.store.inbox.get(&id).cloned();
+        let mut linked_capsule = None;
+        let mut remote_peer = None;
+        if let Some(entry) = inbox_entry {
+            remote_peer = Some(entry.from.parse::<PeerId>()?);
             let raw = RawManifest::parse(entry.manifest)?;
-            if request
-                .get("into")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                return Err("--into requires a full capsule snapshot".into());
+            if replace {
+                return Err("--replace requires a full capsule snapshot".into());
             }
-            if let Some(files) = raw.manifest().files {
-                materialize(&node.store.cas, &files, destination)?;
-            }
-            materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
-            let registry = adapters::AdapterRegistry::discover(&self.root)?;
-            if registry
-                .for_kind(&raw.manifest().kind)
-                .is_some_and(|adapter| adapter.manifest.verbs.iter().any(|verb| verb == "import"))
-            {
-                secure_adapter_tree(destination)?;
-                let options = adapter_options(request)?;
-                let destination_value = request
-                    .get("destination")
-                    .and_then(Value::as_str)
-                    .map(json_object_or_string)
-                    .unwrap_or_else(|| json!(destination));
-                if let Err(error) = registry
-                    .import(
-                        &raw.manifest().kind,
-                        Value::Object(raw.manifest().payload.clone()),
-                        raw.manifest().files.map(|_| destination),
-                        destination_value,
-                        &options,
-                        None,
+            // A linked handoff restores its workspace before the adapter runs,
+            // so the importer sees the tree the sender exported against.
+            let restore = match &workspace {
+                Some(dir) => {
+                    let provenance = raw.manifest().provenance.clone().ok_or(
+                        "--workspace requires a delivery whose manifest carries provenance",
+                    )?;
+                    linked_capsule = Some(provenance.capsule_id);
+                    Some(
+                        self.materialize_provenance(
+                            &provenance,
+                            dir,
+                            wait_timeout(request),
+                            no_lease,
+                        )
+                        .await?,
                     )
-                    .await
-                {
-                    return Err(format!(
-                        "adapter import failed; inbox entry remains unread; files_materialized_at={}: {error}",
-                        destination.display()
-                    )
-                    .into());
                 }
+                None => None,
+            };
+            let outcome = self
+                .import_partial(&raw, destination, workspace.as_deref(), request)
+                .await;
+            if let Err(error) = outcome {
+                if let Some(restore) = restore {
+                    let node = self.locked_node().await?;
+                    if let Err(rollback) = restore.apply(&self.root, &node.store.cas) {
+                        return Err(
+                            format!("{error}; workspace rollback failed: {rollback}").into()
+                        );
+                    }
+                    return Err(format!("{error}; workspace was restored").into());
+                }
+                return Err(error);
             }
-            node.store.mark_inbox_read(id)?;
+            self.locked_node().await?.store.mark_inbox_read(id)?;
         } else {
+            if workspace.is_some() {
+                return Err("--workspace applies to a partial delivery".into());
+            }
+            let mut node = self.locked_node().await?;
             let raw = find_snapshot(&node, &id.to_hex())?;
             if let Some(capsule_id) = raw.manifest().capsule_id {
                 let identity_path = destination.join(".abra/capsule_id");
                 if identity_path.exists() && read_capsule_id(destination)? != capsule_id {
                     return Err("destination belongs to a different capsule".into());
                 }
+                if replace && !no_lease {
+                    ensure_lease(&mut node, &self.root, capsule_id)?;
+                }
             }
             if let Some(files) = raw.manifest().files {
-                if request
-                    .get("into")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                if replace {
                     replace_workspace(
                         &node.store.cas,
                         files,
@@ -1407,13 +2035,158 @@ impl Daemon {
             materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
             if let Some(capsule_id) = raw.manifest().capsule_id {
                 write_workspace_metadata(destination, capsule_id, id)?;
+                record_workspace(&self.root, capsule_id, destination, Some(id))?;
             }
         }
-        Ok(json!({"accepted":id,"to":destination}))
+        let mut result = json!({"accepted":id,"to":destination,"replace":replace});
+        if let Some(dir) = workspace {
+            record_event(
+                &self.root,
+                "linked-accept",
+                json!({"snapshot_id":id,"capsule_id":linked_capsule,"workspace":dir,"peer":remote_peer}),
+            )?;
+            result["workspace"] = json!(dir);
+        }
+        Ok(result)
+    }
+
+    /// Materialize a partial's files and hand them to a registered importer.
+    async fn import_partial(
+        &self,
+        raw: &RawManifest,
+        destination: &Path,
+        workspace: Option<&Path>,
+        request: &Value,
+    ) -> Result<()> {
+        if let Some(files) = raw.manifest().files {
+            let node = self.locked_node().await?;
+            materialize(&node.store.cas, &files, destination)?;
+        }
+        materialize_recipes(destination, raw.manifest().recipes.as_ref())?;
+        let registry = self.registry()?;
+        // The adapter runs unlocked: an import may take minutes.
+        if !registry
+            .for_kind(&raw.manifest().kind)
+            .is_some_and(|adapter| adapter.supports("import"))
+        {
+            return Ok(());
+        }
+        secure_adapter_tree(destination)?;
+        let options = adapter_options(request)?;
+        let mut destination_value = request
+            .get("destination")
+            .and_then(Value::as_str)
+            .map(json_object_or_string)
+            .unwrap_or_else(|| json!(destination));
+        // An adapter such as codex-session finds the restored tree here.
+        if let (Some(workspace), Some(object)) = (workspace, destination_value.as_object_mut()) {
+            object.insert("workspace".into(), json!(workspace));
+        }
+        registry
+            .import_with_workspace(
+                &raw.manifest().kind,
+                Value::Object(raw.manifest().payload.clone()),
+                raw.manifest().files.map(|_| destination),
+                destination_value,
+                workspace,
+                &options,
+                None,
+            )
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                format!(
+                    "adapter import failed; inbox entry remains unread; files_materialized_at={}: {error}",
+                    destination.display()
+                )
+                .into()
+            })?;
+        Ok(())
+    }
+
+    /// Wait for the referenced full snapshot, then put that workspace on disk.
+    /// Deliveries are independent, so the companion usually but not always
+    /// arrives first.
+    async fn materialize_provenance(
+        &self,
+        provenance: &Provenance,
+        workspace: &Path,
+        timeout: Duration,
+        no_lease: bool,
+    ) -> Result<WorkspaceRestore> {
+        validate_destination(workspace)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self
+                .locked_node()
+                .await?
+                .store
+                .capsules
+                .get(&provenance.capsule_id)
+                .is_some_and(|capsule| capsule.snapshot(&provenance.snapshot_id).is_some())
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "workspace snapshot {} did not arrive within {}ms",
+                    provenance.snapshot_id,
+                    timeout.as_millis()
+                )
+                .into());
+            }
+            tokio::time::sleep(WAIT_POLL).await;
+        }
+        let mut node = self.locked_node().await?;
+        let raw = find_snapshot(&node, &provenance.snapshot_id.to_hex())?;
+        let files = raw
+            .manifest()
+            .files
+            .ok_or("workspace snapshot has no files")?;
+        let existing = workspace.join(".abra/capsule_id").exists();
+        let previous_record = load_workspaces(&self.root)?
+            .get(&provenance.capsule_id.to_hex())
+            .cloned();
+        let restore = if existing {
+            if read_capsule_id(workspace)? != provenance.capsule_id {
+                return Err("workspace belongs to a different capsule".into());
+            }
+            WorkspaceRestore::Replace {
+                path: workspace.to_path_buf(),
+                capsule: provenance.capsule_id,
+                files: snapshot_dir(&node.store.cas, workspace)?,
+                snapshot: fs::read_to_string(workspace.join(".abra/snapshot_id"))
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok()),
+                previous_record,
+            }
+        } else {
+            WorkspaceRestore::Remove {
+                path: workspace.to_path_buf(),
+                capsule: provenance.capsule_id,
+                previous_record,
+            }
+        };
+        if existing {
+            replace_workspace(&node.store.cas, files, workspace, provenance.capsule_id)?;
+        } else {
+            materialize(&node.store.cas, &files, workspace)?;
+        }
+        materialize_recipes(workspace, raw.manifest().recipes.as_ref())?;
+        write_workspace_metadata(workspace, provenance.capsule_id, provenance.snapshot_id)?;
+        record_workspace(
+            &self.root,
+            provenance.capsule_id,
+            workspace,
+            Some(provenance.snapshot_id),
+        )?;
+        if !no_lease {
+            ensure_lease(&mut node, &self.root, provenance.capsule_id)?;
+        }
+        Ok(restore)
     }
 
     async fn log(&self, request: &Value) -> Result<Value> {
-        let node = self.fresh_node()?;
+        let node = self.locked_node().await?;
         let capsule = match request.get("capsule").and_then(Value::as_str) {
             Some(x) => x.parse()?,
             None if node.store.capsules.len() == 1 => *node.store.capsules.keys().next().unwrap(),
@@ -1451,7 +2224,7 @@ impl Daemon {
     }
 
     async fn capsules(&self) -> Result<Value> {
-        let node = self.fresh_node()?;
+        let node = self.locked_node().await?;
         Ok(Value::Array(node.store.capsules.iter().map(|(id, capsule)| {
             let heads = capsule.labels().values().filter(|label| label.name == "main" || label.name.starts_with("fork/")).map(|label| label.snapshot_id).collect::<Vec<_>>();
             json!({"capsule_id":id,"kind":capsule.genesis.kind,"title":capsule.genesis.title,"heads":heads})
@@ -1465,7 +2238,7 @@ impl Daemon {
             self.transport.requires_relay_for_wide_area(),
             &addresses,
         );
-        let node = self.node.lock().await;
+        let node = self.locked_node().await?;
         let required_scope = |key: &str| -> Result<Vec<String>> {
             let values = request
                 .get(key)
@@ -1496,8 +2269,8 @@ impl Daemon {
                 .get("receive")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            lease_acquire: false,
-            lease_takeover: false,
+            lease_acquire: flag(request, "lease_acquire"),
+            lease_takeover: flag(request, "lease_takeover"),
         };
         let token = EnrollmentToken::mint(
             "agent".into(),
@@ -1523,9 +2296,6 @@ impl Daemon {
     fn grants_path(&self) -> PathBuf {
         self.root.join("policy/grants.json")
     }
-    fn processes_path(&self) -> PathBuf {
-        self.root.join("policy/processes.json")
-    }
     fn load_grants(&self) -> Result<BTreeMap<String, ReceiveGrant>> {
         match fs::read(self.grants_path()) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -1533,11 +2303,14 @@ impl Daemon {
             Err(error) => Err(error.into()),
         }
     }
-    fn save_grants(&self, grants: &BTreeMap<String, ReceiveGrant>) -> Result<()> {
-        let path = self.grants_path();
-        fs::create_dir_all(path.parent().expect("policy parent"))?;
-        fs::write(path, serde_json::to_vec(grants)?)?;
-        Ok(())
+    fn save_grants(&self, grant: ReceiveGrant) -> Result<()> {
+        update_json_file(
+            &self.grants_path(),
+            |grants: &mut BTreeMap<String, ReceiveGrant>| {
+                grants.insert(grant.id.clone(), grant);
+                Ok(())
+            },
+        )
     }
     async fn policy_grant(&self, request: &Value) -> Result<Value> {
         let peer: PeerId = required_str(request, "peer")?.parse()?;
@@ -1551,19 +2324,17 @@ impl Daemon {
             .get("auto_accept")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let auto_run_recipes = request
-            .get("auto_run_recipes")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if auto_run_recipes && !auto_accept {
-            return Err("auto-run-recipes requires auto-accept".into());
-        }
-        if auto_run_recipes {
-            return Err("auto-run-recipes is unimplemented: Abra carries recipes as data and never executes peer-supplied code".into());
-        }
         let destination = request.get("to").and_then(Value::as_str).map(PathBuf::from);
+        let forward: Option<PeerId> = request
+            .get("forward")
+            .and_then(Value::as_str)
+            .map(str::parse)
+            .transpose()?;
         if auto_accept {
             validate_destination(destination.as_deref().ok_or("auto-accept requires --to")?)?;
+        }
+        if forward.is_some() && !auto_accept {
+            return Err("--forward requires --auto-accept".into());
         }
         let id = format!(
             "{}:{}:{}",
@@ -1577,12 +2348,10 @@ impl Daemon {
             kind,
             capsule,
             auto_accept,
-            auto_run_recipes,
             destination,
+            forward,
         };
-        let mut grants = self.load_grants()?;
-        grants.insert(id.clone(), grant.clone());
-        self.save_grants(&grants)?;
+        self.save_grants(grant.clone())?;
         Ok(serde_json::to_value(grant)?)
     }
     async fn apply_receive_grants(
@@ -1591,34 +2360,30 @@ impl Daemon {
         changed_heads: &std::collections::BTreeSet<Hash>,
     ) -> Result<()> {
         let grants = self.load_grants()?;
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
         if grants.is_empty() {
             return Ok(());
         }
         let failed_grants = load_grant_errors(&self.root)?;
-        let unread = node
-            .store
-            .inbox
-            .values()
-            .filter(|entry| !entry.read)
-            .cloned()
-            .collect::<Vec<_>>();
+        let unread = {
+            let node = self.locked_node().await?;
+            node.store
+                .inbox
+                .values()
+                .filter(|entry| !entry.read)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         for entry in unread {
             let raw = RawManifest::parse(entry.manifest.clone())?;
             let from: PeerId = entry.from.parse()?;
-            if from != delivering_peer {
+            if from != delivering_peer || failed_grants.contains_key(&entry.snapshot_id.to_hex()) {
                 continue;
             }
-            let Some(grant) = grants
-                .values()
-                .find(|g| g.peer == from && g.kind == raw.manifest().kind)
-            else {
+            let Some(grant) = grants.values().find(|grant| {
+                grant.auto_accept && grant.peer == from && grant.kind == raw.manifest().kind
+            }) else {
                 continue;
             };
-            if !grant.auto_accept {
-                continue;
-            }
             let destination_root = grant
                 .destination
                 .as_deref()
@@ -1626,87 +2391,160 @@ impl Daemon {
             validate_destination(destination_root)?;
             let destination = destination_root.join(entry.snapshot_id.to_hex());
             validate_destination(&destination)?;
-            if let Some(files) = raw.manifest().files {
-                if let Err(error) = materialize(&node.store.cas, &files, &destination) {
-                    record_grant_error(&self.root, entry.snapshot_id, &error.to_string())?;
+            // The same materialize-then-import path `accept` runs, so a grant
+            // leaves the adapter's work done rather than only files on disk.
+            if let Err(error) = self
+                .import_partial(&raw, &destination, None, &json!({}))
+                .await
+            {
+                record_grant_error(&self.root, entry.snapshot_id, &error.to_string())?;
+                continue;
+            }
+            self.locked_node()
+                .await?
+                .store
+                .mark_inbox_read(entry.snapshot_id)?;
+            record_event(
+                &self.root,
+                "auto-accepted",
+                json!({"snapshot_id":entry.snapshot_id,"kind":raw.manifest().kind,"to":destination,"peer":from}),
+            )?;
+            self.forward_grant(grant, &raw, from).await?;
+        }
+        // Capsule heads are collected first: materializing and forwarding both
+        // need the node, and the store cannot stay borrowed across them.
+        let mut heads = Vec::new();
+        {
+            let node = self.locked_node().await?;
+            for (capsule_id, capsule) in &node.store.capsules {
+                let Some(head) = capsule.label("main").map(|label| label.snapshot_id) else {
+                    continue;
+                };
+                if !changed_heads.contains(&head) || failed_grants.contains_key(&head.to_hex()) {
                     continue;
                 }
-            }
-            node.store.mark_inbox_read(entry.snapshot_id)?;
-        }
-        for (capsule_id, capsule) in &node.store.capsules {
-            let Some(head) = capsule.label("main").map(|label| label.snapshot_id) else {
-                continue;
-            };
-            if !changed_heads.contains(&head) {
-                continue;
-            }
-            let Some(record) = capsule.snapshot(&head) else {
-                continue;
-            };
-            if failed_grants.contains_key(&head.to_hex()) {
-                continue;
-            }
-            let raw = &record.raw;
-            let Some(grant) = grants.values().find(|grant| {
-                grant.auto_accept
-                    && grant.peer == delivering_peer
-                    && grant.kind == raw.manifest().kind
-                    && grant.capsule.is_none_or(|allowed| allowed == *capsule_id)
-            }) else {
-                continue;
-            };
-            let destination = grant
-                .destination
-                .as_deref()
-                .ok_or("grant lacks destination")?
-                .join(capsule_id.to_hex());
-            validate_destination(
-                grant
+                let Some(record) = capsule.snapshot(&head) else {
+                    continue;
+                };
+                let raw = &record.raw;
+                let Some(grant) = grants.values().find(|grant| {
+                    grant.auto_accept
+                        && grant.peer == delivering_peer
+                        && grant.kind == raw.manifest().kind
+                        && grant.capsule.is_none_or(|allowed| allowed == *capsule_id)
+                }) else {
+                    continue;
+                };
+                let destination_root = grant
                     .destination
                     .as_deref()
-                    .ok_or("grant lacks destination")?,
-            )?;
-            validate_destination(&destination)?;
-            if fs::read_to_string(destination.join(".abra/snapshot_id"))
-                .is_ok_and(|current| current == head.to_hex())
-            {
-                continue;
+                    .ok_or("grant lacks destination")?;
+                validate_destination(destination_root)?;
+                let destination = destination_root.join(capsule_id.to_hex());
+                validate_destination(&destination)?;
+                if fs::read_to_string(destination.join(".abra/snapshot_id"))
+                    .is_ok_and(|current| current == head.to_hex())
+                {
+                    continue;
+                }
+                heads.push((*capsule_id, head, raw.clone(), grant.clone(), destination));
             }
-            if let Some(files) = raw.manifest().files {
-                let result = if destination.join(".abra/capsule_id").exists() {
-                    replace_workspace(&node.store.cas, files, &destination, *capsule_id)
+        }
+        for (capsule_id, head, raw, grant, destination) in heads {
+            let Some(files) = raw.manifest().files else {
+                continue;
+            };
+            let result = {
+                let node = self.locked_node().await?;
+                if destination.join(".abra/capsule_id").exists() {
+                    replace_workspace(&node.store.cas, files, &destination, capsule_id)
                 } else {
                     materialize(&node.store.cas, &files, &destination).map_err(Into::into)
-                };
-                if let Err(error) = result {
-                    record_grant_error(&self.root, head, &error.to_string())?;
-                    continue;
                 }
-                if let Err(error) = write_workspace_metadata(&destination, *capsule_id, head) {
-                    record_grant_error(&self.root, head, &error.to_string())?;
-                    continue;
-                }
-                record_event_file(
-                    &self.root,
-                    &json!({"type":"auto-accepted-full","capsule_id":capsule_id,"snapshot_id":head,"to":destination}),
-                )?;
+            };
+            if let Err(error) = result {
+                record_grant_error(&self.root, head, &error.to_string())?;
+                continue;
             }
+            if let Err(error) = write_workspace_metadata(&destination, capsule_id, head) {
+                record_grant_error(&self.root, head, &error.to_string())?;
+                continue;
+            }
+            record_workspace(&self.root, capsule_id, &destination, Some(head))?;
+            // A mirror never takes the lease: the delivering peer keeps
+            // driving, and its next snapshot must not land here as a fork.
+            record_event(
+                &self.root,
+                "auto-accepted-full",
+                json!({"capsule_id":capsule_id,"snapshot_id":head,"to":destination,"peer":delivering_peer}),
+            )?;
+            record_event(
+                &self.root,
+                "auto-accepted",
+                json!({"capsule_id":capsule_id,"snapshot_id":head,"kind":raw.manifest().kind,"to":destination,"peer":delivering_peer}),
+            )?;
+            self.forward_grant(&grant, &raw, delivering_peer).await?;
         }
         Ok(())
     }
-    fn load_processes(&self) -> Result<Vec<RecipeProcess>> {
-        match fs::read(self.processes_path()) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
+    /// "Receive, process, pass it on": a grant may re-deliver what it accepted
+    /// to one more peer, so a filtering middleman needs no separate send.
+    async fn forward_grant(
+        &self,
+        grant: &ReceiveGrant,
+        raw: &RawManifest,
+        delivering_peer: PeerId,
+    ) -> Result<()> {
+        let Some(peer) = grant.forward else {
+            return Ok(());
+        };
+        let reason = if peer == delivering_peer {
+            Some("delivering-peer")
+        } else if peer == raw.manifest().origin.peer_id {
+            Some("manifest-origin")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            record_event(
+                &self.root,
+                "auto-forward-skipped",
+                json!({"snapshot_id":raw.snapshot_id(),"peer":peer,"reason":reason}),
+            )?;
+            return Ok(());
         }
-    }
-    fn stop_recipes(&self, capsule: &str) -> Result<Value> {
-        Err(format!(
-            "recipe execution is disabled; no Abra-managed recipes exist for capsule {capsule}"
-        )
-        .into())
+        let key = format!("{}:{peer}", raw.snapshot_id());
+        let inserted = update_json_file(
+            &self.root.join("policy/forwarded.json"),
+            |forwarded: &mut std::collections::BTreeSet<String>| Ok(forwarded.insert(key.clone())),
+        )?;
+        if !inserted {
+            record_event(
+                &self.root,
+                "auto-forward-skipped",
+                json!({"snapshot_id":raw.snapshot_id(),"peer":peer,"reason":"already-forwarded"}),
+            )?;
+            return Ok(());
+        }
+        let id = match self.locked_node().await?.enqueue(peer, raw, now_ms()) {
+            Ok(id) => id,
+            Err(error) => {
+                update_json_file(
+                    &self.root.join("policy/forwarded.json"),
+                    |forwarded: &mut std::collections::BTreeSet<String>| {
+                        forwarded.remove(&key);
+                        Ok(())
+                    },
+                )?;
+                return Err(error.into());
+            }
+        };
+        record_event(
+            &self.root,
+            "auto-forwarded",
+            json!({"capsule_id":raw.manifest().capsule_id,"snapshot_id":raw.snapshot_id(),"peer":peer,"outbox_id":id}),
+        )?;
+        Ok(())
     }
     fn events(&self) -> Result<Value> {
         let path = self.root.join("net/events.ndjson");
@@ -1719,7 +2557,7 @@ impl Daemon {
     }
     async fn lease_status(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
-        let node = self.fresh_node()?;
+        let node = self.locked_node().await?;
         let cap = node.store.capsules.get(&capsule).ok_or("unknown capsule")?;
         Ok(
             json!({"capsule":capsule,"winning":cap.winning_lease(),"active":cap.active_lease(now_ms()).is_some()}),
@@ -1727,41 +2565,13 @@ impl Daemon {
     }
     async fn lease_take(&self, request: &Value) -> Result<Value> {
         let capsule: Hash = required_str(request, "capsule")?.parse()?;
-        let mut node = self.node.lock().await;
-        node.store = abra_core::store::AbraStore::open(&self.root)?;
-        let previous = node
-            .store
-            .capsules
-            .get(&capsule)
-            .ok_or("unknown capsule")?
-            .winning_lease()
-            .cloned()
-            .ok_or("capsule lacks lease")?;
-        let local = node.peer_id();
-        if !matches!(node.trust.local_role(), LocalRole::Full) {
-            node.trust.authorize_lease(local, true, now_ms())?;
-        }
-        let now = now_ms();
-        let record = LeaseRecord::new(
-            capsule,
-            local,
-            previous.epoch + 1,
-            LeaseMode::Takeover,
-            format_time(now),
-            format_time(now + 86_400_000),
-            previous.hash()?,
-            &node.store.keys.identity,
-        )?;
-        node.store
-            .accept_lease(capsule, record.clone(), &|peer, _| peer == local)?;
-        record_event_file(
-            &self.root,
-            &json!({"event":"lease-change","capsule":capsule,"lease":record}),
-        )?;
+        let mut node = self.locked_node().await?;
+        local_lease_allowed(&node.trust, true, now_ms())?;
+        let record = take_lease(&mut node, &self.root, capsule)?;
         Ok(serde_json::to_value(record)?)
     }
     async fn renew_leases(&self) -> Result<()> {
-        let mut node = DeliveryNode::open(&self.root)?;
+        let mut node = self.detached_node()?;
         let local = node.peer_id();
         let now = now_ms();
         let candidates = node
@@ -1789,7 +2599,7 @@ impl Daemon {
                 .accept_lease(capsule, record.clone(), &|peer, _| peer == local)?;
             record_event_file(
                 &self.root,
-                &json!({"event":"lease-change","capsule":capsule,"lease":record}),
+                &json!({"event":"lease-change","at":format_time(now_ms()),"capsule_id":capsule,"lease":record}),
             )?;
         }
         Ok(())
@@ -1808,7 +2618,7 @@ impl Daemon {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let message = {
-            let node = self.fresh_node()?;
+            let node = self.locked_node().await?;
             if !node.store.capsules.contains_key(&capsule) {
                 return Err("unknown capsule".into());
             }
@@ -1823,27 +2633,116 @@ impl Daemon {
         };
         let mut connection = self.transport.dial(peer).await?;
         {
-            let mut node = self.node.lock().await;
-            let peer_id = node.peer_id();
+            let mut session = self.locked_node().await?.outgoing_session();
+            let peer_id = session.peer_id();
             dial_handshake_with_trust(
                 &mut connection,
                 peer_id,
                 "abra".into(),
-                &mut node.trust,
+                &mut session.trust,
                 now_ms(),
             )
             .await?;
         }
+        drop(self.locked_node().await?);
         let (send, recv) = connection.control_mut();
         write_frame(send, &message).await?;
-        let ack: ControlAck = read_frame(recv).await?;
-        if !ack.ok {
-            return Err(ack
-                .error
-                .unwrap_or_else(|| "control rejected".into())
-                .into());
-        }
+        // A refused control is an answer, not a transport failure: the caller
+        // wants the peer's `error` and any `result` it managed to produce.
+        let ack: ControlAck = abra_net::read_frame_timeout(
+            recv,
+            abra_net::CONTROL_HANDLER_TIMEOUT + Duration::from_secs(30),
+        )
+        .await
+        .map_err(|error| match error {
+            abra_net::Error::Timeout => "control ack timed out".into(),
+            error => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+        })?;
         Ok(serde_json::to_value(ack)?)
+    }
+}
+
+/// Receiver-side routing of verified control messages to adapters. Everything
+/// it needs is durable state, so each message reads the store and the registry
+/// fresh instead of borrowing the daemon's node.
+struct ControlRouter {
+    root: PathBuf,
+    adapter_sources: Vec<adapters::ExtraAdapterDir>,
+}
+
+#[async_trait::async_trait]
+impl abra_net::ControlHandler for ControlRouter {
+    async fn handle(&self, from: PeerId, message: &ControlMessage) -> abra_net::Result<Value> {
+        self.route(from, message)
+            .await
+            .map_err(|error| abra_net::Error::Protocol(error.to_string()))
+    }
+}
+
+impl ControlRouter {
+    async fn route(&self, from: PeerId, message: &ControlMessage) -> Result<Value> {
+        let op = match message.op {
+            ControlOp::Pause => "pause",
+            ControlOp::Stop => "stop",
+            ControlOp::Instruct => "instruct",
+        };
+        let kind = abra_core::store::AbraStore::open(&self.root)?
+            .capsules
+            .get(&message.capsule_id)
+            .map(|capsule| capsule.genesis.kind.clone());
+        let registry = adapters::AdapterRegistry::discover_with(&self.root, &self.adapter_sources)?;
+        let adapter = kind
+            .as_deref()
+            .and_then(|kind| registry.for_control(kind))
+            .map(|adapter| adapter.manifest.name.clone());
+        let outcome = match (&kind, &adapter) {
+            (Some(kind), Some(_)) => {
+                let key = message.capsule_id.to_hex();
+                let workspace = update_json_file(
+                    &workspaces_path(&self.root),
+                    |workspaces: &mut BTreeMap<String, WorkspaceRecord>| {
+                        let workspace = workspaces.get(&key).and_then(|record| {
+                            (record.path.is_dir()
+                                && read_capsule_id(&record.path).ok() == Some(message.capsule_id))
+                            .then(|| record.path.clone())
+                        });
+                        if workspace.is_none() {
+                            workspaces.remove(&key);
+                        }
+                        Ok(workspace)
+                    },
+                )?;
+                registry
+                    .control(
+                        &adapters::ControlRequest {
+                            kind: kind.clone(),
+                            capsule_id: message.capsule_id,
+                            op: op.into(),
+                            text: message.text.clone(),
+                            workspace,
+                            options: BTreeMap::new(),
+                        },
+                        None,
+                    )
+                    .await
+            }
+            // No adapter: the built-in behaviour is that the message is now on
+            // record, which is all `pause` and `stop` ever promised.
+            _ if matches!(message.op, ControlOp::Pause | ControlOp::Stop) => {
+                Ok(json!({"recorded":true}))
+            }
+            _ => Err(format!(
+                "no adapter handles control for {}",
+                kind.as_deref().unwrap_or("unknown capsule")
+            )
+            .into()),
+        };
+        record_event(
+            &self.root,
+            "control-handled",
+            json!({"capsule_id":message.capsule_id,"op":op,"ok":outcome.is_ok(),"adapter":adapter,"peer":from}),
+        )?;
+        outcome
     }
 }
 
@@ -1861,6 +2760,180 @@ fn warn_if_lan_only(what: &str, requires_relay: bool, addresses: &[String]) {
         eprintln!(
             "cadabra: iroh relay is not ready; this {what} carries direct addresses only and will not cross NATs"
         );
+    }
+}
+
+/// What one workspace snapshot produced.
+struct WorkspaceSnapshot {
+    capsule_id: Hash,
+    snapshot_id: Hash,
+    forked: bool,
+}
+
+/// How to undo a workspace materialization when a later step fails.
+enum WorkspaceRestore {
+    /// The directory did not exist before.
+    Remove {
+        path: PathBuf,
+        capsule: Hash,
+        previous_record: Option<WorkspaceRecord>,
+    },
+    /// The previous contents, captured in CAS before they were replaced.
+    Replace {
+        path: PathBuf,
+        capsule: Hash,
+        files: Hash,
+        snapshot: Option<Hash>,
+        previous_record: Option<WorkspaceRecord>,
+    },
+}
+
+impl WorkspaceRestore {
+    fn apply(self, root: &Path, store: &abra_core::cas::BlobStore) -> Result<()> {
+        match self {
+            Self::Remove {
+                path,
+                capsule,
+                previous_record,
+            } => {
+                fs::remove_dir_all(path)?;
+                restore_workspace_record(root, capsule, previous_record)
+            }
+            Self::Replace {
+                path,
+                capsule,
+                files,
+                snapshot,
+                previous_record,
+            } => {
+                replace_workspace(store, files, &path, capsule)?;
+                match snapshot {
+                    Some(snapshot) => write_workspace_metadata(&path, capsule, snapshot),
+                    None => {
+                        let _ = fs::remove_file(path.join(".abra/snapshot_id"));
+                        Ok(())
+                    }
+                }?;
+                restore_workspace_record(root, capsule, previous_record)
+            }
+        }
+    }
+}
+
+fn flag(request: &Value, key: &str) -> bool {
+    request.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn wait_timeout(request: &Value) -> Duration {
+    Duration::from_millis(
+        request
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_WAIT_MS),
+    )
+}
+
+fn is_workspace_dir(path: &Path) -> bool {
+    path.is_dir() && path.join(".abra/capsule_id").is_file()
+}
+
+fn state_name(state: OutboxState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn outbox_summary(entry: &OutboxEntry) -> Value {
+    json!({
+        "id": entry.id,
+        "peer_id": entry.peer_id,
+        "snapshot_id": entry.snapshot_id,
+        "state": entry.state,
+        "attempts": entry.attempts,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "acked_at": (entry.state == OutboxState::Acked).then(|| entry.updated_at.clone()),
+        "ack_sig": entry.ack_sig,
+        "last_error": entry.last_error,
+    })
+}
+
+/// Sign a takeover of `capsule` for the local device and record it.
+fn take_lease(node: &mut DeliveryNode, root: &Path, capsule: Hash) -> Result<LeaseRecord> {
+    let previous = node
+        .store
+        .capsules
+        .get(&capsule)
+        .ok_or("unknown capsule")?
+        .winning_lease()
+        .cloned()
+        .ok_or("capsule lacks lease")?;
+    let local = node.peer_id();
+    let now = now_ms();
+    let record = LeaseRecord::new(
+        capsule,
+        local,
+        previous.epoch + 1,
+        LeaseMode::Takeover,
+        format_time(now),
+        format_time(now + 86_400_000),
+        previous.hash()?,
+        &node.store.keys.identity,
+    )?;
+    node.store
+        .accept_lease(capsule, record.clone(), &|peer, _| peer == local)?;
+    record_event_file(
+        root,
+        &json!({"event":"lease-change","at":format_time(now_ms()),"capsule_id":capsule,"lease":record}),
+    )?;
+    Ok(record)
+}
+
+/// Take the lease before authoring so an ordinary handoff produces a new head
+/// rather than a fork. A guest that its issuer did not authorize keeps the old
+/// forking behaviour instead of failing.
+fn ensure_lease(
+    node: &mut DeliveryNode,
+    root: &Path,
+    capsule: Hash,
+) -> Result<Option<LeaseRecord>> {
+    let local = node.peer_id();
+    let now = now_ms();
+    let held = node
+        .store
+        .capsules
+        .get(&capsule)
+        .ok_or("unknown capsule")?
+        .active_lease(now)
+        .is_some_and(|lease| lease.holder == local);
+    if held {
+        return Ok(None);
+    }
+    if local_lease_allowed(&node.trust, true, now).is_err() {
+        return Ok(None);
+    }
+    take_lease(node, root, capsule).map(Some)
+}
+
+fn local_lease_allowed(trust: &abra_net::TrustStore, takeover: bool, now: u64) -> Result<()> {
+    let LocalRole::Guest { token } = trust.local_role() else {
+        return Ok(());
+    };
+    token.verify(now)?;
+    let allowed = if takeover {
+        token.scopes.lease_takeover
+    } else {
+        token.scopes.lease_acquire
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "local guest token does not allow lease {}",
+            if takeover { "takeover" } else { "acquire" }
+        )
+        .into())
     }
 }
 
@@ -1908,11 +2981,7 @@ fn read_port(path: &Path) -> Result<u16> {
 }
 
 fn persist_port(path: &Path, port: u16) -> Result<()> {
-    fs::create_dir_all(path.parent().expect("port path parent"))?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, port.to_string())?;
-    File::open(&tmp)?.sync_all()?;
-    fs::rename(tmp, path)?;
+    abra_core::atomic_write(path, port.to_string().as_bytes())?;
     Ok(())
 }
 
@@ -1961,7 +3030,7 @@ fn replace_workspace(
 ) -> Result<()> {
     validate_destination(destination)?;
     if read_capsule_id(destination)? != capsule {
-        return Err("--into workspace belongs to a different capsule".into());
+        return Err("--replace workspace belongs to a different capsule".into());
     }
     let parent = destination
         .parent()
@@ -2097,33 +3166,115 @@ fn load_grant_errors(root: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 fn record_grant_error(root: &Path, snapshot: Hash, error: &str) -> Result<()> {
-    let mut errors = load_grant_errors(root)?;
-    errors.insert(snapshot.to_hex(), error.to_owned());
-    let path = grant_errors_path(root);
-    fs::create_dir_all(path.parent().expect("policy parent"))?;
-    fs::write(path, serde_json::to_vec(&errors)?)?;
-    Ok(())
+    update_json_file(
+        &grant_errors_path(root),
+        |errors: &mut BTreeMap<String, String>| {
+            errors.insert(snapshot.to_hex(), error.to_owned());
+            Ok(())
+        },
+    )
 }
 
 fn clear_grant_errors(root: &Path) -> Result<()> {
-    let path = grant_errors_path(root);
-    fs::create_dir_all(path.parent().expect("policy parent"))?;
-    fs::write(path, b"{}")?;
-    Ok(())
+    update_json_file(
+        &grant_errors_path(root),
+        |errors: &mut BTreeMap<String, String>| {
+            errors.clear();
+            Ok(())
+        },
+    )
+}
+
+fn workspaces_path(root: &Path) -> PathBuf {
+    root.join("policy/workspaces.json")
+}
+
+fn load_workspaces(root: &Path) -> Result<BTreeMap<String, WorkspaceRecord>> {
+    match fs::read(workspaces_path(root)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Remember where a capsule now lives on this device. Every path that puts a
+/// capsule on disk calls this, so `control` can name the directory.
+fn record_workspace(root: &Path, capsule: Hash, path: &Path, snapshot: Option<Hash>) -> Result<()> {
+    update_json_file(
+        &workspaces_path(root),
+        |workspaces: &mut BTreeMap<String, WorkspaceRecord>| {
+            workspaces.insert(
+                capsule.to_hex(),
+                WorkspaceRecord {
+                    path: path.to_path_buf(),
+                    snapshot_id: snapshot,
+                    at: format_time(now_ms()),
+                },
+            );
+            Ok(())
+        },
+    )
+}
+
+fn restore_workspace_record(
+    root: &Path,
+    capsule: Hash,
+    previous: Option<WorkspaceRecord>,
+) -> Result<()> {
+    update_json_file(
+        &workspaces_path(root),
+        |workspaces: &mut BTreeMap<String, WorkspaceRecord>| {
+            match previous {
+                Some(record) => {
+                    workspaces.insert(capsule.to_hex(), record);
+                }
+                None => {
+                    workspaces.remove(&capsule.to_hex());
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn update_json_file<T, R>(path: &Path, update: impl FnOnce(&mut T) -> Result<R>) -> Result<R>
+where
+    T: Serialize + DeserializeOwned + Default,
+{
+    fs::create_dir_all(path.parent().expect("json file parent"))?;
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut value = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(error) => return Err(error.into()),
+    };
+    let result = update(&mut value)?;
+    abra_core::atomic_write(path, &serde_json::to_vec(&value)?)?;
+    fs2::FileExt::unlock(&lock)?;
+    Ok(result)
+}
+
+/// Append one `{"event":...,"at":...}` line. Names are stable API: `watch`
+/// consumers match on them.
+fn record_event(root: &Path, event: &str, fields: Value) -> Result<()> {
+    let mut object = Map::new();
+    object.insert("event".into(), json!(event));
+    object.insert("at".into(), json!(format_time(now_ms())));
+    if let Value::Object(extra) = fields {
+        object.extend(extra);
+    }
+    record_event_file(root, &Value::Object(object))
 }
 
 fn record_event_file(root: &Path, value: &Value) -> Result<()> {
-    use std::io::Write;
-    let path = root.join("net/events.ndjson");
-    fs::create_dir_all(path.parent().expect("event parent"))?;
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_EVENT_LOG_BYTES) {
-        fs::write(&path, [])?;
-    }
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&bytes)?;
-    Ok(())
+    abra_net::append_event(root, value).map_err(Into::into)
 }
 
 fn base_manifest(node: &DeliveryNode, scope: Scope, kind: &str, title: &str) -> Manifest {
@@ -2381,6 +3532,10 @@ mod tests {
         let node = daemon.node.lock().await;
         assert!(node.skip_native);
         assert_eq!(node.offer_budget, 1234);
+        drop(node);
+        let detached = daemon.detached_node().unwrap();
+        assert!(detached.skip_native);
+        assert_eq!(detached.offer_budget, 1234);
     }
 
     #[test]
@@ -2396,12 +3551,58 @@ mod tests {
     }
 
     #[test]
+    fn grants_written_before_recipe_auto_run_was_removed_still_load() {
+        let peer = "ab".repeat(32);
+        let json = format!(
+            r#"{{"one":{{"id":"one","peer":"{peer}","kind":"dev.abra.bundle","auto_accept":true,"auto_run_recipes":false,"destination":"/tmp/inbox"}}}}"#
+        );
+        let grants: BTreeMap<String, ReceiveGrant> = serde_json::from_str(&json).unwrap();
+        assert!(grants["one"].auto_accept);
+    }
+
+    #[test]
     fn policy_clear_removes_recorded_grant_errors() {
         let root = tempfile::tempdir().unwrap();
         record_grant_error(root.path(), Hash::from_bytes([3; 32]), "disk full").unwrap();
         assert_eq!(load_grant_errors(root.path()).unwrap().len(), 1);
         clear_grant_errors(root.path()).unwrap();
         assert!(load_grant_errors(root.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_guest_lease_scope_is_checked_without_remote_peer_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut node = DeliveryNode::open(root.path()).unwrap();
+        let now = now_ms();
+        let token = EnrollmentToken::mint(
+            "guest".into(),
+            Vec::new(),
+            None,
+            Scopes {
+                capsules: vec!["*".into()],
+                kinds: vec!["*".into()],
+                send: false,
+                receive: false,
+                lease_acquire: false,
+                lease_takeover: true,
+            },
+            now,
+            60_000,
+            &node.store.keys.identity,
+        )
+        .unwrap();
+        node.trust
+            .set_local_role(LocalRole::Guest {
+                token: Box::new(token),
+            })
+            .unwrap();
+        assert!(local_lease_allowed(&node.trust, true, now).is_ok());
+        assert_eq!(
+            local_lease_allowed(&node.trust, false, now)
+                .unwrap_err()
+                .to_string(),
+            "local guest token does not allow lease acquire"
+        );
     }
 
     #[test]

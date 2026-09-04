@@ -45,8 +45,21 @@ pub fn signature_preimage(domain: &str, payload: &[u8]) -> Vec<u8> {
     v.extend_from_slice(payload);
     v
 }
-pub fn domain_message(domain: &str, payload: &[u8]) -> Vec<u8> {
-    signature_preimage(domain, payload)
+/// Load a key file, or create and save a fresh one when it does not exist.
+fn load_or_generate_with<T>(
+    path: &Path,
+    load: impl FnOnce(&Path) -> Result<T>,
+    generate: impl FnOnce() -> T,
+    save: impl FnOnce(&T, &Path) -> Result<()>,
+) -> Result<T> {
+    match load(path) {
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            let fresh = generate();
+            save(&fresh, path)?;
+            Ok(fresh)
+        }
+        loaded => loaded,
+    }
 }
 
 #[derive(Clone)]
@@ -93,15 +106,12 @@ impl Identity {
         Ok(Self::from_secret_bytes(&a))
     }
     pub fn load_or_generate(p: impl AsRef<Path>) -> Result<Self> {
-        let p = p.as_ref();
-        match Self::load(p) {
-            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                let x = Self::generate();
-                x.save(p)?;
-                Ok(x)
-            }
-            x => x,
-        }
+        load_or_generate_with(
+            p.as_ref(),
+            |p| Self::load(p),
+            Self::generate,
+            |x, p| x.save(p),
+        )
     }
 }
 
@@ -159,15 +169,12 @@ impl DeviceKeys {
         })
     }
     pub fn load_or_generate(p: impl AsRef<Path>) -> Result<Self> {
-        let p = p.as_ref();
-        match Self::load(p) {
-            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                let x = Self::generate();
-                x.save(p)?;
-                Ok(x)
-            }
-            x => x,
-        }
+        load_or_generate_with(
+            p.as_ref(),
+            |p| Self::load(p),
+            Self::generate,
+            |x, p| x.save(p),
+        )
     }
 }
 trait ParseHex {

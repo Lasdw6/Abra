@@ -12,14 +12,14 @@ for Ubuntu guests; a musl build is preferred for vendor images:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl -p abra-cli -p cadabra
+cargo build --release --target x86_64-unknown-linux-musl -p abra-cli
 sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
-  target/x86_64-unknown-linux-musl/release/abra \
-  target/x86_64-unknown-linux-musl/release/cadabra
+  target/x86_64-unknown-linux-musl/release/abra
 ```
 
-The installer adds `cadabra.service`, an observer, `/workspace`, the two
-binaries, and the `os-desktop-init.sh` PID 1 handoff named in the boot arguments.
+The installer adds `abra-daemon.service` (which execs `abra --root /var/lib/abra
+daemon`), an observer, `/workspace`, the `abra` binary, and the
+`os-desktop-init.sh` PID 1 handoff named in the boot arguments.
 It does not install network packages.
 
 For an agent image, use `provision-rootfs.sh` instead. It grows images smaller
@@ -28,8 +28,7 @@ registers the browser-session adapter:
 
 ```sh
 sudo -E adapters/firecracker/guest/provision-rootfs.sh rootfs.ext4 \
-  target/x86_64-unknown-linux-musl/release/abra \
-  target/x86_64-unknown-linux-musl/release/cadabra
+  target/x86_64-unknown-linux-musl/release/abra
 ```
 
 The package step needs outbound HTTPS and currently supports amd64 Debian or
@@ -75,8 +74,8 @@ that file. Tokens never appear in kernel arguments, adapter JSON, or Firecracker
 configuration/logs; `/proc/cmdline` is treated as public.
 The observer derives recipes from `/proc` (argv, workspace-relative cwd, a small
 environment allowlist, listening TCP ports, and start time) and atomically writes
-`/workspace/.abra/recipes.json`. Cadabra validates and embeds those recipes when
-the workspace is snapshotted. Recipes are data and are never executed.
+`/workspace/.abra/recipes.json`. The daemon validates and embeds those recipes
+when the workspace is snapshotted. Recipes are data and are never executed.
 
 ## Lifecycle
 
@@ -131,10 +130,10 @@ manifest stores its structured equivalent. After creation, `abra-fc` runs
 `firecracker --describe-snapshot VMSTATE` and uses the major component of the
 independent snapshot data-format version—not the Firecracker release number.
 The remaining values come from the live host architecture, `/proc/cpuinfo`, and
-configured `ABRA_FC_CPU_TEMPLATE` (`-` means none). Restore always computes a
-fresh receiver fingerprint; capture-time `fingerprint.json` is never receiver
-identity. `ABRA_FC_FAKE_FINGERPRINT` exists solely to exercise
-the mismatch path.
+configured `ABRA_FC_CPU_TEMPLATE` (`-` means none). Restore always probes the
+live receiver; no capture-time fingerprint is cached on disk or trusted as
+receiver identity. `ABRA_FC_FAKE_FINGERPRINT` exists solely to exercise the
+mismatch path.
 
 Native restore is honestly same-host/same-CPU-model with no CPU template.
 Firecracker also warns that host-kernel differences can matter. A static CPU
@@ -142,7 +141,8 @@ template such as `T2CL` can widen the compatible CPU set, but this adapter does
 not enable it by default because it changes the guest CPU contract. Custom
 `/cpu-config` probing and UFFD/CAS paging are deferred Tier 2 work. Tier 1 is
 cold boot, full capture, File-backed native restore, and portable fallback.
-Differential capture is rejected until chained restore is implemented.
+Every capture is full; there is no differential capture until chained restore
+is implemented.
 
 `snapshot` prints both `portable_snapshot_id` and `native_snapshot_id`. Send the
 native child to a compatible host. Abra streams its memory and disk objects and

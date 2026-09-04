@@ -1,0 +1,13 @@
+{
+  "name": "@abra/codex-session",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "abra-codex-adapter": "./bin/adapter.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" }
+}

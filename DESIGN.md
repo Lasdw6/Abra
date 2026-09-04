@@ -85,7 +85,7 @@ handoff link. No lineage, no capsule, no lease. Receiving a `partial` means: it
 lands in an inbox.
 
 A partial may carry a **provenance** back-reference: `{capsule_id,
-snapshot_hash, label}`. It is optional and it is a reference, not a claim of
+snapshot_id, turn}`. It is optional and it is a reference, not a claim of
 membership — "this handoff came out of that workspace at that version". It
 never makes the partial part of the DAG.
 

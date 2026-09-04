@@ -61,8 +61,6 @@ enum Action {
         slot: u8,
         #[arg(long)]
         capsule: String,
-        #[arg(long)]
-        diff: bool,
     },
     Restore {
         #[arg(long)]
@@ -136,7 +134,7 @@ fn main() -> Result<()> {
             vcpus,
             token,
         } => {
-            let key = resolve_key(cli.ssh_key, &rootfs)?;
+            let key = resolve_key(cli.ssh_key)?;
             let state = up(
                 &root,
                 &cli.firecracker,
@@ -152,20 +150,10 @@ fn main() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
-        Action::Snapshot {
-            slot,
-            capsule,
-            diff,
-        } => {
+        Action::Snapshot { slot, capsule } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&snapshot(
-                    &root,
-                    &cli.firecracker,
-                    slot,
-                    &capsule,
-                    diff
-                )?)?
+                serde_json::to_string_pretty(&snapshot(&root, &cli.firecracker, slot, &capsule)?)?
             );
         }
         Action::Restore {
@@ -222,14 +210,13 @@ fn state_path(root: &Path, slot: u8) -> PathBuf {
     slot_dir(root, slot).join("state.json")
 }
 
-fn resolve_key(explicit: Option<PathBuf>, rootfs: &Path) -> Result<PathBuf> {
+fn resolve_key(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let key = explicit
         .filter(|p| p.is_file())
         .ok_or("SSH key not found; set --ssh-key or ABRA_FC_SSH_KEY")?;
     if key.metadata()?.permissions().mode() & 0o077 != 0 {
         return Err(format!("SSH key must have mode 0600: {}", key.display()).into());
     }
-    let _ = rootfs;
     Ok(key)
 }
 
@@ -262,6 +249,95 @@ fn up(root: &Path, fc: &Path, slot: u8, config: Config, token: Option<&str>) -> 
     start_vm(root, fc, slot, config, rootfs)
 }
 
+/// A started Firecracker process plus the host resources its slot holds before
+/// the VM is recorded as running. Dropping it kills the child, removes the TAP
+/// device, and deletes the API socket; `keep` hands ownership to the slot state.
+struct Vm {
+    child: Option<Child>,
+    socket: PathBuf,
+    tap: String,
+    host_ip: String,
+    guest_ip: String,
+    guest_mac: String,
+    armed: bool,
+}
+
+impl Vm {
+    fn pid(&self) -> u32 {
+        self.child.as_ref().map_or(0, Child::id)
+    }
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(child) = self.child.as_mut() {
+            cleanup_child(child);
+        }
+        teardown_network(&self.tap);
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+fn spawn_firecracker(fc: &Path, slot: u8, dir: &Path) -> Result<Vm> {
+    let (tap, host_ip, guest_ip, guest_mac) = network(slot);
+    setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
+    let mut vm = Vm {
+        child: None,
+        socket: dir.join("firecracker.sock"),
+        tap,
+        host_ip,
+        guest_ip,
+        guest_mac,
+        armed: true,
+    };
+    vm.child = Some(
+        Command::new(fc)
+            .args(["--api-sock"])
+            .arg(&vm.socket)
+            .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
+            .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
+            .spawn()?,
+    );
+    wait_path(&vm.socket, Duration::from_secs(5))?;
+    fs::set_permissions(&vm.socket, fs::Permissions::from_mode(0o600))?;
+    Ok(vm)
+}
+
+fn finish_start(
+    root: &Path,
+    slot: u8,
+    vm: Vm,
+    config: &Config,
+    rootfs: PathBuf,
+    ssh_timeout: Duration,
+) -> Result<SlotState> {
+    let state = SlotState {
+        slot,
+        pid: vm.pid(),
+        pid_starttime: proc_starttime(vm.pid()).unwrap_or(0),
+        api_socket: vm.socket.clone(),
+        tap: vm.tap.clone(),
+        host_ip: vm.host_ip.clone(),
+        guest_ip: vm.guest_ip.clone(),
+        guest_mac: vm.guest_mac.clone(),
+        rootfs,
+        kernel: config.kernel.clone(),
+        mem_mib: config.mem_mib,
+        vcpus: config.vcpus,
+        status: "running".into(),
+    };
+    write_state(root, &state)?;
+    wait_ssh(&state, &config.ssh_key, ssh_timeout)?;
+    vm.keep();
+    Ok(state)
+}
+
 fn start_vm(
     root: &Path,
     fc: &Path,
@@ -271,102 +347,51 @@ fn start_vm(
 ) -> Result<SlotState> {
     let dir = slot_dir(root, slot);
     create_slot_dir(root, slot)?;
-    let socket = dir.join("firecracker.sock");
     let log = dir.join("firecracker.log");
-    let stdout = fs::File::create(dir.join("stdout.log"))?;
-    let stderr = fs::File::create(dir.join("stderr.log"))?;
-    let (tap, host_ip, guest_ip, guest_mac) = network(slot);
-    setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
-    let mut child = Command::new(fc)
-        .args(["--api-sock"])
-        .arg(&socket)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()?;
-    if let Err(error) = wait_path(&socket, Duration::from_secs(5)) {
-        cleanup_child(&mut child);
-        teardown_network(&tap);
-        return Err(error);
-    }
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let configured = (|| -> Result<()> {
-        fs::File::create(&log)?;
-        api(
-            &socket,
-            "PUT",
-            "/logger",
-            &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
-        )?;
-        api(
-            &socket,
-            "PUT",
-            "/machine-config",
-            &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
-        )?;
-        let boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
-        api(
-            &socket,
-            "PUT",
-            "/boot-source",
-            &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
-        )?;
-        api(
-            &socket,
-            "PUT",
-            "/drives/rootfs",
-            &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
-        )?;
-        api(
-            &socket,
-            "PUT",
-            "/network-interfaces/net1",
-            &json!({"iface_id":"net1","guest_mac":guest_mac,"host_dev_name":tap}),
-        )?;
-        api(
-            &socket,
-            "PUT",
-            "/actions",
-            &json!({"action_type":"InstanceStart"}),
-        )?;
-        Ok(())
-    })();
-    if let Err(error) = configured {
-        cleanup_child(&mut child);
-        teardown_network(&tap);
-        let _ = fs::remove_file(&socket);
-        return Err(error);
-    }
-    let state = SlotState {
-        slot,
-        pid: child.id(),
-        pid_starttime: proc_starttime(child.id()).unwrap_or(0),
-        api_socket: socket,
-        tap,
-        host_ip,
-        guest_ip,
-        guest_mac,
-        rootfs,
-        kernel: config.kernel,
-        mem_mib: config.mem_mib,
-        vcpus: config.vcpus,
-        status: "running".into(),
-    };
-    write_state(root, &state)?;
-    if let Err(error) = wait_ssh(&state, &config.ssh_key, Duration::from_secs(90)) {
-        cleanup_child(&mut child);
-        teardown_network(&state.tap);
-        let _ = fs::remove_file(&state.api_socket);
-        return Err(error);
-    }
-    Ok(state)
+    let vm = spawn_firecracker(fc, slot, &dir)?;
+    fs::File::create(&log)?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/logger",
+        &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/machine-config",
+        &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
+    )?;
+    let (guest_ip, host_ip) = (&vm.guest_ip, &vm.host_ip);
+    let boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
+    api(
+        &vm.socket,
+        "PUT",
+        "/boot-source",
+        &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/drives/rootfs",
+        &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/network-interfaces/net1",
+        &json!({"iface_id":"net1","guest_mac":vm.guest_mac,"host_dev_name":vm.tap}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/actions",
+        &json!({"action_type":"InstanceStart"}),
+    )?;
+    finish_start(root, slot, vm, &config, rootfs, Duration::from_secs(90))
 }
 
-fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Result<Value> {
-    if diff {
-        return Err(
-            "differential snapshots are unsupported until chained restore is implemented".into(),
-        );
-    }
+fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
     let state = read_state(root, slot)?;
     ensure_running(&state)?;
     let config: Config =
@@ -442,10 +467,6 @@ fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str, diff: bool) -> Resu
             }),
         )?;
         let fp = fingerprint_for_snapshot(fc, &vmstate)?;
-        fs::write(
-            adapter_root(root).join("fingerprint.json"),
-            serde_json::to_vec_pretty(&fp)?,
-        )?;
         let response = control(
             root,
             &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
@@ -490,7 +511,8 @@ fn restore(
         .snapshot(&snapshot_id)
         .ok_or("snapshot not found in capsule")?;
     let config = resolve_restore_config(root, overrides)?;
-    let local = local_fingerprint(root, fc)?;
+    // Always probe the live receiver; a captured fingerprint never identifies it.
+    let local = fingerprint(fc)?;
     let matched = matching_native(record.raw.manifest().native.as_deref(), &local);
     if let Some((vmstate, memory, disk)) = matched {
         let native_attempt = (|| -> Result<Value> {
@@ -503,65 +525,22 @@ fn restore(
             store.cas.copy_to_file(&vmstate.blob, &vmstate_path)?;
             store.cas.copy_to_file(&memory.blob, &memory_path)?;
             store.cas.copy_to_file(&disk.blob, &disk_path)?;
-            let (tap, host_ip, guest_ip, guest_mac) = network(slot);
-            setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
-            let socket = dir.join("firecracker.sock");
-            let mut child = Command::new(fc)
-                .args(["--api-sock"])
-                .arg(&socket)
-                .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
-                .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
-                .spawn()?;
-            if let Err(error) = wait_path(&socket, Duration::from_secs(5)) {
-                cleanup_child(&mut child);
-                teardown_network(&tap);
-                return Err(error);
-            }
-            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-            let configured = (|| -> Result<()> {
-                api(
-                    &socket,
-                    "PUT",
-                    "/snapshot/load",
-                    &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
-            "track_dirty_pages":true,"resume_vm":false,"network_overrides":[{"iface_id":"net1","host_dev_name":tap,"guest_mac":guest_mac}]}),
-                )?;
-                api(
-                    &socket,
-                    "PATCH",
-                    "/drives/rootfs",
-                    &json!({"drive_id":"rootfs","path_on_host":disk_path}),
-                )?;
-                api(&socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
-                Ok(())
-            })();
-            if let Err(error) = configured {
-                cleanup_child(&mut child);
-                teardown_network(&tap);
-                let _ = fs::remove_file(&socket);
-                return Err(error);
-            }
-            let state = SlotState {
-                slot,
-                pid: child.id(),
-                pid_starttime: proc_starttime(child.id()).unwrap_or(0),
-                api_socket: socket,
-                tap,
-                host_ip,
-                guest_ip,
-                guest_mac,
-                rootfs: disk_path,
-                kernel: config.kernel.clone(),
-                mem_mib: config.mem_mib,
-                vcpus: config.vcpus,
-                status: "running".into(),
-            };
-            write_state(root, &state)?;
-            if let Err(error) = wait_ssh(&state, &config.ssh_key, Duration::from_secs(30)) {
-                cleanup_child(&mut child);
-                teardown_network(&state.tap);
-                return Err(error);
-            }
+            let vm = spawn_firecracker(fc, slot, &dir)?;
+            api(
+                &vm.socket,
+                "PUT",
+                "/snapshot/load",
+                &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
+            "track_dirty_pages":true,"resume_vm":false,"network_overrides":[{"iface_id":"net1","host_dev_name":vm.tap,"guest_mac":vm.guest_mac}]}),
+            )?;
+            api(
+                &vm.socket,
+                "PATCH",
+                "/drives/rootfs",
+                &json!({"drive_id":"rootfs","path_on_host":disk_path}),
+            )?;
+            api(&vm.socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
+            finish_start(root, slot, vm, &config, disk_path, Duration::from_secs(30))?;
             Ok(
                 json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis()}),
             )
@@ -673,7 +652,7 @@ fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Co
     }
     require_file(&config.kernel)?;
     require_file(&config.base_rootfs)?;
-    resolve_key(Some(config.ssh_key.clone()), &config.base_rootfs)?;
+    resolve_key(Some(config.ssh_key.clone()))?;
     if config_was_absent {
         create_adapter_root(root)?;
         fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
@@ -685,13 +664,6 @@ fn fingerprint(fc: &Path) -> Result<Fingerprint> {
     if let Ok(fake) = std::env::var("ABRA_FC_FAKE_FINGERPRINT") {
         return Ok(serde_json::from_str(&fake)?);
     }
-    let output = Command::new(fc).arg("--version").output()?;
-    let version = String::from_utf8(output.stdout)?
-        .split_whitespace()
-        .find(|x| x.starts_with('v'))
-        .ok_or("unrecognized Firecracker version")?
-        .trim_start_matches('v')
-        .to_owned();
     let major = if let Ok(value) = std::env::var("ABRA_FC_SNAPSHOT_FORMAT_MAJOR") {
         value.parse()?
     } else {
@@ -707,7 +679,6 @@ fn fingerprint(fc: &Path) -> Result<Fingerprint> {
             .ok_or("unrecognized Firecracker snapshot version")?
             .parse()?
     };
-    let _ = version;
     Ok(Fingerprint {
         os: "linux".into(),
         arch: std::env::consts::ARCH.into(),
@@ -716,12 +687,6 @@ fn fingerprint(fc: &Path) -> Result<Fingerprint> {
         cpu_template: std::env::var("ABRA_FC_CPU_TEMPLATE").unwrap_or_else(|_| "-".into()),
         cpu_identity: live_cpu_identity()?,
     })
-}
-
-fn local_fingerprint(_root: &Path, fc: &Path) -> Result<Fingerprint> {
-    // Always probe the live receiver. fingerprint.json describes a capture and
-    // must never be trusted as receiver identity.
-    fingerprint(fc)
 }
 
 fn fingerprint_for_snapshot(fc: &Path, vmstate: &Path) -> Result<Fingerprint> {
@@ -918,23 +883,33 @@ fn list(root: &Path) -> Result<()> {
     Ok(())
 }
 
+const SSH_OPTIONS: [&str; 9] = [
+    "-q",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=2",
+];
+
+/// `ssh`/`scp` with the one option list every guest call uses.
+fn transport_command(program: &str, key: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(SSH_OPTIONS).arg("-i").arg(key);
+    command
+}
+
+fn ssh_command(state: &SlotState, key: &Path) -> Command {
+    let mut command = transport_command("ssh", key);
+    command.arg(format!("root@{}", state.guest_ip));
+    command
+}
+
 fn ssh(state: &SlotState, key: &Path, command: &str) -> Result<()> {
-    let status = Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=2",
-            "-i",
-        ])
-        .arg(key)
-        .arg(format!("root@{}", state.guest_ip))
-        .arg(command)
-        .status()?;
+    let status = ssh_command(state, key).arg(command).status()?;
     if !status.success() {
         return Err(format!("guest SSH command failed with {status}").into());
     }
@@ -942,23 +917,7 @@ fn ssh(state: &SlotState, key: &Path, command: &str) -> Result<()> {
 }
 
 fn ssh_output(state: &SlotState, key: &Path, command: &str) -> Result<String> {
-    let output = Command::new("ssh")
-        .args([
-            "-q",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=2",
-            "-i",
-        ])
-        .arg(key)
-        .arg(format!("root@{}", state.guest_ip))
-        .arg(command)
-        .output()?;
+    let output = ssh_command(state, key).arg(command).output()?;
     if !output.status.success() {
         return Err(format!("guest SSH command failed with {}", output.status).into());
     }
@@ -983,17 +942,8 @@ fn wait_ssh(state: &SlotState, key: &Path, timeout: Duration) -> Result<()> {
 
 fn rsync_guest(source: &Path, state: &SlotState, key: &Path, destination: &str) -> Result<()> {
     ssh(state, key, &format!("mkdir -p {destination}"))?;
-    let status = Command::new("scp")
-        .args([
-            "-q",
-            "-r",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-i",
-        ])
-        .arg(key)
+    let status = transport_command("scp", key)
+        .arg("-r")
         .arg(format!("{}/.", source.display()))
         .arg(format!("root@{}:{destination}", state.guest_ip))
         .status()?;

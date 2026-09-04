@@ -27,7 +27,7 @@ pub mod store;
 mod util;
 
 pub use error::{Error, Result};
-pub use util::now_ms;
+pub use util::{atomic_write, now_ms};
 
 /// This crate's version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

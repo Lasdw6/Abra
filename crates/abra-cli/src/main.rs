@@ -1,11 +1,15 @@
-use cadabra::{control_call, Daemon, DaemonConfig};
-use clap::{Args, Parser, Subcommand};
+use cadabra::{
+    adapters::ExtraAdapterDir, background, control_call, relay::RelayConfig, Daemon, DaemonConfig,
+};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Stdio},
     sync::Arc,
+    time::Duration,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -27,20 +31,23 @@ enum Command {
     Daemon {
         #[arg(long)]
         yes: bool,
-        #[arg(long, value_enum, default_value_t = TransportKind::Iroh)]
+        /// Loopback-only test transport; the default iroh transport is the
+        /// only inter-device one.
+        #[arg(long, value_enum, default_value_t = TransportKind::Iroh, hide = true)]
         transport: TransportKind,
         #[arg(long)]
         token: Option<String>,
-        /// n0, none, or a custom https relay URL.
+        /// Re-execute detached, logging to <root>/daemon.log, and print the
+        /// peer id once the daemon answers.
         #[arg(long)]
-        iroh_relay: Option<String>,
-        /// Accept portable content without optional native cache blobs.
-        #[arg(long)]
-        skip_native: bool,
-        /// Maximum bytes accepted for one direct offer.
-        #[arg(long)]
-        offer_budget: Option<u64>,
+        background: bool,
+        /// Extra adapter directory, or a parent of adapter directories. Not
+        /// persisted; repeatable. `ABRA_ADAPTERS` is the colon-separated form.
+        #[arg(long = "adapters")]
+        adapters: Vec<PathBuf>,
     },
+    /// Terminate the daemon recorded by `daemon --background`.
+    Stop,
     Pair {
         #[command(subcommand)]
         command: PairCommand,
@@ -54,19 +61,19 @@ enum Command {
         label: Option<String>,
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Do not take the capsule lease before snapshotting.
+        #[arg(long)]
+        no_lease: bool,
     },
     Send(SendArgs),
-    Inbox,
-    Accept {
-        id: String,
-        #[arg(long, required_unless_present = "into", conflicts_with = "into")]
-        to: Option<PathBuf>,
-        #[arg(long, required_unless_present = "to", conflicts_with = "to")]
-        into: Option<PathBuf>,
+    Inbox(InboxArgs),
+    Accept(AcceptArgs),
+    /// Per-kind summary of who last had each handoff.
+    Handoffs {
         #[arg(long)]
-        destination: Option<String>,
-        #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
-        adapter_options: Vec<(String, String)>,
+        kind: Option<String>,
+        #[arg(long)]
+        peer: Option<String>,
     },
     Log {
         #[arg(long)]
@@ -88,20 +95,14 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    Ps,
-    StopRecipes {
-        capsule: String,
-    },
     Lease {
         #[command(subcommand)]
         command: LeaseCommand,
     },
     Control(ControlArgs),
+    /// Run only an adapter's inspect verb on a source.
+    Inspect(InspectArgs),
     Watch,
-    Mesh {
-        #[command(subcommand)]
-        command: MeshCommand,
-    },
     Link {
         #[command(subcommand)]
         command: LinkCommand,
@@ -114,6 +115,26 @@ enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print one key, or every key when none is named.
+    Get {
+        key: Option<String>,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    /// Restore a key to its default.
+    Unset {
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,10 +143,6 @@ enum RelayCommand {
         url: String,
         #[arg(long)]
         secret: Option<String>,
-        #[arg(long)]
-        relay_after_attempts: Option<u32>,
-        #[arg(long)]
-        poll_seconds: Option<u64>,
     },
     List,
     Remove {
@@ -146,8 +163,6 @@ enum LinkCommand {
         snapshot: String,
         #[arg(long, value_parser = parse_duration, default_value = "7d")]
         ttl: u64,
-        #[arg(long, conflicts_with = "full")]
-        floor_only: bool,
         #[arg(long)]
         full: bool,
         #[arg(long, default_value = ".")]
@@ -183,11 +198,6 @@ enum LinkCommand {
 }
 
 #[derive(Subcommand)]
-enum MeshCommand {
-    Profile { profile: Option<String> },
-}
-
-#[derive(Subcommand)]
 enum PolicyCommand {
     Grant {
         #[arg(long)]
@@ -199,9 +209,10 @@ enum PolicyCommand {
         #[arg(long)]
         auto_accept: bool,
         #[arg(long)]
-        auto_run_recipes: bool,
-        #[arg(long)]
         to: Option<PathBuf>,
+        /// Re-deliver every auto-accepted snapshot to this peer.
+        #[arg(long, requires = "auto_accept")]
+        forward: Option<String>,
     },
     List,
     Clear,
@@ -226,6 +237,16 @@ struct ControlArgs {
     text: Option<String>,
 }
 
+#[derive(Args)]
+struct InspectArgs {
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    source: String,
+    #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
+    adapter_options: Vec<(String, String)>,
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum TransportKind {
     Iroh,
@@ -241,6 +262,17 @@ enum PairCommand {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("payload")
+        .required(true)
+        .multiple(false)
+        .args(["link", "path", "snapshot", "kind"])
+))]
+#[command(group(
+    ArgGroup::new("back_reference")
+        .multiple(false)
+        .args(["workspace", "provenance"])
+))]
 struct SendArgs {
     peer: String,
     #[arg(long)]
@@ -251,12 +283,31 @@ struct SendArgs {
     note: Option<String>,
     #[arg(long)]
     path: Option<PathBuf>,
-    #[arg(long)]
-    capsule: Option<String>,
+    /// Snapshot id, or a capsule id resolved to its main head.
+    #[arg(long, alias = "capsule")]
+    snapshot: Option<String>,
     #[arg(long, requires = "source")]
     kind: Option<String>,
     #[arg(long, requires = "kind")]
     source: Option<String>,
+    /// Snapshot this workspace, send it, and set the adapter partial's
+    /// provenance to it. Initializes the directory when it is not a capsule.
+    #[arg(long, requires = "kind")]
+    workspace: Option<PathBuf>,
+    /// Existing local snapshot id to record as the partial's provenance.
+    #[arg(long)]
+    provenance: Option<String>,
+    /// Return only once every enqueued delivery is acknowledged.
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, value_parser = parse_duration, default_value = "120s")]
+    timeout: u64,
+    /// Do not take the capsule lease before snapshotting a workspace.
+    #[arg(long)]
+    no_lease: bool,
+    /// Send even when the adapter's inspect verb blocked this source.
+    #[arg(long)]
+    force: bool,
     #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
     adapter_options: Vec<(String, String)>,
 }
@@ -272,6 +323,53 @@ fn parse_adapter_option(value: &str) -> Result<(String, String), String> {
 }
 
 #[derive(Args)]
+struct InboxArgs {
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    /// Block until an unread matching delivery exists.
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, value_parser = parse_duration, default_value = "120s")]
+    timeout: u64,
+}
+
+// `id` is optional with `--latest`, so the last positional stays the path.
+#[derive(Args)]
+#[command(allow_missing_positional = true)]
+struct AcceptArgs {
+    #[arg(required_unless_present = "latest")]
+    id: Option<String>,
+    path: PathBuf,
+    /// Accept the newest unread delivery of `--kind`, or another peer's
+    /// capsule main head of that kind when the inbox has none.
+    #[arg(long, requires = "kind")]
+    latest: bool,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    /// Replace the files of an existing workspace for the same capsule,
+    /// preserving its .abra directory.
+    #[arg(long)]
+    replace: bool,
+    /// Restore the workspace this delivery's provenance names into <dir>
+    /// before the adapter import runs.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long, value_parser = parse_duration, default_value = "120s")]
+    timeout: u64,
+    /// Do not take the capsule lease while materializing a workspace.
+    #[arg(long)]
+    no_lease: bool,
+    #[arg(long)]
+    destination: Option<String>,
+    #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
+    adapter_options: Vec<(String, String)>,
+}
+
+#[derive(Args)]
 struct EnrollArgs {
     #[arg(long = "capsule", required = true)]
     capsules: Vec<String>,
@@ -283,6 +381,12 @@ struct EnrollArgs {
     send: bool,
     #[arg(long)]
     receive: bool,
+    /// Let the guest acquire an expired or unheld capsule lease.
+    #[arg(long)]
+    lease_acquire: bool,
+    /// Let the guest take over a capsule lease another peer holds.
+    #[arg(long)]
+    lease_takeover: bool,
 }
 
 fn parse_duration(s: &str) -> Result<u64, String> {
@@ -314,31 +418,31 @@ async fn main() -> cadabra::Result<()> {
     if let Command::Link { command } = cli.command {
         return run_link(&root, command, cli.json).await;
     }
+    if let Command::Config { command } = cli.command {
+        return run_config(&root, command, cli.json);
+    }
+    if matches!(cli.command, Command::Stop) {
+        let result = background::stop(&root).await?;
+        if cli.json {
+            println!("{}", serde_json::to_string(&result)?);
+        } else {
+            print_human(&result);
+        }
+        return Ok(());
+    }
     if let Command::Daemon {
         yes,
         transport,
         token,
-        iroh_relay,
-        skip_native,
-        offer_budget,
+        background: detached,
+        adapters,
     } = cli.command
     {
-        let mut config = DaemonConfig::load(&root)?;
-        let config_changed = iroh_relay.is_some() || skip_native || offer_budget.is_some();
-        if let Some(relay) = &iroh_relay {
-            relay.parse::<abra_net::IrohRelayMode>()?;
-            config.iroh_relay = relay.clone();
+        if detached {
+            return start_background_daemon(&root, cli.json).await;
         }
-        if skip_native {
-            config.skip_native = true;
-        }
-        if let Some(bytes) = offer_budget {
-            config.offer_budget = bytes;
-        }
-        if config_changed {
-            config.save(&root)?;
-        }
-        let daemon = Arc::new(match transport {
+        background::detach_from_terminal();
+        let mut daemon = match transport {
             #[cfg(feature = "iroh")]
             TransportKind::Iroh => Daemon::iroh(&root, yes).await?,
             #[cfg(not(feature = "iroh"))]
@@ -347,13 +451,16 @@ async fn main() -> cadabra::Result<()> {
             TransportKind::Tcp => Daemon::tcp(&root, yes).await?,
             #[cfg(not(feature = "tcp"))]
             TransportKind::Tcp => return Err("binary built without TCP transport".into()),
-        });
+        };
+        daemon.set_adapter_sources(adapter_sources(adapters)?);
+        let daemon = Arc::new(daemon);
         if let Some(token) = token {
             daemon.join(&token).await?;
         }
         let running = daemon.start().await?;
         wait_for_shutdown().await?;
         running.shutdown().await;
+        background::release_pid_file(&root);
         return Ok(());
     }
     if matches!(cli.command, Command::Watch) {
@@ -379,44 +486,62 @@ async fn main() -> cadabra::Result<()> {
             std::fs::create_dir_all(&path)?;
             json!({"op":"capsule-create","path":std::fs::canonicalize(path)?})
         }
-        Command::Snapshot { label, path } => {
-            json!({"op":"snapshot","path":std::fs::canonicalize(path)?,"label":label})
+        Command::Snapshot {
+            label,
+            path,
+            no_lease,
+        } => {
+            json!({"op":"snapshot","path":std::fs::canonicalize(path)?,"label":label,"no_lease":no_lease})
         }
         Command::Send(args) => {
             let path = args.path.map(std::fs::canonicalize).transpose()?;
+            let workspace = args
+                .workspace
+                .map(|path| {
+                    std::fs::create_dir_all(&path)?;
+                    std::fs::canonicalize(path)
+                })
+                .transpose()?;
             let options = args
                 .adapter_options
                 .into_iter()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.capsule,"kind":args.kind,"source":args.source,"options":options})
+            json!({"op":"send","peer":args.peer,"link":args.link,"title":args.title,"note":args.note,"path":path,"snapshot_id":args.snapshot,"kind":args.kind,"source":args.source,"workspace":workspace,"provenance":args.provenance,"wait":args.wait,"timeout_ms":args.timeout,"no_lease":args.no_lease,"force":args.force,"options":options})
         }
-        Command::Inbox => json!({"op":"inbox"}),
-        Command::Accept {
-            id,
-            to,
-            into,
-            destination,
-            adapter_options,
-        } => {
-            let path = to.or(into.clone()).expect("clap requires a destination");
-            let absolute = if into.is_some() {
-                std::fs::canonicalize(&path)?
-            } else if path.is_absolute() {
-                path
+        Command::Inbox(args) => {
+            json!({"op":"inbox","kind":args.kind,"from":args.from,"wait":args.wait,"timeout_ms":args.timeout})
+        }
+        Command::Accept(args) => {
+            let absolute = if args.replace {
+                std::fs::canonicalize(&args.path)?
+            } else if args.path.is_absolute() {
+                args.path
             } else {
-                std::env::current_dir()?.join(path)
+                std::env::current_dir()?.join(args.path)
             };
-            let options = adapter_options
+            let workspace = args
+                .workspace
+                .map(|path| {
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        std::env::current_dir().map(|cwd| cwd.join(path))
+                    }
+                })
+                .transpose()?;
+            let options = args
+                .adapter_options
                 .into_iter()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            json!({"op":"accept","id":id,"to":absolute,"into":into.is_some(),"destination":destination,"options":options})
+            json!({"op":"accept","id":args.id,"to":absolute,"replace":args.replace,"latest":args.latest,"kind":args.kind,"from":args.from,"workspace":workspace,"timeout_ms":args.timeout,"no_lease":args.no_lease,"destination":args.destination,"options":options})
         }
+        Command::Handoffs { kind, peer } => json!({"op":"handoffs","kind":kind,"peer":peer}),
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
         Command::Capsules => json!({"op":"capsules"}),
         Command::Outbox => json!({"op":"outbox"}),
         Command::Cancel { id } => json!({"op":"cancel","id":id}),
         Command::Enroll(args) => {
-            json!({"op":"enroll-mint","capsules":args.capsules,"kinds":args.kinds,"ttl_ms":args.ttl,"send":args.send,"receive":args.receive})
+            json!({"op":"enroll-mint","capsules":args.capsules,"kinds":args.kinds,"ttl_ms":args.ttl,"send":args.send,"receive":args.receive,"lease_acquire":args.lease_acquire,"lease_takeover":args.lease_takeover})
         }
         Command::Join { token } => json!({"op":"enroll-join","token":token}),
         Command::Revoke { token_id } => json!({"op":"revoke","token_id":token_id}),
@@ -426,8 +551,8 @@ async fn main() -> cadabra::Result<()> {
                 kind,
                 capsule,
                 auto_accept,
-                auto_run_recipes,
                 to,
+                forward,
             } => {
                 let to = to.map(|path| {
                     if path.is_absolute() {
@@ -436,14 +561,12 @@ async fn main() -> cadabra::Result<()> {
                         std::env::current_dir().unwrap().join(path)
                     }
                 });
-                json!({"op":"policy-grant","peer":peer,"kind":kind,"capsule":capsule,"auto_accept":auto_accept,"auto_run_recipes":auto_run_recipes,"to":to})
+                json!({"op":"policy-grant","peer":peer,"kind":kind,"capsule":capsule,"auto_accept":auto_accept,"to":to,"forward":forward})
             }
             PolicyCommand::List => json!({"op":"policy-list"}),
             PolicyCommand::Clear => json!({"op":"policy-clear"}),
             PolicyCommand::Revoke { id } => json!({"op":"policy-revoke","id":id}),
         },
-        Command::Ps => json!({"op":"ps"}),
-        Command::StopRecipes { capsule } => json!({"op":"stop-recipes","capsule":capsule}),
         Command::Lease { command } => match command {
             LeaseCommand::Status { capsule } => json!({"op":"lease-status","capsule":capsule}),
             LeaseCommand::Take { capsule } => json!({"op":"lease-take","capsule":capsule}),
@@ -451,9 +574,13 @@ async fn main() -> cadabra::Result<()> {
         Command::Control(args) => {
             json!({"op":"control","peer":args.peer,"capsule":args.capsule,"control_op":args.op,"text":args.text})
         }
-        Command::Mesh {
-            command: MeshCommand::Profile { profile },
-        } => json!({"op":"mesh-profile","profile":profile}),
+        Command::Inspect(args) => {
+            let options = args
+                .adapter_options
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            json!({"op":"inspect","kind":args.kind,"source":args.source,"options":options})
+        }
         Command::Adapters { command } => match command {
             AdapterCommand::List => json!({"op":"adapters-list"}),
             AdapterCommand::Add { dir } => {
@@ -462,22 +589,18 @@ async fn main() -> cadabra::Result<()> {
             AdapterCommand::Remove { name } => json!({"op":"adapters-remove","name":name}),
         },
         Command::Relay { command } => match command {
-            RelayCommand::Add {
-                url,
-                secret,
-                relay_after_attempts,
-                poll_seconds,
-            } => {
-                json!({"op":"relay-add","url":url,"secret":secret,"relay_after_attempts":relay_after_attempts,"poll_seconds":poll_seconds})
+            RelayCommand::Add { url, secret } => {
+                json!({"op":"relay-add","url":url,"secret":secret})
             }
             RelayCommand::List => json!({"op":"relay-list"}),
             RelayCommand::Remove { url } => json!({"op":"relay-remove","url":url}),
         },
         Command::Watch => unreachable!(),
         Command::Link { .. } => unreachable!(),
-        Command::Daemon { .. } => unreachable!(),
+        Command::Daemon { .. } | Command::Stop => unreachable!(),
+        Command::Config { .. } => unreachable!(),
     };
-    let result = control_call(root, &request).await?;
+    let result = call_with_pairing_hint(&root, &request, !cli.json).await?;
     if cli.json {
         println!("{}", serde_json::to_string(&result)?);
     } else if matches!(
@@ -497,11 +620,311 @@ async fn main() -> cadabra::Result<()> {
             .and_then(Value::as_str)
             .ok_or("daemon returned no enrollment token")?;
         println!("{token}");
-        println!("abra://join/{token}");
     } else {
+        if result.get("workspace_detected") == Some(&Value::Bool(true)) {
+            eprintln!(
+                "workspace detected: sent capsule snapshot {}",
+                result
+                    .get("snapshot_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+        }
         print_human(&result);
+        // A control ack is a result, not a transport error; human mode still
+        // exits non-zero when the peer refused it.
+        if request.get("op").and_then(Value::as_str) == Some("control")
+            && result.get("ok") == Some(&Value::Bool(false))
+        {
+            return Err(result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("control was refused")
+                .to_owned()
+                .into());
+        }
     }
     Ok(())
+}
+
+/// `--adapters` first, then `ABRA_ADAPTERS`, so an explicit flag wins.
+fn adapter_sources(flags: Vec<PathBuf>) -> cadabra::Result<Vec<ExtraAdapterDir>> {
+    let mut sources = Vec::new();
+    for path in flags {
+        sources.push(ExtraAdapterDir::flag(absolute(path)?));
+    }
+    sources.extend(ExtraAdapterDir::from_env());
+    Ok(sources)
+}
+
+fn absolute(path: PathBuf) -> cadabra::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Re-execute this binary without `--background`, detached, and wait for the
+/// child to answer on the control socket.
+async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if !root.exists() {
+        builder.create(root)?;
+    }
+    let launch_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("daemon.launch.lock"))?;
+    fs2::FileExt::lock_exclusive(&launch_lock)?;
+    if control_call(root, &json!({"op":"status"})).await.is_ok() {
+        return Err(format!("daemon already running at {}", root.display()).into());
+    }
+    let binary = std::env::current_exe()?;
+    let args = std::env::args_os()
+        .skip(1)
+        .filter(|argument| argument != "--background")
+        .collect::<Vec<OsString>>();
+    let log_path = background::log_path(root);
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options.open(&log_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))?;
+    }
+    let child = ProcessCommand::new(&binary)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .env("ABRA_DAEMON_DETACH", "1")
+        .spawn()?;
+    let pid = child.id() as i32;
+    background::PidFile {
+        pid,
+        started_at: background::process_identity(pid).map(|(started, _)| started),
+        binary: binary.display().to_string(),
+        root: root.to_path_buf(),
+    }
+    .save(root)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(status) = control_call(root, &json!({"op":"status"})).await {
+            let peer = status
+                .get("peer_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &json!({"peer_id":peer,"pid":pid,"root":root,"log":log_path})
+                    )?
+                );
+            } else {
+                println!("{peer}");
+            }
+            return Ok(());
+        }
+        if !background::is_alive(pid) {
+            remove_pid_file_if_matches(root, pid);
+            return Err(format!("daemon exited during startup; see {}", log_path.display()).into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "daemon did not answer within 60 seconds; see {}",
+                log_path.display()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn remove_pid_file_if_matches(root: &Path, pid: i32) {
+    if background::PidFile::load(root)
+        .is_ok_and(|record| record.is_some_and(|record| record.pid == pid))
+    {
+        let _ = background::PidFile::remove(root);
+    }
+}
+
+/// Daemon and relay settings are plain JSON files, so `config` edits them
+/// directly and works before the first daemon start.
+fn run_config(root: &Path, command: ConfigCommand, json_output: bool) -> cadabra::Result<()> {
+    match command {
+        ConfigCommand::Get { key } => {
+            let daemon = DaemonConfig::load(root)?;
+            let relays = RelayConfig::load(root)?;
+            let all = json!({
+                "iroh_relay": daemon.iroh_relay,
+                "skip_native": daemon.skip_native,
+                "offer_budget": daemon.offer_budget,
+                "relay_after_attempts": relays.relay_after_attempts,
+                "relay_poll_seconds": relays.relay_poll_seconds,
+            });
+            let value = match &key {
+                Some(key) => all
+                    .get(key.as_str())
+                    .cloned()
+                    .ok_or_else(|| format!("unknown config key: {key}"))?,
+                None => all,
+            };
+            if json_output {
+                println!("{}", serde_json::to_string(&value)?);
+            } else if let Some(object) = value.as_object() {
+                for (key, value) in object {
+                    println!("{key}={}", plain_value(value));
+                }
+            } else {
+                println!("{}", plain_value(&value));
+            }
+        }
+        ConfigCommand::Set { key, value } => {
+            apply_config(root, &key, Some(&value))?;
+            if json_output {
+                println!("{}", serde_json::to_string(&json!({"key":key}))?);
+            } else {
+                println!("{key} set{}", restart_note(&key));
+            }
+        }
+        ConfigCommand::Unset { key } => {
+            apply_config(root, &key, None)?;
+            if json_output {
+                println!("{}", serde_json::to_string(&json!({"key":key}))?);
+            } else {
+                println!("{key} reset to its default{}", restart_note(&key));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Relay tuning is reread while the daemon runs; daemon settings are not.
+fn restart_note(key: &str) -> &'static str {
+    match key {
+        "relay_after_attempts" | "relay_poll_seconds" => "",
+        _ => "; restart the daemon to apply it",
+    }
+}
+
+fn plain_value(value: &Value) -> String {
+    match value.as_str() {
+        Some(text) => text.to_owned(),
+        None => value.to_string(),
+    }
+}
+
+/// `None` restores the key's default.
+fn apply_config(root: &Path, key: &str, value: Option<&str>) -> cadabra::Result<()> {
+    match key {
+        "iroh_relay" | "skip_native" | "offer_budget" => {
+            let mut config = DaemonConfig::load(root)?;
+            let default = DaemonConfig::default();
+            match (key, value) {
+                ("iroh_relay", Some(value)) => {
+                    value.parse::<abra_net::IrohRelayMode>()?;
+                    config.iroh_relay = value.to_owned();
+                }
+                ("iroh_relay", None) => config.iroh_relay = default.iroh_relay,
+                ("skip_native", Some(value)) => {
+                    config.skip_native = value
+                        .parse()
+                        .map_err(|_| "skip_native must be true or false")?;
+                }
+                ("skip_native", None) => config.skip_native = default.skip_native,
+                (_, Some(value)) => {
+                    config.offer_budget =
+                        value.parse().map_err(|_| "offer_budget must be bytes")?;
+                }
+                (_, None) => config.offer_budget = default.offer_budget,
+            }
+            config.save(root)?;
+        }
+        "relay_after_attempts" | "relay_poll_seconds" => {
+            let mut config = RelayConfig::load(root)?;
+            let default = RelayConfig::default();
+            match (key, value) {
+                ("relay_after_attempts", Some(value)) => {
+                    config.relay_after_attempts = value
+                        .parse()
+                        .map_err(|_| "relay_after_attempts must be a count")?;
+                }
+                ("relay_after_attempts", None) => {
+                    config.relay_after_attempts = default.relay_after_attempts;
+                }
+                (_, Some(value)) => {
+                    let seconds: u64 = value
+                        .parse()
+                        .map_err(|_| "relay_poll_seconds must be seconds")?;
+                    if seconds < 5 {
+                        return Err("relay_poll_seconds minimum is 5".into());
+                    }
+                    config.relay_poll_seconds = seconds;
+                }
+                (_, None) => config.relay_poll_seconds = default.relay_poll_seconds,
+            }
+            config.save(root)?;
+        }
+        _ => return Err(format!("unknown config key: {key}").into()),
+    }
+    Ok(())
+}
+
+/// Pairing blocks until the ticket issuer confirms, so tell the operator where
+/// to confirm when the wait is real.
+async fn call_with_pairing_hint(
+    root: &Path,
+    request: &Value,
+    human: bool,
+) -> cadabra::Result<Value> {
+    let hint = if human && request.get("op").and_then(Value::as_str) == Some("pair-add") {
+        pairing_hint(root, request).await
+    } else {
+        None
+    };
+    let call = control_call(root, request);
+    tokio::pin!(call);
+    if let Some(hint) = hint {
+        tokio::select! {
+            result = &mut call => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => eprintln!("{hint}"),
+        }
+    }
+    call.await
+}
+
+async fn pairing_hint(root: &Path, request: &Value) -> Option<String> {
+    let ticket = request.get("ticket").and_then(Value::as_str)?;
+    let issuer = abra_net::PairTicket::parse(ticket, abra_core::now_ms())
+        .ok()?
+        .peer_id;
+    let local = control_call(root, &json!({"op":"status"}))
+        .await
+        .ok()?
+        .get("peer_id")
+        .and_then(Value::as_str)?
+        .to_owned();
+    Some(format!(
+        "waiting for confirmation on {}: run `abra pair confirm {local}` there",
+        issuer.short()
+    ))
 }
 
 async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadabra::Result<()> {
@@ -523,7 +946,6 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
         LinkCommand::Mint {
             snapshot,
             ttl,
-            floor_only: _,
             full,
             out,
             url,
@@ -859,14 +1281,121 @@ mod tests {
     }
 
     #[test]
-    fn accept_requires_exactly_one_materialization_mode() {
+    fn accept_takes_one_path_and_an_optional_replace() {
         assert!(Cli::try_parse_from(["abra", "accept", "id"]).is_err());
+        assert!(Cli::try_parse_from(["abra", "accept", "id", "new"]).is_ok());
+        assert!(Cli::try_parse_from(["abra", "accept", "id", "existing", "--replace"]).is_ok());
+    }
+
+    #[test]
+    fn accept_latest_replaces_the_id_positional() {
+        let parsed =
+            Cli::try_parse_from(["abra", "accept", "--latest", "--kind", "k", "here"]).unwrap();
+        let Command::Accept(args) = parsed.command else {
+            panic!("expected accept");
+        };
+        assert!(args.id.is_none());
+        assert_eq!(args.path, PathBuf::from("here"));
+        assert!(args.latest);
+
+        let parsed = Cli::try_parse_from(["abra", "accept", "id", "here"]).unwrap();
+        let Command::Accept(args) = parsed.command else {
+            panic!("expected accept");
+        };
+        assert_eq!(args.id.as_deref(), Some("id"));
+        assert_eq!(args.path, PathBuf::from("here"));
+
+        // Without --latest the id stays required, and --latest needs a kind.
+        assert!(Cli::try_parse_from(["abra", "accept", "here"]).is_err());
+        assert!(Cli::try_parse_from(["abra", "accept", "--latest", "here"]).is_err());
+    }
+
+    #[test]
+    fn send_workspace_and_provenance_are_exclusive_back_references() {
+        assert!(Cli::try_parse_from([
+            "abra",
+            "send",
+            "peer",
+            "--kind",
+            "k",
+            "--source",
+            "s",
+            "--workspace",
+            "dir",
+            "--wait"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "abra",
+            "send",
+            "peer",
+            "--kind",
+            "k",
+            "--source",
+            "s",
+            "--workspace",
+            "dir",
+            "--provenance",
+            "id"
+        ])
+        .is_err());
+        // --workspace only makes sense for an adapter send.
         assert!(
-            Cli::try_parse_from(["abra", "accept", "id", "--to", "new", "--into", "existing"])
+            Cli::try_parse_from(["abra", "send", "peer", "--path", "dir", "--workspace", "w"])
                 .is_err()
         );
-        assert!(Cli::try_parse_from(["abra", "accept", "id", "--to", "new"]).is_ok());
-        assert!(Cli::try_parse_from(["abra", "accept", "id", "--into", "existing"]).is_ok());
+    }
+
+    #[test]
+    fn daemon_takes_background_and_repeatable_adapter_dirs() {
+        let parsed = Cli::try_parse_from([
+            "abra",
+            "daemon",
+            "--background",
+            "--adapters",
+            "/one",
+            "--adapters",
+            "/two",
+        ])
+        .unwrap();
+        let Command::Daemon {
+            background,
+            adapters,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected daemon");
+        };
+        assert!(background);
+        assert_eq!(adapters, [PathBuf::from("/one"), PathBuf::from("/two")]);
+        assert!(Cli::try_parse_from(["abra", "stop"]).is_ok());
+    }
+
+    #[test]
+    fn send_takes_exactly_one_payload_source() {
+        assert!(Cli::try_parse_from(["abra", "send", "peer"]).is_err());
+        assert!(Cli::try_parse_from(["abra", "send", "peer", "--snapshot", "id"]).is_ok());
+        assert!(Cli::try_parse_from(["abra", "send", "peer", "--capsule", "id"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["abra", "send", "peer", "--snapshot", "id", "--path", "dir"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_keys_and_restores_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(apply_config(root.path(), "nope", Some("1")).is_err());
+        apply_config(root.path(), "skip_native", Some("true")).unwrap();
+        assert!(DaemonConfig::load(root.path()).unwrap().skip_native);
+        apply_config(root.path(), "skip_native", None).unwrap();
+        assert!(!DaemonConfig::load(root.path()).unwrap().skip_native);
+        assert!(apply_config(root.path(), "relay_poll_seconds", Some("1")).is_err());
+        apply_config(root.path(), "relay_poll_seconds", Some("30")).unwrap();
+        assert_eq!(
+            RelayConfig::load(root.path()).unwrap().relay_poll_seconds,
+            30
+        );
     }
 
     #[test]

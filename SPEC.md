@@ -421,7 +421,7 @@ Dialer sends `hello`, listener answers `hello-ok` (or `hello-reject`):
 
 ```json
 {"type":"hello","wire":1,"spec":"abra/0.1","peer_id":"<hex>","name":"laptop",
- "features":["resume","control","revocation","skip-native","bind-cert"],
+ "features":["resume","control","revocation","skip-native","bind-cert","control-result"],
  "nonce":"<16 bytes hex>"}
 {"type":"hello-ok","wire":1,"peer_id":"<hex>","features":[...],"nonce":"<echo>",
  "session":"trusted|bootstrap","revocations":[...optional, negotiated signed records...]}
@@ -433,7 +433,9 @@ v0.1 speaks `wire` 1 only; `resume` and `control` are mandatory features. The
 fields. A sender MUST omit `revocations` unless the remote advertised
 `revocation`, MUST omit `skip_native` unless it advertised `skip-native`, and
 MUST omit `bind_certificate` plus `bind_certificate_issuer` unless it advertised
-`bind-cert`. Wire-1 decoders reject unknown fields. A dialer's first `hello`
+`bind-cert`. Wire-1 decoders reject unknown fields, so `result` on
+`control-ack` is sent only when the dialer advertised `control-result`. A
+dialer's first `hello`
 cannot know the listener's features, so it never carries revocations. `hello-ok`
 and later offers carry them after negotiation. Relay envelopes have no preceding
 handshake and omit these fields. Unknown peers get `session:"bootstrap"`. The
@@ -572,7 +574,9 @@ receipt, not import or execution.
 Signed domain `control`. Receivers MUST reject: signers that are not full peers
 (guests never send control), `at` older than 5 minutes or in the future beyond
 60s skew, and reused nonces (nonce set persisted for 10 minutes **before**
-acting). Reply `control-ack {nonce, ok, error?}`. Control is a live message in
+acting). Reply `control-ack {nonce, ok, error?, result?}`. The receiver includes
+`result` only when the dialer advertised `control-result`. Control is a live
+message in
 v0.1: senders retry while the peer is reachable, and an unreachable agent misses
 it — a stated limitation, not an accident.
 
@@ -860,6 +864,7 @@ user selection — never first-registered-wins.
 - **`watch`** `{kind, source, options}` — replies `{ok:true,watching:true}` then
   emits `{request_id, event:"changed", cursor, hint}` until cancelled. Events are
   hints; the daemon debounces and re-exports.
+  Reserved: the daemon cannot invoke it yet; adapters should not declare it.
 
 ---
 

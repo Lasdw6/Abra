@@ -1,26 +1,15 @@
 #!/usr/bin/env node
-import { createInterface } from 'node:readline';
 import path from 'node:path';
+import { runAdapter } from '../../lib/adapter.js';
 import { capture, withLocalChrome } from '../lib/browser.js';
 import { installBundle } from '../lib/import.js';
 import { KIND, LEGACY_KIND, parseList, saveBundle, secureTree } from '../lib/util.js';
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of rl) {
-  let request;
-  try {
-    if (Buffer.byteLength(line) > 1024 * 1024) throw coded('invalid_request', 'request exceeds 1 MiB');
-    request = JSON.parse(line);
-    if (request.protocol !== 'abra-adapter/1' || !/^[0-9a-f]+$/.test(request.request_id || '')) throw coded('invalid_request', 'invalid protocol or request_id');
-    if (![KIND, LEGACY_KIND].includes(request.kind)) throw coded('unsupported_kind', `expected ${KIND} or ${LEGACY_KIND}`);
-    const response = request.verb === 'export' ? await exportRequest(request)
-      : request.verb === 'import' ? await importRequest(request)
-      : (() => { throw coded('unsupported_verb', `unsupported verb: ${request.verb}`); })();
-    emit({ request_id: request.request_id, ok: true, ...response });
-  } catch (error) {
-    emit({ request_id: request?.request_id || '', ok: false, error: { code: error.code || 'internal', message: error.code ? error.message : 'browser-session operation failed', retryable: false } });
-  }
-}
+await runAdapter({
+  kinds: [KIND, LEGACY_KIND],
+  verbs: { export: exportRequest, import: importRequest },
+  internalMessage: 'browser-session operation failed'
+});
 
 async function exportRequest(r) {
   const options = requestOptions(r), source = parseSource(r.source, options);
@@ -85,4 +74,3 @@ function parseWatchMs(value) {
 }
 
 function coded(code, message) { return Object.assign(new Error(message), { code }); }
-function emit(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }

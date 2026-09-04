@@ -5,8 +5,8 @@ if [[ ${ABRA_PROVISION_PRIVATE_NS:-0} != 1 ]]; then
   exec env ABRA_PROVISION_PRIVATE_NS=1 unshare --mount --pid --fork --propagation private -- "$0" "$@"
 fi
 
-if [[ $# -lt 2 || $# -gt 4 ]]; then
-  echo "usage: sudo $0 ROOTFS_EXT4 ABRA_BIN [CADABRA_BIN [BROWSER_SESSION_DIR]]" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: sudo $0 ROOTFS_EXT4 ABRA_BIN [BROWSER_SESSION_DIR]" >&2
   exit 2
 fi
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -16,14 +16,13 @@ fi
 
 ROOTFS="$(realpath "$1")"
 ABRA_BIN="$(realpath "$2")"
-CADABRA_BIN="$(realpath "${3:-$2}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(realpath "$SCRIPT_DIR/../../..")"
-BROWSER_SESSION_DIR="$(realpath "${4:-$REPO_ROOT/adapters/browser-session}")"
+BROWSER_SESSION_DIR="$(realpath "${3:-$REPO_ROOT/adapters/browser-session}")"
 ROOTFS_SIZE="${ABRA_GUEST_ROOTFS_SIZE:-4G}"
 CODEX_PACKAGE="${ABRA_CODEX_PACKAGE:-@openai/codex}"
 
-for path in "$ROOTFS" "$ABRA_BIN" "$CADABRA_BIN" \
+for path in "$ROOTFS" "$ABRA_BIN" \
             "$BROWSER_SESSION_DIR/abra-adapter.json"; do
   [[ -e "$path" ]] || { echo "missing prerequisite: $path" >&2; exit 1; }
 done
@@ -251,4 +250,4 @@ if ! cleanup 0; then
 fi
 trap - EXIT
 exec env ABRA_INSTALL_PRIVATE_NS=1 "$SCRIPT_DIR/install-rootfs.sh" \
-  "$ROOTFS" "$ABRA_BIN" "$CADABRA_BIN" "$BROWSER_SESSION_DIR"
+  "$ROOTFS" "$ABRA_BIN" "$BROWSER_SESSION_DIR"

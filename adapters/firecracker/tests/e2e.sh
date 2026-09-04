@@ -3,7 +3,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ABRA="${ABRA_BIN:-$REPO_ROOT/target/release/abra}"
-CADABRA="${CADABRA_BIN:-$REPO_ROOT/target/release/cadabra}"
 ABRA_FC="${ABRA_FC_BIN:-$REPO_ROOT/target/release/abra-fc}"
 FC="${FIRECRACKER_BIN:-/usr/local/bin/firecracker}"
 ARTIFACTS="${FIRECRACKER_ARTIFACT_DIR:-/home/ubuntu/paperplanes/artifacts/firecracker}"
@@ -65,7 +64,7 @@ inbox_has() { "$ABRA" --root "$1" --json inbox 2>/dev/null | jq -e --arg id "$2"
 # Full-capsule snapshots sync into the capsule log, not the inbox.
 log_has() { "$ABRA" --root "$1" --json log --capsule "$2" 2>/dev/null | jq -e --arg id "$3" '.[] | select(.snapshot_id == $id)' >/dev/null; }
 
-for binary in "$ABRA" "$CADABRA" "$ABRA_FC" "$FC" "$KERNEL" "$ROOTFS" "$KEY"; do
+for binary in "$ABRA" "$ABRA_FC" "$FC" "$KERNEL" "$ROOTFS" "$KEY"; do
   [[ -e "$binary" ]] || { echo "missing prerequisite: $binary" >&2; exit 1; }
 done
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0 >/dev/null 2>&1 || true
@@ -75,7 +74,7 @@ mkdir -p "$RUN_ROOT" "$RUN_ROOT_B" "$FRESH_ROOT" "$WORKSPACE" "$(dirname "$REPOR
 chmod 0700 "$RUN_ROOT" "$RUN_ROOT_B" "$FRESH_ROOT"
 
 STARTED="$(now_ms)"
-"$CADABRA" --root "$RUN_ROOT" --yes >"$HOST_LOG" 2>&1 &
+"$ABRA" --root "$RUN_ROOT" daemon --yes >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
 wait_until "host daemon socket" test -S "$RUN_ROOT/cadabra.sock"
 HOST_PEER="$("$ABRA" --root "$RUN_ROOT" --json status | jq -r .peer_id)"
@@ -86,20 +85,20 @@ INITIAL="$("$ABRA" --root "$RUN_ROOT" --json snapshot "$WORKSPACE")"
 CAPSULE="$(jq -r .capsule_id <<<"$INITIAL")"
 TOKEN="$("$ABRA" --root "$RUN_ROOT" --json enroll --capsule "$CAPSULE" --kind dev.abra.workspace --ttl 1h --send --receive | jq -r .token)"
 
-# Guest binaries must be STATIC (musl): the guest rootfs (jammy, glibc 2.35)
+# The guest binary must be STATIC (musl): the guest rootfs (jammy, glibc 2.35)
 # cannot run host-glibc builds, and a stale image silently breaks enrollment
-# when token/protocol formats change. Rebuild both per run unless disabled.
+# when token/protocol formats change. Rebuild per run unless disabled.
 if [[ "${ABRA_FC_E2E_REBUILD_IMAGE:-1}" == "1" ]]; then
-  (cd "$REPO_ROOT" && cargo build --release --target x86_64-unknown-linux-musl -p abra-cli -p cadabra >/dev/null)
+  (cd "$REPO_ROOT" && cargo build --release --target x86_64-unknown-linux-musl -p abra-cli >/dev/null)
   MUSL="$REPO_ROOT/target/x86_64-unknown-linux-musl/release"
   ROOTFS="$RUN_ROOT/rootfs-headless-abra.ext4"
   cp -f "$BASE_ROOTFS" "$ROOTFS"
   if [[ "${ABRA_FC_E2E_RICH_IMAGE:-0}" == "1" ]]; then
     sudo -E bash "$REPO_ROOT/adapters/firecracker/guest/provision-rootfs.sh" \
-      "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+      "$ROOTFS" "$MUSL/abra" >/dev/null
   else
     sudo bash "$REPO_ROOT/adapters/firecracker/guest/install-rootfs.sh" \
-      "$ROOTFS" "$MUSL/abra" "$MUSL/cadabra" >/dev/null
+      "$ROOTFS" "$MUSL/abra" >/dev/null
   fi
 fi
 
@@ -153,7 +152,7 @@ MANIFEST="$RUN_ROOT/capsules/$CAPSULE/snapshots/$NATIVE_SNAPSHOT.cjson"
 jq -e '.native | length == 3 and all(.fingerprint.hypervisor == "firecracker")' "$MANIFEST" >/dev/null
 
 # Device B receives only the portable parent, then materializes files and recipes.
-"$CADABRA" --root "$RUN_ROOT_B" --yes >"$RUN_ROOT_B/daemon.log" 2>&1 &
+"$ABRA" --root "$RUN_ROOT_B" daemon --yes >"$RUN_ROOT_B/daemon.log" 2>&1 &
 HOST_PID_B=$!
 wait_until "device B daemon socket" test -S "$RUN_ROOT_B/cadabra.sock"
 PAIR_TICKET_B="$("$ABRA" --root "$RUN_ROOT_B" pair ticket)"
@@ -186,7 +185,7 @@ fi
 
 # A third empty root acts as a fresh compatible host. It receives the portable
 # parent, so native blobs are absent even though host A still owns them.
-"$CADABRA" --root "$FRESH_ROOT" --yes >"$FRESH_ROOT/daemon.log" 2>&1 &
+"$ABRA" --root "$FRESH_ROOT" daemon --yes >"$FRESH_ROOT/daemon.log" 2>&1 &
 FRESH_PID=$!
 wait_until "fresh host daemon socket" test -S "$FRESH_ROOT/cadabra.sock"
 PAIR_TICKET_FRESH="$("$ABRA" --root "$FRESH_ROOT" pair ticket)"

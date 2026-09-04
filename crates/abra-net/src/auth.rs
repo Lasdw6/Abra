@@ -57,9 +57,15 @@ mod optional_hex32 {
 
 pub const CLOCK_SKEW_MS: u64 = 60_000;
 pub const MAX_REVOCATIONS_PER_MESSAGE: usize = 128;
+/// Peer carries revocations on its hello and offers.
 pub const FEATURE_REVOCATION: &str = "revocation";
+/// Receiver may decline optional native cache blobs.
 pub const FEATURE_SKIP_NATIVE: &str = "skip-native";
+/// Peer accepts guest bind certificates attached to forwarded offers.
 pub const FEATURE_BIND_CERT: &str = "bind-cert";
+/// Dialer accepts a `result` key on `ControlAck`; older peers reject the
+/// unknown field, so the receiver drops the handler's value for them.
+pub const FEATURE_CONTROL_RESULT: &str = "control-result";
 const MAX_CERTIFICATE_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTED_REVOCATIONS: usize = 4096;
 const MAX_PERSISTED_BIND_CERTIFICATES: usize = 4096;
@@ -76,6 +82,7 @@ fn supported_features() -> Vec<String> {
         FEATURE_REVOCATION,
         FEATURE_SKIP_NATIVE,
         FEATURE_BIND_CERT,
+        FEATURE_CONTROL_RESULT,
     ]
     .into_iter()
     .map(str::to_owned)
@@ -351,6 +358,16 @@ impl TrustStore {
             .write(true)
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        let mut merged = self.merge_disk_state()?;
+        prune_expired(&mut merged, abra_core::now_ms());
+        enforce_limits(&mut merged);
+        remove_revoked_guests(&mut merged);
+        abra_core::atomic_write(&self.path, &canonical::to_vec(&merged)?)?;
+        Ok(())
+    }
+    /// Folds this handle's in-memory state onto whatever another process has
+    /// written since it was loaded, so a concurrent writer is never clobbered.
+    fn merge_disk_state(&self) -> Result<TrustDisk> {
         let mut merged = self.read_disk()?;
         merged.mesh_profile = self.disk.mesh_profile;
         merged.local_role = self.disk.local_role.clone();
@@ -373,55 +390,7 @@ impl TrustStore {
             .control_nonces
             .extend(self.disk.control_nonces.clone());
         merged.peers.extend(self.disk.peers.clone());
-        let now = abra_core::now_ms();
-        merged
-            .revocations
-            .retain(|_, stored| parse_time(&stored.relevant_until).is_ok_and(|until| until >= now));
-        merged.bind_certificates.retain(|_, stored| {
-            parse_time(&stored.certificate.expires_at).is_ok_and(|until| until >= now)
-        });
-        while merged.revocations.len() > MAX_PERSISTED_REVOCATIONS {
-            let oldest = merged
-                .revocations
-                .iter()
-                .min_by_key(|(_, stored)| parse_time(&stored.relevant_until).unwrap_or(0))
-                .map(|(key, _)| key.clone())
-                .expect("non-empty revocation map");
-            merged.revocations.remove(&oldest);
-        }
-        while merged.bind_certificates.len() > MAX_PERSISTED_BIND_CERTIFICATES {
-            let oldest = merged
-                .bind_certificates
-                .iter()
-                .min_by_key(|(_, stored)| parse_time(&stored.certificate.expires_at).unwrap_or(0))
-                .map(|(peer, _)| *peer)
-                .expect("non-empty certificate map");
-            merged.bind_certificates.remove(&oldest);
-        }
-        let revoked = merged.revoked.clone();
-        let revocations = merged.revocations.clone();
-        merged.peers.retain(|peer_id, peer| {
-            peer.token_id.as_ref().is_none_or(|token| {
-                !revoked.contains(token)
-                    && !revocations.values().any(|stored| {
-                        stored.record.guest_peer_id == *peer_id && stored.record.token_id == *token
-                    })
-            })
-        });
-        merged.bind_certificates.retain(|guest, stored| {
-            !revoked.contains(&stored.certificate.token_id)
-                && !revocations.values().any(|revocation| {
-                    revocation.record.issuer == stored.issuer
-                        && revocation.record.guest_peer_id == *guest
-                        && revocation.record.token_id == stored.certificate.token_id
-                })
-        });
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, canonical::to_vec(&merged)?)?;
-        let f = fs::OpenOptions::new().read(true).open(&tmp)?;
-        f.sync_all()?;
-        fs::rename(tmp, &self.path)?;
-        Ok(())
+        Ok(merged)
     }
     pub fn get(&self, p: &PeerId) -> Option<&TrustedPeer> {
         self.disk.peers.get(p)
@@ -925,28 +894,6 @@ impl TrustStore {
         }
         Ok(())
     }
-    pub fn authorize_ack(
-        &self,
-        actor: PeerId,
-        other: PeerId,
-        capsule: Option<Hash>,
-        kind: &str,
-        direction: Direction,
-        now: u64,
-    ) -> Result<()> {
-        self.authorize_offer(actor, other, capsule, kind, direction, now)
-    }
-    pub fn authorize_fetch(
-        &self,
-        actor: PeerId,
-        other: PeerId,
-        capsule: Option<Hash>,
-        kind: &str,
-        direction: Direction,
-        now: u64,
-    ) -> Result<()> {
-        self.authorize_offer(actor, other, capsule, kind, direction, now)
-    }
     pub fn authorize_lease(&self, actor: PeerId, takeover: bool, now: u64) -> Result<()> {
         let peer = self
             .get(&actor)
@@ -991,6 +938,65 @@ impl TrustStore {
         self.disk.control_nonces.insert(nonce.into(), now);
         self.save()
     }
+}
+
+/// Drops revocations and bind certificates that can no longer authorize or
+/// deny anything, so the file does not grow without bound.
+fn prune_expired(disk: &mut TrustDisk, now: u64) {
+    disk.revocations
+        .retain(|_, stored| parse_time(&stored.relevant_until).is_ok_and(|until| until >= now));
+    disk.bind_certificates.retain(|_, stored| {
+        parse_time(&stored.certificate.expires_at).is_ok_and(|until| until >= now)
+    });
+}
+
+fn enforce_limits(disk: &mut TrustDisk) {
+    evict_oldest(&mut disk.revocations, MAX_PERSISTED_REVOCATIONS, |stored| {
+        parse_time(&stored.relevant_until).unwrap_or(0)
+    });
+    evict_oldest(
+        &mut disk.bind_certificates,
+        MAX_PERSISTED_BIND_CERTIFICATES,
+        |stored| parse_time(&stored.certificate.expires_at).unwrap_or(0),
+    );
+}
+
+fn evict_oldest<K: Clone + Ord, V>(
+    map: &mut BTreeMap<K, V>,
+    limit: usize,
+    age: impl Fn(&V) -> u64,
+) {
+    while map.len() > limit {
+        let oldest = map
+            .iter()
+            .min_by_key(|(_, value)| age(value))
+            .map(|(key, _)| key.clone())
+            .expect("non-empty map");
+        map.remove(&oldest);
+    }
+}
+
+/// A revoked token takes its peer and its bind certificate with it, including
+/// records another process merged in.
+fn remove_revoked_guests(disk: &mut TrustDisk) {
+    let revoked = disk.revoked.clone();
+    let revocations = disk.revocations.clone();
+    disk.peers.retain(|peer_id, peer| {
+        peer.token_id.as_ref().is_none_or(|token| {
+            !revoked.contains(token)
+                && !revocations.values().any(|stored| {
+                    stored.record.guest_peer_id == *peer_id && stored.record.token_id == *token
+                })
+        })
+    });
+    disk.bind_certificates.retain(|guest, stored| {
+        !revoked.contains(&stored.certificate.token_id)
+            && !revocations.values().any(|revocation| {
+                revocation.record.issuer == stored.issuer
+                    && revocation.record.guest_peer_id == *guest
+                    && revocation.record.token_id == stored.certificate.token_id
+            })
+    });
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1548,49 +1554,10 @@ pub fn bootstrap_allowed(kind: &str) -> bool {
     )
 }
 
-pub async fn dial_handshake(
+async fn exchange_hello(
     connection: &mut crate::Connection,
     local: PeerId,
     name: String,
-) -> Result<HelloOk> {
-    let remote = connection.peer_id();
-    let hello = Hello {
-        message_type: "hello".into(),
-        wire: WIRE_VERSION,
-        spec: abra_core::SPEC.into(),
-        peer_id: local,
-        name,
-        features: supported_features(),
-        nonce: random16(),
-        revocations: Vec::new(),
-    };
-    let (send, recv) = connection.control_mut();
-    crate::write_frame(send, &hello).await?;
-    let value: serde_json::Value =
-        tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
-            .await
-            .map_err(|_| Error::Timeout)??;
-    match value.get("type").and_then(|v| v.as_str()) {
-        Some("hello-ok") => {
-            let ok: HelloOk = serde_json::from_value(value)?;
-            if ok.nonce != hello.nonce || ok.peer_id != remote {
-                return Err(Error::Authentication("invalid hello response".into()));
-            }
-            Ok(ok)
-        }
-        Some("hello-reject") => Err(Error::protocol(
-            serde_json::from_value::<HelloReject>(value)?.message,
-        )),
-        _ => Err(Error::protocol("expected hello response")),
-    }
-}
-
-pub async fn dial_handshake_with_trust(
-    connection: &mut crate::Connection,
-    local: PeerId,
-    name: String,
-    trust: &mut TrustStore,
-    now: u64,
 ) -> Result<HelloOk> {
     let remote = connection.peer_id();
     let hello = Hello {
@@ -1607,17 +1574,12 @@ pub async fn dial_handshake_with_trust(
     let (send, recv) = connection.control_mut();
     crate::write_frame(send, &hello).await?;
     let value: serde_json::Value =
-        tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
-            .await
-            .map_err(|_| Error::Timeout)??;
+        crate::framing::read_frame_timeout(recv, crate::delivery::HEALTH_TIMEOUT).await?;
     match value.get("type").and_then(|value| value.as_str()) {
         Some("hello-ok") => {
             let ok: HelloOk = serde_json::from_value(value)?;
             if ok.nonce != hello.nonce || ok.peer_id != remote {
                 return Err(Error::Authentication("invalid hello response".into()));
-            }
-            if has_feature(&ok.features, FEATURE_REVOCATION) {
-                trust.apply_revocations(&ok.revocations, now)?;
             }
             Ok(ok)
         }
@@ -1628,6 +1590,28 @@ pub async fn dial_handshake_with_trust(
     }
 }
 
+pub async fn dial_handshake(
+    connection: &mut crate::Connection,
+    local: PeerId,
+    name: String,
+) -> Result<HelloOk> {
+    exchange_hello(connection, local, name).await
+}
+
+pub async fn dial_handshake_with_trust(
+    connection: &mut crate::Connection,
+    local: PeerId,
+    name: String,
+    trust: &mut TrustStore,
+    now: u64,
+) -> Result<HelloOk> {
+    let ok = exchange_hello(connection, local, name).await?;
+    if has_feature(&ok.features, FEATURE_REVOCATION) {
+        trust.apply_revocations(&ok.revocations, now)?;
+    }
+    Ok(ok)
+}
+
 pub async fn accept_handshake(
     connection: &mut crate::Connection,
     local: PeerId,
@@ -1636,9 +1620,7 @@ pub async fn accept_handshake(
     let remote = connection.peer_id();
     let (send, recv) = connection.control_mut();
     let hello: Hello =
-        tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
-            .await
-            .map_err(|_| Error::Timeout)??;
+        crate::framing::read_frame_timeout(recv, crate::delivery::HEALTH_TIMEOUT).await?;
     let now = abra_core::now_ms();
     let was_trusted = trust.get(&remote).is_some();
     let mut checked = if trust.is_revoked_guest(&remote, now) {
@@ -1681,9 +1663,8 @@ pub async fn health_check(connection: &mut crate::Connection, now: u64) -> Resul
     };
     let (send, recv) = connection.control_mut();
     crate::write_frame(send, &ping).await?;
-    let pong: Pong = tokio::time::timeout(crate::delivery::HEALTH_TIMEOUT, crate::read_frame(recv))
-        .await
-        .map_err(|_| Error::Timeout)??;
+    let pong: Pong =
+        crate::framing::read_frame_timeout(recv, crate::delivery::HEALTH_TIMEOUT).await?;
     if pong.message_type != "pong" || pong.nonce != ping.nonce {
         return Err(Error::protocol("invalid pong"));
     }

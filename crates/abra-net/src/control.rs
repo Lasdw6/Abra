@@ -31,6 +31,22 @@ pub struct ControlAck {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whatever the receiver's `ControlHandler` returned. `ControlAck` denies
+    /// unknown fields, so this key is only serialized when the dialer's hello
+    /// advertised `control-result`; older peers get an ack shaped as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+/// Receiver-side hook for acting on a verified control message. The daemon
+/// registers one on its `DeliveryNode`; abra-net never interprets the message
+/// itself. The returned value is sent back in `ControlAck.result`, but only if
+/// the dialer advertised the `control-result` feature — the handler always runs
+/// either way. An `Err` becomes `ok: false` plus `error` on the ack, and a
+/// handler that runs longer than `CONTROL_HANDLER_TIMEOUT` is abandoned.
+#[async_trait::async_trait]
+pub trait ControlHandler: Send + Sync {
+    async fn handle(&self, from: PeerId, message: &ControlMessage) -> Result<serde_json::Value>;
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

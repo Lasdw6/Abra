@@ -1,12 +1,12 @@
 use crate::{
     auth::{
         accept_handshake, bootstrap_allowed, dial_handshake_with_trust, format_time, has_feature,
-        BindCertificate, Direction, LocalRole, MeshProfile, Ping, Pong, ProtocolError, Revocation,
-        TrustStore, FEATURE_BIND_CERT, FEATURE_REVOCATION, FEATURE_SKIP_NATIVE,
-        MAX_REVOCATIONS_PER_MESSAGE,
+        BindCertificate, Direction, HelloOk, LocalRole, MeshProfile, Ping, Pong, ProtocolError,
+        Revocation, TrustStore, FEATURE_BIND_CERT, FEATURE_CONTROL_RESULT, FEATURE_REVOCATION,
+        FEATURE_SKIP_NATIVE, MAX_REVOCATIONS_PER_MESSAGE,
     },
     framing::{ObjectHeader, ObjectKind},
-    read_frame, write_frame, Connection, Error, Outbox, OutboxState, Result,
+    write_frame, Connection, Error, Outbox, OutboxState, Result,
 };
 use abra_core::{
     capsule::{Genesis, LabelOp, LeaseMode, LeaseRecord},
@@ -18,22 +18,85 @@ use abra_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
-pub const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
 pub const MAX_NATIVE_OBJECT_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_OFFER_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
 pub const OBJECT_STREAM_CHUNK: u64 = 1024 * 1024;
 pub const STREAMING_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// Ceiling on a registered control handler, matching cadabra's adapter
+/// timeout: a stuck adapter must not hold the session open forever.
+pub const CONTROL_HANDLER_TIMEOUT: Duration = Duration::from_secs(660);
 const MAX_INBOX_ENTRIES: usize = 10_000;
 const MAX_PENDING_PAIRS: usize = 128;
 const MAX_EVENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+pub fn append_event(root: &Path, value: &serde_json::Value) -> Result<()> {
+    if value
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || value
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err(Error::protocol("event line requires event and at"));
+    }
+    let path = root.join("net/events.ndjson");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    if file.metadata()?.len() >= MAX_EVENT_LOG_BYTES {
+        file.set_len(0)?;
+    }
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)?;
+    file.sync_data()?;
+    fs2::FileExt::unlock(&file)?;
+    Ok(())
+}
 pub const MAX_LEASE_CHAIN_LEN: usize = 256;
 const MAX_REJECTION_REASON_CHARS: usize = 256;
+
+/// How an accepted offer reached this node. Only relay arrivals are tagged
+/// in the event log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Via {
+    Direct,
+    Relay,
+}
+
+impl Via {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
+/// What `finalize_received_offer` leaves for its caller: the signed ack and the
+/// arrival event, which is only recorded once the ack is safely on the wire.
+struct ReceivedOffer {
+    ack: Ack,
+    event: serde_json::Value,
+}
 
 struct DirectoryCleanup(PathBuf);
 
@@ -317,6 +380,10 @@ pub enum DeliveryOutcome {
     Interrupted { stats: TransferStats },
 }
 
+/// A plain clone keeps `persist` on for the cloned outbox, so two clones write
+/// the same files; callers that want a detached outbox for network I/O must use
+/// `outgoing_session()`.
+#[derive(Clone)]
 pub struct DeliveryNode {
     pub store: AbraStore,
     pub trust: TrustStore,
@@ -330,13 +397,14 @@ pub struct DeliveryNode {
     pub offer_budget: u64,
     /// Decline optional native cache blobs while accepting portable content.
     pub skip_native: bool,
+    /// Receiver-side hook for verified control messages. `None` keeps the
+    /// record-and-ack behaviour; the daemon installs one to route control to
+    /// an adapter verb.
+    pub control_handler: Option<Arc<dyn crate::ControlHandler>>,
+    control_timeout: Duration,
     streaming_threshold: u64,
-    /// Pair requests observed by an interactive daemon and approvals granted
-    /// through its local control API. They are intentionally process-local;
-    /// tickets remain the durable, bounded authorization.
-    pub pending_pair_requests: BTreeMap<PeerId, crate::PairRequest>,
-    pub approved_pair_requests: BTreeSet<PeerId>,
     pending_main_labels: BTreeMap<Hash, Vec<LabelOp>>,
+    pending_main_labels_path: PathBuf,
     partial_dir: PathBuf,
     pending_ack_dir: PathBuf,
     pending_pair_dir: PathBuf,
@@ -377,6 +445,12 @@ impl DeliveryNode {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let partial_dir = root.join("net/partials");
+        let pending_main_labels_path = root.join("net/pending-labels.json");
+        let pending_main_labels = match fs::read(&pending_main_labels_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             store: AbraStore::open(root)?,
             trust: TrustStore::open(root)?,
@@ -385,10 +459,11 @@ impl DeliveryNode {
             auto_confirm_pairs: false,
             offer_budget: DEFAULT_OFFER_BUDGET,
             skip_native: false,
+            control_handler: None,
+            control_timeout: CONTROL_HANDLER_TIMEOUT,
             streaming_threshold: STREAMING_THRESHOLD,
-            pending_pair_requests: BTreeMap::new(),
-            approved_pair_requests: BTreeSet::new(),
-            pending_main_labels: BTreeMap::new(),
+            pending_main_labels,
+            pending_main_labels_path,
             partial_dir,
             pending_ack_dir: root.join("net/pending-acks"),
             pending_pair_dir: root.join("net/pending-pairs"),
@@ -403,22 +478,8 @@ impl DeliveryNode {
     /// state so a daemon can perform network I/O without holding its node lock.
     pub fn outgoing_session(&self) -> Self {
         Self {
-            store: self.store.clone(),
-            trust: self.trust.clone(),
             outbox: self.outbox.detached(),
-            allow_agent_send: self.allow_agent_send,
-            auto_confirm_pairs: self.auto_confirm_pairs,
-            offer_budget: self.offer_budget,
-            skip_native: self.skip_native,
-            streaming_threshold: self.streaming_threshold,
-            pending_pair_requests: self.pending_pair_requests.clone(),
-            approved_pair_requests: self.approved_pair_requests.clone(),
-            pending_main_labels: self.pending_main_labels.clone(),
-            partial_dir: self.partial_dir.clone(),
-            pending_ack_dir: self.pending_ack_dir.clone(),
-            pending_pair_dir: self.pending_pair_dir.clone(),
-            approved_pair_dir: self.approved_pair_dir.clone(),
-            event_log: self.event_log.clone(),
+            ..self.clone()
         }
     }
 
@@ -427,6 +488,14 @@ impl DeliveryNode {
     pub fn set_streaming_threshold_for_tests(&mut self, bytes: u64) {
         debug_assert!(bytes <= STREAMING_THRESHOLD);
         self.streaming_threshold = bytes.min(STREAMING_THRESHOLD);
+    }
+
+    /// Shorten the control handler timeout in tests so a hung handler is
+    /// observable without waiting ten minutes.
+    #[doc(hidden)]
+    pub fn set_control_timeout_for_tests(&mut self, timeout: Duration) {
+        debug_assert!(timeout <= CONTROL_HANDLER_TIMEOUT);
+        self.control_timeout = timeout.min(CONTROL_HANDLER_TIMEOUT);
     }
     pub fn approve_pair(&self, peer: PeerId) -> Result<()> {
         fs::create_dir_all(&self.approved_pair_dir)?;
@@ -495,39 +564,8 @@ impl DeliveryNode {
                 data: data_encoding::BASE64URL_NOPAD.encode(&bytes),
             });
         }
-        let capsule = raw
-            .manifest()
-            .capsule_id
-            .and_then(|c| self.store.capsules.get(&c));
-        let offer = Offer {
-            message_type: "offer".into(),
-            offer_id: entry.offer_id.clone(),
-            snapshot_id: entry.snapshot_id,
-            scope: raw.manifest().scope,
-            kind: raw.manifest().kind.clone(),
-            title: raw.manifest().title.clone(),
-            capsule_id: raw.manifest().capsule_id,
-            fork: capsule.is_some_and(|c| {
-                c.active_lease(now)
-                    .is_none_or(|l| l.holder != raw.manifest().origin.peer_id)
-            }),
-            bytes_hint,
-            object_count: objects.len() as u64,
-            manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
-            genesis: capsule.map(|c| c.genesis.clone()),
-            genesis_grant: capsule.and_then(|c| {
-                c.leases()
-                    .iter()
-                    .find(|l| l.epoch == 1 && l.mode == LeaseMode::Grant)
-                    .cloned()
-            }),
-            lease_chain: capsule.map(winning_lease_chain).unwrap_or_default(),
-            main_label: capsule.and_then(|c| c.label("main").cloned()),
-            // Relay envelopes have no preceding feature handshake.
-            bind_certificate_issuer: None,
-            bind_certificate: None,
-            revocations: Vec::new(),
-        };
+        // Relay envelopes have no preceding feature handshake.
+        let offer = self.build_offer(entry, &raw, bytes_hint, objects.len() as u64, now, None);
         Ok(RelayPayload::Delivery {
             sender: self.peer_id(),
             offer: Box::new(offer),
@@ -591,44 +629,10 @@ impl DeliveryNode {
         for (_, bytes) in decoded {
             self.store.cas.put(&bytes)?;
         }
-        if raw.manifest().scope == Scope::Full {
-            let capsule_id = raw.manifest().capsule_id.expect("validated");
-            if !self.store.capsules.contains_key(&capsule_id) {
-                self.store.add_capsule(
-                    offer
-                        .genesis
-                        .clone()
-                        .ok_or_else(|| Error::protocol("missing genesis"))?,
-                    offer
-                        .genesis_grant
-                        .clone()
-                        .ok_or_else(|| Error::protocol("missing genesis grant"))?,
-                )?;
-            }
-        } else if self.store.inbox.len() >= MAX_INBOX_ENTRIES {
-            return Err(Error::authz("inbox quota exceeded"));
-        }
-        let mut shelf = self.commit_manifest(raw, sender, now)?;
-        if shelf == "capsule" {
-            shelf = if self.adopt_offer_capsule_state(&offer, now).unwrap_or(false) {
-                "capsule-head"
-            } else {
-                "capsule-fork"
-            }
-            .into();
-        }
-        let ack = Ack::sign(
-            offer.offer_id.clone(),
-            offer.snapshot_id,
-            shelf,
-            now,
-            sender,
-            &self.store.keys.identity,
-        )?;
-        self.persist_pending_ack(&ack)?;
-        self.record_event(&serde_json::json!({"event":if offer.scope == Scope::Full {"capsule-sync"} else {"inbox-arrival"},"snapshot_id":ack.snapshot_id,"from":sender,"at":ack.received_at,"via":"relay"}))?;
+        let received = self.finalize_received_offer(raw, &offer, sender, now, Via::Relay)?;
+        self.record_event(&received.event)?;
         self.clear_partials(&offer.offer_id)?;
-        Ok((sender, ack))
+        Ok((sender, received.ack))
     }
     fn compute_have(&self, offer: &str, closure: &BTreeSet<Hash>) -> Result<Have> {
         let mut have = Vec::new();
@@ -717,13 +721,10 @@ impl DeliveryNode {
         self.pending_ack_dir.join(format!("{offer}.cjson"))
     }
     fn persist_pending_ack(&self, ack: &Ack) -> Result<()> {
-        let path = self.pending_ack_path(&ack.offer_id);
-        fs::create_dir_all(&self.pending_ack_dir)?;
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, abra_core::canonical::to_vec(ack)?)?;
-        fs::OpenOptions::new().read(true).open(&tmp)?.sync_all()?;
-        fs::rename(tmp, path)?;
-        fs::File::open(&self.pending_ack_dir)?.sync_all()?;
+        abra_core::atomic_write(
+            &self.pending_ack_path(&ack.offer_id),
+            &abra_core::canonical::to_vec(ack)?,
+        )?;
         Ok(())
     }
     fn clear_pending_ack(&self, offer: &str) -> Result<()> {
@@ -734,25 +735,15 @@ impl DeliveryNode {
         }
     }
     fn record_event(&self, value: &serde_json::Value) -> Result<()> {
-        use std::io::Write;
-        if let Some(parent) = self.event_log.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if fs::metadata(&self.event_log).is_ok_and(|metadata| metadata.len() >= MAX_EVENT_LOG_BYTES)
-        {
-            fs::write(&self.event_log, [])?;
-        }
-        let mut bytes = serde_json::to_vec(value)?;
-        bytes.push(b'\n');
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.event_log)?;
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-        Ok(())
+        append_event(
+            self.event_log
+                .parent()
+                .and_then(Path::parent)
+                .expect("event log root"),
+            value,
+        )
     }
-    pub fn pending_acks(&self) -> Result<Vec<Ack>> {
+    fn pending_acks(&self) -> Result<Vec<Ack>> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(&self.pending_ack_dir) else {
             return Ok(out);
@@ -783,6 +774,79 @@ impl DeliveryNode {
                 Ok("capsule".into())
             }
         }
+    }
+
+    /// The shared tail of an accepted offer, direct or relayed: create the
+    /// capsule on first sight, enforce the inbox limit, commit the manifest,
+    /// adopt the offered capsule state, then sign and durably record the ack.
+    /// The caller records the returned event and clears the partials, so a
+    /// direct receiver can put the ack on the wire first.
+    fn finalize_received_offer(
+        &mut self,
+        raw: RawManifest,
+        offer: &Offer,
+        sender: PeerId,
+        now: u64,
+        via: Via,
+    ) -> Result<ReceivedOffer> {
+        if raw.manifest().scope == Scope::Full {
+            let capsule_id = raw.manifest().capsule_id.expect("validated");
+            if !self.store.capsules.contains_key(&capsule_id) {
+                let genesis = offer
+                    .genesis
+                    .clone()
+                    .ok_or_else(|| Error::protocol("missing genesis"))?;
+                let grant = offer
+                    .genesis_grant
+                    .clone()
+                    .ok_or_else(|| Error::protocol("missing genesis grant"))?;
+                if genesis.capsule_id != capsule_id {
+                    return Err(Error::protocol("genesis capsule mismatch"));
+                }
+                self.store.add_capsule(genesis, grant)?;
+            }
+        } else if self.store.inbox.len() >= MAX_INBOX_ENTRIES {
+            return Err(Error::authz("inbox quota exceeded"));
+        }
+        let mut shelf = self.commit_manifest(raw, sender, now)?;
+        if shelf == "capsule" {
+            shelf = match self.adopt_offer_capsule_state(offer, now) {
+                Ok(true) => "capsule-head".into(),
+                Ok(false) | Err(_) => {
+                    if let (Some(capsule_id), Some(op)) =
+                        (offer.capsule_id, offer.main_label.clone())
+                    {
+                        self.insert_pending_main_label(capsule_id, op)?;
+                    }
+                    if let Some(capsule_id) = offer.capsule_id {
+                        let signer =
+                            Identity::from_secret_bytes(&self.store.keys.identity.secret_bytes());
+                        self.store.record_fork_label(
+                            capsule_id,
+                            offer.snapshot_id,
+                            format_time(now),
+                            &signer,
+                            now,
+                        )?;
+                    }
+                    "capsule-fork".into()
+                }
+            };
+            if let Some(capsule_id) = offer.capsule_id {
+                self.retry_pending_main_labels(capsule_id, now)?;
+            }
+        }
+        let ack = Ack::sign(
+            offer.offer_id.clone(),
+            offer.snapshot_id,
+            shelf,
+            now,
+            sender,
+            &self.store.keys.identity,
+        )?;
+        self.persist_pending_ack(&ack)?;
+        let event = arrival_event(offer, &ack, sender, via);
+        Ok(ReceivedOffer { ack, event })
     }
 
     pub fn validate_incoming_offer(
@@ -965,12 +1029,61 @@ impl DeliveryNode {
         now: u64,
         byte_limit: Option<u64>,
     ) -> Result<DeliveryOutcome> {
+        let entry = self.check_outbox_entry(id, connection.peer_id(), now)?;
+        self.outbox.transition(id, OutboxState::Healthcheck, now)?;
+        let hello = self
+            .establish_trusted_session(connection, entry.peer_id, now)
+            .await?;
+        let raw = RawManifest::parse(entry.manifest_raw.clone())?;
+        if let LocalRole::Guest { token } = self.trust.local_role() {
+            if !self.allow_agent_send
+                || !token.scopes.allows(
+                    raw.manifest().capsule_id,
+                    &raw.manifest().kind,
+                    Direction::Send,
+                )
+            {
+                return Err(Error::authz("local guest send out of scope"));
+            }
+        }
+        let native = native_blobs(&raw);
+        let (objects, bytes_hint) = self.build_plan(&raw, &native)?;
+        let offer = self.build_offer(
+            &entry,
+            &raw,
+            bytes_hint,
+            objects.len() as u64,
+            now,
+            Some(&hello.features),
+        );
+        let have = self
+            .negotiate_have(connection, id, &offer, &objects, &native, now)
+            .await?;
+        let (stats, complete) = self
+            .stream_objects(connection, &objects, &have, byte_limit)
+            .await?;
+        if !complete {
+            return Ok(DeliveryOutcome::Interrupted { stats });
+        }
+        self.outbox.transition(id, OutboxState::AwaitingAck, now)?;
+        let ack = self.await_ack(connection, id, now).await?;
+        Ok(DeliveryOutcome::Complete { ack, stats })
+    }
+
+    /// The entry must belong to the connected recipient, still be live, and be
+    /// past its retry backoff.
+    fn check_outbox_entry(
+        &mut self,
+        id: &str,
+        recipient: PeerId,
+        now: u64,
+    ) -> Result<crate::OutboxEntry> {
         let entry = self
             .outbox
             .get(id)
             .cloned()
             .ok_or_else(|| Error::protocol("unknown outbox id"))?;
-        if entry.peer_id != connection.peer_id() {
+        if entry.peer_id != recipient {
             return Err(Error::Authentication(
                 "connected recipient differs from outbox".into(),
             ));
@@ -986,7 +1099,17 @@ impl DeliveryNode {
         if crate::auth::parse_time(&entry.next_attempt_at)? > now {
             return Err(Error::protocol("outbox backoff active"));
         }
-        self.outbox.transition(id, OutboxState::Healthcheck, now)?;
+        Ok(entry)
+    }
+
+    /// Handshakes, re-checks the recipient's trust, and health-checks the
+    /// route. Acks the peer replays while we wait are applied to the outbox.
+    async fn establish_trusted_session(
+        &mut self,
+        connection: &mut Connection,
+        recipient: PeerId,
+        now: u64,
+    ) -> Result<HelloOk> {
         let hello = dial_handshake_with_trust(
             connection,
             self.peer_id(),
@@ -998,9 +1121,7 @@ impl DeliveryNode {
         if hello.session != "trusted" {
             return Err(Error::authz("delivery requires trusted session"));
         }
-        if self.trust.get(&entry.peer_id).is_none()
-            || self.trust.is_revoked_guest(&entry.peer_id, now)
-        {
+        if self.trust.get(&recipient).is_none() || self.trust.is_revoked_guest(&recipient, now) {
             return Err(Error::authz("recipient trust was revoked"));
         }
         let ping = Ping {
@@ -1020,7 +1141,7 @@ impl DeliveryNode {
                     if pong.nonce != ping.nonce {
                         return Err(Error::protocol("invalid pong"));
                     }
-                    break;
+                    return Ok(hello);
                 }
                 Some("ack") => {
                     let ack: Ack = serde_json::from_value(value)?;
@@ -1037,26 +1158,16 @@ impl DeliveryNode {
                 _ => return Err(Error::protocol("unexpected health-check frame")),
             }
         }
-        let raw = RawManifest::parse(entry.manifest_raw.clone())?;
-        if let LocalRole::Guest { token } = self.trust.local_role() {
-            if !self.allow_agent_send
-                || !token.scopes.allows(
-                    raw.manifest().capsule_id,
-                    &raw.manifest().kind,
-                    Direction::Send,
-                )
-            {
-                return Err(Error::authz("local guest send out of scope"));
-            }
-        }
+    }
+
+    /// Walks the manifest closure into the object list the receiver plans
+    /// against, plus the byte total the offer advertises.
+    fn build_plan(
+        &self,
+        raw: &RawManifest,
+        native: &BTreeSet<Hash>,
+    ) -> Result<(Vec<PlanObject>, u64)> {
         let closure_set = closure(&self.store.cas, raw.manifest())?;
-        let native: BTreeSet<Hash> = raw
-            .manifest()
-            .native
-            .iter()
-            .flatten()
-            .map(|object| object.blob)
-            .collect();
         let mut objects = Vec::with_capacity(closure_set.len());
         let mut bytes_hint = 0u64;
         for digest in &closure_set {
@@ -1068,7 +1179,7 @@ impl DeliveryNode {
                 MAX_OBJECT_SIZE
             };
             if size > limit {
-                return Err(Error::protocol("CAS object exceeds delivery limit"));
+                return Err(Error::protocol("stored object exceeds delivery limit"));
             }
             bytes_hint = bytes_hint
                 .checked_add(size)
@@ -1086,53 +1197,80 @@ impl DeliveryNode {
                 bytes: size,
             });
         }
-        let capsule = raw
-            .manifest()
+        Ok((objects, bytes_hint))
+    }
+
+    /// Builds the offer envelope. `features` is the negotiated feature list of
+    /// a live session; a relay envelope has no handshake and passes `None`.
+    fn build_offer(
+        &self,
+        entry: &crate::OutboxEntry,
+        raw: &RawManifest,
+        bytes_hint: u64,
+        object_count: u64,
+        now: u64,
+        features: Option<&[String]>,
+    ) -> Offer {
+        let manifest = raw.manifest();
+        let capsule = manifest
             .capsule_id
-            .and_then(|c| self.store.capsules.get(&c));
-        let fork = capsule.is_some_and(|capsule| {
-            capsule
-                .active_lease(now)
-                .is_none_or(|lease| lease.holder != raw.manifest().origin.peer_id)
-        });
-        let (bind_certificate_issuer, bind_certificate) =
-            if has_feature(&hello.features, FEATURE_BIND_CERT) {
-                self.offer_bind_certificate(raw.manifest().origin.peer_id)
-            } else {
-                (None, None)
-            };
-        let offer = Offer {
+            .and_then(|id| self.store.capsules.get(&id));
+        let negotiated = |feature| features.is_some_and(|list| has_feature(list, feature));
+        let (bind_certificate_issuer, bind_certificate) = if negotiated(FEATURE_BIND_CERT) {
+            self.offer_bind_certificate(manifest.origin.peer_id)
+        } else {
+            (None, None)
+        };
+        Offer {
             message_type: "offer".into(),
             offer_id: entry.offer_id.clone(),
             snapshot_id: entry.snapshot_id,
-            scope: raw.manifest().scope,
-            kind: raw.manifest().kind.clone(),
-            title: raw.manifest().title.clone(),
-            capsule_id: raw.manifest().capsule_id,
-            fork,
+            scope: manifest.scope,
+            kind: manifest.kind.clone(),
+            title: manifest.title.clone(),
+            capsule_id: manifest.capsule_id,
+            fork: capsule.is_some_and(|capsule| {
+                capsule
+                    .active_lease(now)
+                    .is_none_or(|lease| lease.holder != manifest.origin.peer_id)
+            }),
             bytes_hint,
-            object_count: objects.len() as u64,
+            object_count,
             manifest_raw: data_encoding::BASE64URL_NOPAD.encode(raw.bytes()),
-            genesis: capsule.map(|x| x.genesis.clone()),
-            genesis_grant: capsule.and_then(|x| {
-                x.leases()
+            genesis: capsule.map(|capsule| capsule.genesis.clone()),
+            genesis_grant: capsule.and_then(|capsule| {
+                capsule
+                    .leases()
                     .iter()
                     .find(|lease| lease.epoch == 1 && lease.mode == LeaseMode::Grant)
                     .cloned()
             }),
             lease_chain: capsule.map(winning_lease_chain).unwrap_or_default(),
-            main_label: capsule.and_then(|x| x.label("main").cloned()),
+            main_label: capsule.and_then(|capsule| capsule.label("main").cloned()),
             bind_certificate_issuer,
             bind_certificate,
-            revocations: if has_feature(&hello.features, FEATURE_REVOCATION) {
+            revocations: if negotiated(FEATURE_REVOCATION) {
                 self.trust.current_revocations(now)
             } else {
                 Vec::new()
             },
-        };
+        }
+    }
+
+    /// Offers the snapshot, sends the plan, and reads back what the receiver
+    /// already has or wants resumed.
+    async fn negotiate_have(
+        &mut self,
+        connection: &mut Connection,
+        id: &str,
+        offer: &Offer,
+        objects: &[PlanObject],
+        native: &BTreeSet<Hash>,
+        now: u64,
+    ) -> Result<Have> {
         {
             let (send, _) = connection.control_mut();
-            write_frame(send, &offer).await?;
+            write_frame(send, offer).await?;
         }
         let response = read_value(connection).await?;
         if response.get("type").and_then(|x| x.as_str()) != Some("offer-accept") {
@@ -1147,10 +1285,10 @@ impl DeliveryNode {
         self.outbox.transition(id, OutboxState::Offered, now)?;
         let plan = Plan {
             message_type: "plan".into(),
-            offer_id: entry.offer_id.clone(),
+            offer_id: offer.offer_id.clone(),
             seq: 0,
             eof: true,
-            objects: objects.clone(),
+            objects: objects.to_vec(),
         };
         {
             let (send, _) = connection.control_mut();
@@ -1172,11 +1310,23 @@ impl DeliveryNode {
                 .copied()
                 .filter(|digest| native.contains(digest))
                 .collect();
-            if skipped != native {
+            if skipped != *native {
                 return Err(Error::protocol("skip_native did not cover native objects"));
             }
         }
         self.outbox.transition(id, OutboxState::Transferring, now)?;
+        Ok(have)
+    }
+
+    /// Streams every wanted object. The bool is false when a byte limit cut the
+    /// transfer short, leaving the rest for the next attempt to resume.
+    async fn stream_objects(
+        &self,
+        connection: &mut Connection,
+        objects: &[PlanObject],
+        have: &Have,
+        byte_limit: Option<u64>,
+    ) -> Result<(TransferStats, bool)> {
         let have_set: BTreeSet<Hash> = have.have.iter().copied().collect();
         let mut stats = TransferStats {
             objects_reused: have_set.len() as u64,
@@ -1227,7 +1377,7 @@ impl DeliveryNode {
                     .min(budget)
                     .min(OBJECT_STREAM_CHUNK);
                 if take == 0 {
-                    return Ok(DeliveryOutcome::Interrupted { stats });
+                    return Ok((stats, false));
                 }
                 file.read_exact(&mut buffer[..take as usize])?;
                 hasher.update(&buffer[..take as usize]);
@@ -1244,16 +1394,19 @@ impl DeliveryNode {
                 position += take;
             }
             if Hash::from_bytes(*hasher.finalize().as_bytes()) != object.digest {
-                return Err(Error::protocol("CAS object changed while streaming"));
+                return Err(Error::protocol("stored object changed while streaming"));
             }
             stats.objects_transferred += 1;
         }
-        self.outbox.transition(id, OutboxState::AwaitingAck, now)?;
+        Ok((stats, true))
+    }
+
+    async fn await_ack(&mut self, connection: &mut Connection, id: &str, now: u64) -> Result<Ack> {
         let ack: Ack = serde_json::from_value(read_value(connection).await?)?;
         if !self.outbox.apply_ack(id, &ack, self.peer_id(), now)? {
             return Err(Error::Authentication("ack mismatch".into()));
         }
-        Ok(DeliveryOutcome::Complete { ack, stats })
+        Ok(ack)
     }
 
     pub async fn handle_connection(
@@ -1322,468 +1475,26 @@ impl DeliveryNode {
                 return Err(Error::authz("bootstrap message forbidden"));
             }
             match kind {
-                "ping" => {
-                    let ping: Ping = serde_json::from_value(value)?;
-                    let pong = Pong {
-                        message_type: "pong".into(),
-                        nonce: ping.nonce,
-                        ts: format_time(now),
-                    };
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &pong).await?;
-                }
+                "ping" => self.handle_ping(connection, value, now).await?,
                 "offer" => {
-                    let offer: Offer = serde_json::from_value(value)?;
-                    let reply =
-                        match self.validate_incoming_offer(&offer, connection.peer_id(), now) {
-                            Ok(raw) => {
-                                pending = Some((offer.clone(), raw));
-                                serde_json::to_value(OfferAccept {
-                                    message_type: "offer-accept".into(),
-                                    offer_id: offer.offer_id,
-                                })?
-                            }
-                            Err(error) => serde_json::to_value(OfferReject {
-                                message_type: "offer-reject".into(),
-                                offer_id: offer.offer_id,
-                                reason: rejection_reason(&error),
-                            })?,
-                        };
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &reply).await?;
+                    self.handle_offer(connection, value, now, &mut pending)
+                        .await?
                 }
                 "plan" => {
-                    let plan: Plan = serde_json::from_value(value)?;
-                    let (offer, raw) = pending
-                        .take()
-                        .ok_or_else(|| Error::protocol("plan without offer"))?;
-                    if plan.offer_id != offer.offer_id
-                        || !plan.eof
-                        || plan.objects.len() as u64 != offer.object_count
-                    {
-                        return Err(Error::protocol("plan mismatch"));
-                    }
-                    let allowed: BTreeMap<Hash, &PlanObject> =
-                        plan.objects.iter().map(|x| (x.digest, x)).collect();
-                    let native: BTreeSet<Hash> = raw
-                        .manifest()
-                        .native
-                        .iter()
-                        .flatten()
-                        .map(|object| object.blob)
-                        .collect();
-                    let declared_native_bytes = raw
-                        .manifest()
-                        .native
-                        .iter()
-                        .flatten()
-                        .map(|object| (object.blob, object.bytes))
-                        .collect::<BTreeMap<_, _>>();
-                    if allowed.len() != plan.objects.len()
-                        || plan.objects.iter().any(|x| {
-                            x.bytes
-                                > if native.contains(&x.digest) {
-                                    MAX_NATIVE_OBJECT_SIZE
-                                } else {
-                                    MAX_OBJECT_SIZE
-                                }
-                                || !matches!(x.kind.as_str(), "blob" | "tree")
-                                || (native.contains(&x.digest) && x.kind != "blob")
-                                || declared_native_bytes
-                                    .get(&x.digest)
-                                    .is_some_and(|bytes| *bytes != x.bytes)
-                        })
-                    {
-                        return Err(Error::protocol("invalid plan"));
-                    }
-                    let planned_bytes = plan.objects.iter().try_fold(0u64, |sum, object| {
-                        sum.checked_add(object.bytes)
-                            .ok_or_else(|| Error::protocol("plan byte count overflow"))
-                    })?;
-                    if planned_bytes != offer.bytes_hint {
-                        return Err(Error::protocol("plan quota mismatch"));
-                    }
-                    let guest_sender = self
-                        .trust
-                        .get(&connection.peer_id())
-                        .is_some_and(|p| p.role == crate::Role::Guest);
-                    let effective_skip_native = self.skip_native
-                        && !guest_sender
-                        && has_feature(&hello.features, FEATURE_SKIP_NATIVE);
-                    let skipped_native_bytes = if effective_skip_native {
-                        plan.objects
-                            .iter()
-                            .filter(|object| native.contains(&object.digest))
-                            .try_fold(0u64, |sum, object| sum.checked_add(object.bytes))
-                            .ok_or_else(|| Error::protocol("native byte count overflow"))?
-                    } else {
-                        0
-                    };
-                    let required_bytes = planned_bytes.saturating_sub(skipped_native_bytes);
-                    if exceeds_storage_quota(
-                        required_bytes,
-                        self.offer_budget,
-                        fs2::available_space(self.store.cas.root()),
-                    ) {
-                        let reject = OfferReject {
-                            message_type: "offer-reject".into(),
-                            offer_id: offer.offer_id,
-                            reason: "quota".into(),
-                        };
-                        let (send, _) = connection.control_mut();
-                        write_frame(send, &reject).await?;
-                        return Err(Error::authz("offer exceeds quota"));
-                    }
-                    let mut have =
-                        self.compute_have(&offer.offer_id, &allowed.keys().copied().collect())?;
-                    if guest_sender {
-                        have.have.clear();
-                        have.resume.clear();
-                        have.skip_native = false;
-                    } else if self.skip_native && has_feature(&hello.features, FEATURE_SKIP_NATIVE)
-                    {
-                        for digest in &native {
-                            if !have.have.contains(digest) {
-                                have.have.push(*digest);
-                            }
-                            have.resume.remove(digest);
-                        }
-                    }
-                    {
-                        let (send, _) = connection.control_mut();
-                        write_frame(send, &have).await?;
-                    }
-                    let have_set: BTreeSet<Hash> = have.have.iter().copied().collect();
-                    let staged = abra_core::cas::BlobStore::open(
-                        self.partial_dir.join(&offer.offer_id).join("staged"),
-                    )?;
-                    let _staged_cleanup = DirectoryCleanup(staged.root().to_path_buf());
-                    for digest in &have_set {
-                        if effective_skip_native && native.contains(digest) {
-                            continue;
-                        }
-                        let destination = staged.path_for(digest);
-                        if let Some(parent) = destination.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::hard_link(self.store.cas.path_for(digest), destination)?;
-                    }
-                    let wanted_count = plan
-                        .objects
-                        .iter()
-                        .filter(|x| !have_set.contains(&x.digest))
-                        .count();
-                    let mut hashers = BTreeMap::new();
-                    for object in plan
-                        .objects
-                        .iter()
-                        .filter(|x| !have_set.contains(&x.digest))
-                    {
-                        let mut hasher = blake3::Hasher::new();
-                        let partial = self.partial_path(&offer.offer_id, object.digest);
-                        if partial.is_file() {
-                            let mut file = fs::File::open(partial)?;
-                            let mut buffer = vec![0u8; OBJECT_STREAM_CHUNK as usize];
-                            loop {
-                                let read = file.read(&mut buffer)?;
-                                if read == 0 {
-                                    break;
-                                }
-                                hasher.update(&buffer[..read]);
-                            }
-                        }
-                        hashers.insert(object.digest, hasher);
-                    }
-                    let mut completed = BTreeSet::new();
-                    while completed.len() < wanted_count {
-                        let stream = connection
-                            .accept_uni_bounded(STREAMING_THRESHOLD as usize + ObjectHeader::LEN)
-                            .await?;
-                        if stream.len() < ObjectHeader::LEN {
-                            return Err(Error::protocol("short object header"));
-                        }
-                        let header = ObjectHeader::decode(
-                            stream[..ObjectHeader::LEN]
-                                .try_into()
-                                .expect("header length"),
-                        )?;
-                        let wanted = wanted_plan_object(&allowed, &have_set, &header.digest)?;
-                        if completed.contains(&header.digest) {
-                            return Err(Error::protocol("object stream for completed object"));
-                        }
-                        let expected_kind = if wanted.kind == "tree" {
-                            ObjectKind::Tree
-                        } else {
-                            ObjectKind::Blob
-                        };
-                        if header.kind != expected_kind
-                            || header.total_size != wanted.bytes
-                            || header.offset
-                                != self
-                                    .partial_len(&offer.offer_id, header.digest)?
-                                    .unwrap_or(0)
-                        {
-                            return Err(Error::protocol("object header mismatch"));
-                        }
-                        self.append_partial(
-                            &offer.offer_id,
-                            header.digest,
-                            header.total_size,
-                            header.offset,
-                            &stream[ObjectHeader::LEN..],
-                        )?;
-                        update_object_hasher(
-                            &mut hashers,
-                            header.digest,
-                            &stream[ObjectHeader::LEN..],
-                        )?;
-                        if header.offset + (stream.len() - ObjectHeader::LEN) as u64
-                            == header.total_size
-                        {
-                            let actual = Hash::from_bytes(
-                                *hashers
-                                    .remove(&header.digest)
-                                    .ok_or_else(|| {
-                                        Error::protocol("object stream for completed object")
-                                    })?
-                                    .finalize()
-                                    .as_bytes(),
-                            );
-                            if actual != header.digest {
-                                let _ = fs::remove_file(
-                                    self.partial_path(&offer.offer_id, header.digest),
-                                );
-                                return Err(Error::protocol("object hash mismatch"));
-                            }
-                            self.commit_verified_partial(&offer.offer_id, header.digest)?;
-                            completed.insert(header.digest);
-                        }
-                    }
-                    let mut portable_manifest = raw.manifest().clone();
-                    portable_manifest.native = None;
-                    let portable = closure(&staged, &portable_manifest)?;
-                    let skippable = native
-                        .difference(&portable)
-                        .copied()
-                        .collect::<BTreeSet<_>>();
-                    let mut actual = closure(&staged, raw.manifest())?;
-                    actual.retain(|digest| !effective_skip_native || !skippable.contains(digest));
-                    let planned = allowed
-                        .keys()
-                        .copied()
-                        .filter(|digest| !effective_skip_native || !skippable.contains(digest))
-                        .collect::<BTreeSet<_>>();
-                    if actual != planned {
-                        return Err(Error::protocol(
-                            "plan differs from verified manifest closure",
-                        ));
-                    }
-                    if actual.iter().any(|digest| !staged.has(digest)) {
-                        return Err(Error::protocol("staged object is missing"));
-                    }
-                    for digest in &actual {
-                        self.store
-                            .cas
-                            .commit_file(staged.path_for(digest), digest)?;
-                    }
-                    if raw.manifest().scope == Scope::Full {
-                        let capsule_id = raw.manifest().capsule_id.expect("validated");
-                        if !self.store.capsules.contains_key(&capsule_id) {
-                            let genesis = offer
-                                .genesis
-                                .clone()
-                                .ok_or_else(|| Error::protocol("missing genesis"))?;
-                            let grant = offer
-                                .genesis_grant
-                                .clone()
-                                .ok_or_else(|| Error::protocol("missing genesis grant"))?;
-                            if genesis.capsule_id != capsule_id {
-                                return Err(Error::protocol("genesis capsule mismatch"));
-                            }
-                            self.store.add_capsule(genesis, grant)?;
-                        }
-                    }
-                    if raw.manifest().scope == Scope::Partial
-                        && self.store.inbox.len() >= MAX_INBOX_ENTRIES
-                    {
-                        return Err(Error::authz("inbox quota exceeded"));
-                    }
-                    let mut shelf = self.commit_manifest(raw, connection.peer_id(), now)?;
-                    if shelf == "capsule" {
-                        shelf = match self.adopt_offer_capsule_state(&offer, now) {
-                            Ok(true) => {
-                                if let Some(capsule_id) = offer.capsule_id {
-                                    self.retry_pending_main_labels(capsule_id, now);
-                                }
-                                "capsule-head".into()
-                            }
-                            Ok(false) | Err(_) => {
-                                if let (Some(capsule_id), Some(op)) =
-                                    (offer.capsule_id, offer.main_label.clone())
-                                {
-                                    let pending =
-                                        self.pending_main_labels.entry(capsule_id).or_default();
-                                    if pending.len() < MAX_LEASE_CHAIN_LEN
-                                        && !pending.iter().any(|old| old.sig == op.sig)
-                                    {
-                                        pending.push(op);
-                                    }
-                                }
-                                if let Some(capsule_id) = offer.capsule_id {
-                                    let signer = Identity::from_secret_bytes(
-                                        &self.store.keys.identity.secret_bytes(),
-                                    );
-                                    self.store.record_fork_label(
-                                        capsule_id,
-                                        offer.snapshot_id,
-                                        format_time(now),
-                                        &signer,
-                                        now,
-                                    )?;
-                                }
-                                "capsule-fork".into()
-                            }
-                        };
-                    }
-                    let ack = Ack::sign(
-                        offer.offer_id,
-                        offer.snapshot_id,
-                        shelf,
-                        now,
-                        connection.peer_id(),
-                        &self.store.keys.identity,
-                    )?;
-                    self.persist_pending_ack(&ack)?;
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &ack).await?;
-                    self.clear_pending_ack(&ack.offer_id)?;
-                    let event = match offer.scope {
-                        Scope::Full => {
-                            serde_json::json!({"event":"capsule-sync","snapshot_id":ack.snapshot_id,"capsule_id":offer.capsule_id,"scope":"full","from":connection.peer_id(),"at":ack.received_at})
-                        }
-                        Scope::Partial => {
-                            serde_json::json!({"event":"inbox-arrival","snapshot_id":ack.snapshot_id,"scope":"partial","from":connection.peer_id(),"at":ack.received_at})
-                        }
-                    };
-                    self.record_event(&event)?;
-                    self.clear_partials(&ack.offer_id)?;
+                    self.handle_plan(connection, value, now, &mut pending, &hello.features)
+                        .await?
                 }
-                "ack" => {
-                    let ack: Ack = serde_json::from_value(value)?;
-                    let id = {
-                        self.outbox
-                            .entries()
-                            .find(|e| e.offer_id == ack.offer_id)
-                            .map(|e| e.id.clone())
-                    };
-                    if let Some(id) = id {
-                        let _ = self.outbox.apply_ack(&id, &ack, self.peer_id(), now)?;
-                    }
-                }
+                "ack" => self.handle_ack(value, now)?,
                 "control" => {
-                    let msg: crate::ControlMessage = serde_json::from_value(value)?;
-                    let result = msg.verify_and_record(connection.peer_id(), &mut self.trust, now);
-                    if result.is_ok() {
-                        self.record_event(&serde_json::json!({"event":"control","from":connection.peer_id(),"message":msg}))?;
-                    }
-                    let reply = crate::ControlAck {
-                        message_type: "control-ack".into(),
-                        nonce: msg.nonce,
-                        ok: result.is_ok(),
-                        error: result.err().map(|e| e.to_string()),
-                    };
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &reply).await?;
+                    self.handle_control(connection, value, now, &hello.features)
+                        .await?
                 }
-                "pair-request" => {
-                    let request: crate::PairRequest = serde_json::from_value(value)?;
-                    if request.peer_id != connection.peer_id() {
-                        return Err(Error::Authentication(
-                            "pair request differs from transport".into(),
-                        ));
-                    }
-                    fs::create_dir_all(&self.pending_pair_dir)?;
-                    fs::create_dir_all(&self.approved_pair_dir)?;
-                    let pending_count = fs::read_dir(&self.pending_pair_dir)?.count();
-                    if pending_count >= MAX_PENDING_PAIRS {
-                        return Err(Error::authz("too many pending pair requests"));
-                    }
-                    let pending_path = self.pending_pair_dir.join(request.peer_id.to_hex());
-                    let approved_path = self.approved_pair_dir.join(request.peer_id.to_hex());
-                    fs::write(&pending_path, abra_core::canonical::to_vec(&request)?)?;
-                    let approved = if self.auto_confirm_pairs {
-                        true
-                    } else {
-                        let deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-                        loop {
-                            if approved_path.exists() {
-                                break true;
-                            }
-                            if tokio::time::Instant::now() >= deadline {
-                                let error = ProtocolError {
-                                    message_type: "error".into(),
-                                    code: "untrusted".into(),
-                                    message: "pairing confirmation timed out".into(),
-                                };
-                                let (send, _) = connection.control_mut();
-                                write_frame(send, &error).await?;
-                                break false;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    };
-                    let accept = self.trust.accept_pair_request(
-                        &request,
-                        connection.peer_id(),
-                        now,
-                        self.auto_confirm_pairs,
-                        |_, _| approved,
-                    );
-                    let _ = fs::remove_file(&pending_path);
-                    let _ = fs::remove_file(&approved_path);
-                    let accept = accept?;
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &accept).await?;
-                }
+                "pair-request" => self.handle_pair_request(connection, value, now).await?,
                 "pair-confirm" => {
                     let confirm = serde_json::from_value(value)?;
                     self.trust.confirm_pair(&confirm, connection.peer_id())?;
                 }
-                "enroll-bind" => {
-                    let bind: crate::EnrollBind = serde_json::from_value(value)?;
-                    let secret = self.store.keys.identity.secret_bytes();
-                    let issuer = Identity::from_secret_bytes(&secret);
-                    let certificate =
-                        self.trust
-                            .bind_enrollment(&bind, connection.peer_id(), now, &issuer)?;
-                    let mesh = self
-                        .trust
-                        .peers()
-                        .values()
-                        .filter(|peer| {
-                            peer.role == crate::Role::Full
-                                || self.trust.mesh_profile() == crate::MeshProfile::Fleet
-                        })
-                        .map(|peer| crate::EnrollMeshPeer {
-                            peer_id: peer.peer_id,
-                            name: peer.name.clone(),
-                            role: peer.role.clone(),
-                            x25519_pk: peer.x25519_pk,
-                            token_id: peer.token_id.clone(),
-                            scopes: peer.scopes.clone(),
-                            expires_at: peer.expires_at.clone(),
-                        })
-                        .collect();
-                    let reply = crate::EnrollOk {
-                        message_type: "enroll-ok".into(),
-                        mesh,
-                        certificate,
-                        mesh_profile: self.trust.mesh_profile(),
-                    };
-                    let (send, _) = connection.control_mut();
-                    write_frame(send, &reply).await?;
-                }
+                "enroll-bind" => self.handle_enroll_bind(connection, value, now).await?,
                 _ => {
                     let error = ProtocolError {
                         message_type: "error".into(),
@@ -1795,6 +1506,449 @@ impl DeliveryNode {
                 }
             }
         }
+    }
+
+    async fn handle_ping(
+        &self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        let ping: Ping = serde_json::from_value(value)?;
+        let pong = Pong {
+            message_type: "pong".into(),
+            nonce: ping.nonce,
+            ts: format_time(now),
+        };
+        let (send, _) = connection.control_mut();
+        write_frame(send, &pong).await?;
+        Ok(())
+    }
+
+    async fn handle_offer(
+        &mut self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+        pending: &mut Option<(Offer, RawManifest)>,
+    ) -> Result<()> {
+        let offer: Offer = serde_json::from_value(value)?;
+        let reply = match self.validate_incoming_offer(&offer, connection.peer_id(), now) {
+            Ok(raw) => {
+                *pending = Some((offer.clone(), raw));
+                serde_json::to_value(OfferAccept {
+                    message_type: "offer-accept".into(),
+                    offer_id: offer.offer_id,
+                })?
+            }
+            Err(error) => serde_json::to_value(OfferReject {
+                message_type: "offer-reject".into(),
+                offer_id: offer.offer_id,
+                reason: rejection_reason(&error),
+            })?,
+        };
+        let (send, _) = connection.control_mut();
+        write_frame(send, &reply).await?;
+        Ok(())
+    }
+
+    /// Validates the plan against the accepted offer, stages every wanted
+    /// object, then commits the snapshot and acknowledges it.
+    async fn handle_plan(
+        &mut self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+        pending: &mut Option<(Offer, RawManifest)>,
+        features: &[String],
+    ) -> Result<()> {
+        let plan: Plan = serde_json::from_value(value)?;
+        let (offer, raw) = pending
+            .take()
+            .ok_or_else(|| Error::protocol("plan without offer"))?;
+        if plan.offer_id != offer.offer_id
+            || !plan.eof
+            || plan.objects.len() as u64 != offer.object_count
+        {
+            return Err(Error::protocol("plan mismatch"));
+        }
+        let allowed: BTreeMap<Hash, &PlanObject> =
+            plan.objects.iter().map(|x| (x.digest, x)).collect();
+        let native = native_blobs(&raw);
+        let declared_native_bytes = raw
+            .manifest()
+            .native
+            .iter()
+            .flatten()
+            .map(|object| (object.blob, object.bytes))
+            .collect::<BTreeMap<_, _>>();
+        if allowed.len() != plan.objects.len()
+            || plan.objects.iter().any(|x| {
+                x.bytes
+                    > if native.contains(&x.digest) {
+                        MAX_NATIVE_OBJECT_SIZE
+                    } else {
+                        MAX_OBJECT_SIZE
+                    }
+                    || !matches!(x.kind.as_str(), "blob" | "tree")
+                    || (native.contains(&x.digest) && x.kind != "blob")
+                    || declared_native_bytes
+                        .get(&x.digest)
+                        .is_some_and(|bytes| *bytes != x.bytes)
+            })
+        {
+            return Err(Error::protocol("invalid plan"));
+        }
+        let planned_bytes = plan.objects.iter().try_fold(0u64, |sum, object| {
+            sum.checked_add(object.bytes)
+                .ok_or_else(|| Error::protocol("plan byte count overflow"))
+        })?;
+        if planned_bytes != offer.bytes_hint {
+            return Err(Error::protocol("plan quota mismatch"));
+        }
+        let guest_sender = self
+            .trust
+            .get(&connection.peer_id())
+            .is_some_and(|p| p.role == crate::Role::Guest);
+        let effective_skip_native =
+            self.skip_native && !guest_sender && has_feature(features, FEATURE_SKIP_NATIVE);
+        let skipped_native_bytes = if effective_skip_native {
+            plan.objects
+                .iter()
+                .filter(|object| native.contains(&object.digest))
+                .try_fold(0u64, |sum, object| sum.checked_add(object.bytes))
+                .ok_or_else(|| Error::protocol("native byte count overflow"))?
+        } else {
+            0
+        };
+        let required_bytes = planned_bytes.saturating_sub(skipped_native_bytes);
+        if exceeds_storage_quota(
+            required_bytes,
+            self.offer_budget,
+            fs2::available_space(self.store.cas.root()),
+        ) {
+            let reject = OfferReject {
+                message_type: "offer-reject".into(),
+                offer_id: offer.offer_id,
+                reason: "quota".into(),
+            };
+            let (send, _) = connection.control_mut();
+            write_frame(send, &reject).await?;
+            return Err(Error::authz("offer exceeds quota"));
+        }
+        let mut have = self.compute_have(&offer.offer_id, &allowed.keys().copied().collect())?;
+        if guest_sender {
+            have.have.clear();
+            have.resume.clear();
+            have.skip_native = false;
+        } else if self.skip_native && has_feature(features, FEATURE_SKIP_NATIVE) {
+            for digest in &native {
+                if !have.have.contains(digest) {
+                    have.have.push(*digest);
+                }
+                have.resume.remove(digest);
+            }
+        }
+        {
+            let (send, _) = connection.control_mut();
+            write_frame(send, &have).await?;
+        }
+        let have_set: BTreeSet<Hash> = have.have.iter().copied().collect();
+        let staged =
+            abra_core::cas::BlobStore::open(self.partial_dir.join(&offer.offer_id).join("staged"))?;
+        let _staged_cleanup = DirectoryCleanup(staged.root().to_path_buf());
+        for digest in &have_set {
+            if effective_skip_native && native.contains(digest) {
+                continue;
+            }
+            let destination = staged.path_for(digest);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::hard_link(self.store.cas.path_for(digest), destination)?;
+        }
+        let wanted_count = plan
+            .objects
+            .iter()
+            .filter(|x| !have_set.contains(&x.digest))
+            .count();
+        let mut hashers = BTreeMap::new();
+        for object in plan
+            .objects
+            .iter()
+            .filter(|x| !have_set.contains(&x.digest))
+        {
+            let mut hasher = blake3::Hasher::new();
+            let partial = self.partial_path(&offer.offer_id, object.digest);
+            if partial.is_file() {
+                let mut file = fs::File::open(partial)?;
+                let mut buffer = vec![0u8; OBJECT_STREAM_CHUNK as usize];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+            }
+            hashers.insert(object.digest, hasher);
+        }
+        let mut completed = BTreeSet::new();
+        while completed.len() < wanted_count {
+            let stream = connection
+                .accept_uni_bounded(STREAMING_THRESHOLD as usize + ObjectHeader::LEN)
+                .await?;
+            if stream.len() < ObjectHeader::LEN {
+                return Err(Error::protocol("short object header"));
+            }
+            let header = ObjectHeader::decode(
+                stream[..ObjectHeader::LEN]
+                    .try_into()
+                    .expect("header length"),
+            )?;
+            let wanted = wanted_plan_object(&allowed, &have_set, &header.digest)?;
+            if completed.contains(&header.digest) {
+                return Err(Error::protocol("object stream for completed object"));
+            }
+            let expected_kind = if wanted.kind == "tree" {
+                ObjectKind::Tree
+            } else {
+                ObjectKind::Blob
+            };
+            if header.kind != expected_kind
+                || header.total_size != wanted.bytes
+                || header.offset
+                    != self
+                        .partial_len(&offer.offer_id, header.digest)?
+                        .unwrap_or(0)
+            {
+                return Err(Error::protocol("object header mismatch"));
+            }
+            self.append_partial(
+                &offer.offer_id,
+                header.digest,
+                header.total_size,
+                header.offset,
+                &stream[ObjectHeader::LEN..],
+            )?;
+            update_object_hasher(&mut hashers, header.digest, &stream[ObjectHeader::LEN..])?;
+            if header.offset + (stream.len() - ObjectHeader::LEN) as u64 == header.total_size {
+                let actual = Hash::from_bytes(
+                    *hashers
+                        .remove(&header.digest)
+                        .ok_or_else(|| Error::protocol("object stream for completed object"))?
+                        .finalize()
+                        .as_bytes(),
+                );
+                if actual != header.digest {
+                    let _ = fs::remove_file(self.partial_path(&offer.offer_id, header.digest));
+                    return Err(Error::protocol("object hash mismatch"));
+                }
+                self.commit_verified_partial(&offer.offer_id, header.digest)?;
+                completed.insert(header.digest);
+            }
+        }
+        let mut portable_manifest = raw.manifest().clone();
+        portable_manifest.native = None;
+        let portable = closure(&staged, &portable_manifest)?;
+        let skippable = native
+            .difference(&portable)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut actual = closure(&staged, raw.manifest())?;
+        actual.retain(|digest| !effective_skip_native || !skippable.contains(digest));
+        let planned = allowed
+            .keys()
+            .copied()
+            .filter(|digest| !effective_skip_native || !skippable.contains(digest))
+            .collect::<BTreeSet<_>>();
+        if actual != planned {
+            return Err(Error::protocol(
+                "plan differs from verified manifest closure",
+            ));
+        }
+        if actual.iter().any(|digest| !staged.has(digest)) {
+            return Err(Error::protocol("staged object is missing"));
+        }
+        for digest in &actual {
+            self.store
+                .cas
+                .commit_file(staged.path_for(digest), digest)?;
+        }
+        let received =
+            self.finalize_received_offer(raw, &offer, connection.peer_id(), now, Via::Direct)?;
+        let (send, _) = connection.control_mut();
+        write_frame(send, &received.ack).await?;
+        self.clear_pending_ack(&received.ack.offer_id)?;
+        self.record_event(&received.event)?;
+        self.clear_partials(&offer.offer_id)?;
+        Ok(())
+    }
+
+    fn handle_ack(&mut self, value: serde_json::Value, now: u64) -> Result<()> {
+        let ack: Ack = serde_json::from_value(value)?;
+        let id = {
+            self.outbox
+                .entries()
+                .find(|e| e.offer_id == ack.offer_id)
+                .map(|e| e.id.clone())
+        };
+        if let Some(id) = id {
+            let _ = self.outbox.apply_ack(&id, &ack, self.peer_id(), now)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_control(
+        &mut self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+        features: &[String],
+    ) -> Result<()> {
+        let msg: crate::ControlMessage = serde_json::from_value(value)?;
+        let verified = msg.verify_and_record(connection.peer_id(), &mut self.trust, now);
+        let mut ok = verified.is_ok();
+        let mut error = verified.err().map(|e| e.to_string());
+        let mut handler_result = None;
+        if ok {
+            self.record_event(
+                &serde_json::json!({"event":"control","at":format_time(now),"from":connection.peer_id(),"message":msg}),
+            )?;
+            if let Some(handler) = self.control_handler.clone() {
+                // The message stays recorded as received whatever the handler
+                // does; only the acknowledgement reports its failure.
+                match tokio::time::timeout(
+                    self.control_timeout,
+                    handler.handle(connection.peer_id(), &msg),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => handler_result = Some(value),
+                    Ok(Err(e)) => {
+                        ok = false;
+                        // The handler's error goes to the remote peer, so it
+                        // gets the same scrubbing as a rejected offer: local
+                        // paths never leave this node.
+                        error = Some(rejection_reason(&e));
+                    }
+                    Err(_) => {
+                        ok = false;
+                        error = Some("control handler timed out".into());
+                    }
+                }
+            }
+        }
+        let reply = crate::ControlAck {
+            message_type: "control-ack".into(),
+            nonce: msg.nonce,
+            ok,
+            error,
+            // A dialer that never advertised the feature would reject an ack
+            // carrying `result`, so the handler runs and its value is dropped.
+            result: handler_result.filter(|_| has_feature(features, FEATURE_CONTROL_RESULT)),
+        };
+        let (send, _) = connection.control_mut();
+        write_frame(send, &reply).await?;
+        Ok(())
+    }
+
+    async fn handle_pair_request(
+        &mut self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        let request: crate::PairRequest = serde_json::from_value(value)?;
+        if request.peer_id != connection.peer_id() {
+            return Err(Error::Authentication(
+                "pair request differs from transport".into(),
+            ));
+        }
+        fs::create_dir_all(&self.pending_pair_dir)?;
+        fs::create_dir_all(&self.approved_pair_dir)?;
+        let pending_count = fs::read_dir(&self.pending_pair_dir)?.count();
+        if pending_count >= MAX_PENDING_PAIRS {
+            return Err(Error::authz("too many pending pair requests"));
+        }
+        let pending_path = self.pending_pair_dir.join(request.peer_id.to_hex());
+        let approved_path = self.approved_pair_dir.join(request.peer_id.to_hex());
+        fs::write(&pending_path, abra_core::canonical::to_vec(&request)?)?;
+        let approved = if self.auto_confirm_pairs {
+            true
+        } else {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+            loop {
+                if approved_path.exists() {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let error = ProtocolError {
+                        message_type: "error".into(),
+                        code: "untrusted".into(),
+                        message: "pairing confirmation timed out".into(),
+                    };
+                    let (send, _) = connection.control_mut();
+                    write_frame(send, &error).await?;
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        let accept = self.trust.accept_pair_request(
+            &request,
+            connection.peer_id(),
+            now,
+            self.auto_confirm_pairs,
+            |_, _| approved,
+        );
+        let _ = fs::remove_file(&pending_path);
+        let _ = fs::remove_file(&approved_path);
+        let accept = accept?;
+        let (send, _) = connection.control_mut();
+        write_frame(send, &accept).await?;
+        Ok(())
+    }
+
+    async fn handle_enroll_bind(
+        &mut self,
+        connection: &mut Connection,
+        value: serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        let bind: crate::EnrollBind = serde_json::from_value(value)?;
+        let secret = self.store.keys.identity.secret_bytes();
+        let issuer = Identity::from_secret_bytes(&secret);
+        let certificate = self
+            .trust
+            .bind_enrollment(&bind, connection.peer_id(), now, &issuer)?;
+        let mesh = self
+            .trust
+            .peers()
+            .values()
+            .filter(|peer| {
+                peer.role == crate::Role::Full
+                    || self.trust.mesh_profile() == crate::MeshProfile::Fleet
+            })
+            .map(|peer| crate::EnrollMeshPeer {
+                peer_id: peer.peer_id,
+                name: peer.name.clone(),
+                role: peer.role.clone(),
+                x25519_pk: peer.x25519_pk,
+                token_id: peer.token_id.clone(),
+                scopes: peer.scopes.clone(),
+                expires_at: peer.expires_at.clone(),
+            })
+            .collect();
+        let reply = crate::EnrollOk {
+            message_type: "enroll-ok".into(),
+            mesh,
+            certificate,
+            mesh_profile: self.trust.mesh_profile(),
+        };
+        let (send, _) = connection.control_mut();
+        write_frame(send, &reply).await?;
+        Ok(())
     }
 
     fn adopt_offer_capsule_state(&mut self, offer: &Offer, now: u64) -> Result<bool> {
@@ -1840,9 +1994,58 @@ impl DeliveryNode {
         )?)
     }
 
-    fn retry_pending_main_labels(&mut self, capsule_id: Hash, now: u64) {
-        let Some(pending) = self.pending_main_labels.remove(&capsule_id) else {
-            return;
+    fn pending_main_labels_lock(&self) -> Result<fs::File> {
+        if let Some(parent) = self.pending_main_labels_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut lock_name: OsString = self.pending_main_labels_path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(lock_name))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        Ok(lock)
+    }
+
+    fn read_pending_main_labels(&self) -> Result<BTreeMap<Hash, Vec<LabelOp>>> {
+        match fs::read(&self.pending_main_labels_path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn save_pending_main_labels(&self, pending: &BTreeMap<Hash, Vec<LabelOp>>) -> Result<()> {
+        abra_core::atomic_write(
+            &self.pending_main_labels_path,
+            &abra_core::canonical::to_vec(pending)?,
+        )?;
+        Ok(())
+    }
+
+    fn insert_pending_main_label(&mut self, capsule_id: Hash, op: LabelOp) -> Result<()> {
+        let lock = self.pending_main_labels_lock()?;
+        let mut pending_labels = self.read_pending_main_labels()?;
+        let pending = pending_labels.entry(capsule_id).or_default();
+        if pending.len() < MAX_LEASE_CHAIN_LEN && !pending.iter().any(|old| old.sig == op.sig) {
+            pending.push(op);
+        }
+        self.save_pending_main_labels(&pending_labels)?;
+        fs2::FileExt::unlock(&lock)?;
+        self.pending_main_labels = pending_labels;
+        Ok(())
+    }
+
+    fn retry_pending_main_labels(&mut self, capsule_id: Hash, now: u64) -> Result<()> {
+        let lock = self.pending_main_labels_lock()?;
+        let mut pending_labels = self.read_pending_main_labels()?;
+        let Some(pending) = pending_labels.remove(&capsule_id) else {
+            fs2::FileExt::unlock(&lock)?;
+            self.pending_main_labels = pending_labels;
+            return Ok(());
         };
         let mut still_pending = Vec::new();
         for op in pending {
@@ -1851,8 +2054,38 @@ impl DeliveryNode {
             }
         }
         if !still_pending.is_empty() {
-            self.pending_main_labels.insert(capsule_id, still_pending);
+            pending_labels.insert(capsule_id, still_pending);
         }
+        self.save_pending_main_labels(&pending_labels)?;
+        fs2::FileExt::unlock(&lock)?;
+        self.pending_main_labels = pending_labels;
+        Ok(())
+    }
+}
+
+fn native_blobs(raw: &RawManifest) -> BTreeSet<Hash> {
+    raw.manifest()
+        .native
+        .iter()
+        .flatten()
+        .map(|object| object.blob)
+        .collect()
+}
+
+/// Relay arrivals are tagged with `via`; direct arrivals carry the capsule and
+/// scope fields the daemon's event feed already reads.
+fn arrival_event(offer: &Offer, ack: &Ack, from: PeerId, via: Via) -> serde_json::Value {
+    let event = if offer.scope == Scope::Full {
+        "capsule-sync"
+    } else {
+        "inbox-arrival"
+    };
+    if via == Via::Relay {
+        serde_json::json!({"event":event,"snapshot_id":ack.snapshot_id,"from":from,"at":ack.received_at,"via":via.as_str()})
+    } else if offer.scope == Scope::Full {
+        serde_json::json!({"event":event,"snapshot_id":ack.snapshot_id,"capsule_id":offer.capsule_id,"scope":"full","from":from,"at":ack.received_at})
+    } else {
+        serde_json::json!({"event":event,"snapshot_id":ack.snapshot_id,"scope":"partial","from":from,"at":ack.received_at})
     }
 }
 
@@ -1882,37 +2115,45 @@ fn winning_lease_chain(capsule: &abra_core::capsule::Capsule) -> Vec<LeaseRecord
 
 async fn read_value(connection: &mut Connection) -> Result<serde_json::Value> {
     let (_, recv) = connection.control_mut();
-    tokio::time::timeout(HEALTH_TIMEOUT, read_frame(recv))
-        .await
-        .map_err(|_| Error::Timeout)?
-}
-
-pub fn add_capsule_from_peer(
-    receiver: &mut DeliveryNode,
-    genesis: Genesis,
-    grant: LeaseRecord,
-) -> Result<()> {
-    receiver.store.add_capsule(genesis, grant)?;
-    Ok(())
-}
-
-pub fn object_kind(bytes: &[u8]) -> crate::framing::ObjectKind {
-    if Tree::decode(bytes).is_ok() {
-        crate::framing::ObjectKind::Tree
-    } else {
-        crate::framing::ObjectKind::Blob
-    }
+    crate::framing::read_frame_timeout(recv, HEALTH_TIMEOUT).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_relay_object_bytes, exceeds_storage_quota, sanitize_rejection_reason,
-        update_object_hasher, wanted_plan_object, DeliveryNode, PlanObject, MAX_OBJECT_SIZE,
-        MAX_REJECTION_REASON_CHARS, STREAMING_THRESHOLD,
+        add_relay_object_bytes, append_event, exceeds_storage_quota, sanitize_rejection_reason,
+        update_object_hasher, wanted_plan_object, DeliveryNode, PlanObject, MAX_EVENT_LOG_BYTES,
+        MAX_OBJECT_SIZE, MAX_REJECTION_REASON_CHARS, STREAMING_THRESHOLD,
     };
     use abra_core::cas::Hash;
     use std::fs;
+
+    #[test]
+    fn concurrent_event_appends_keep_every_fresh_line() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("net")).unwrap();
+        fs::write(
+            root.path().join("net/events.ndjson"),
+            vec![b'x'; MAX_EVENT_LOG_BYTES as usize],
+        )
+        .unwrap();
+        let root_a = root.path().to_path_buf();
+        let root_b = root.path().to_path_buf();
+        let first = std::thread::spawn(move || {
+            append_event(&root_a, &serde_json::json!({"event":"first","at":"now"})).unwrap();
+        });
+        let second = std::thread::spawn(move || {
+            append_event(&root_b, &serde_json::json!({"event":"second","at":"now"})).unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+        let text = fs::read_to_string(root.path().join("net/events.ndjson")).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
+    }
 
     #[test]
     fn received_rejection_reason_is_printable_and_bounded() {

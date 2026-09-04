@@ -12,26 +12,20 @@ default = ["iroh", "tcp"]
 iroh = ["abra-net/iroh"]
 tcp = ["abra-net/tcp"]
 
-[[bin]]
-name = "cadabra"
-path = "src/main.rs"
-
 [dependencies]
 abra-core.workspace = true
 abra-net = { path = "../abra-net", default-features = false }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "signal", "process"] }
+tokio = { workspace = true, features = ["net", "process"] }
 rand.workspace = true
 hex.workspace = true
 fs2 = "0.4"
 rustix = { version = "1", features = ["fs", "process"] }
-clap.workspace = true
 tempfile.workspace = true
 data-encoding.workspace = true
 abra-relay = { path = "../abra-relay" }
 
 [dev-dependencies]
 tempfile.workspace = true
-assert_cmd = "2"
-predicates = "3"

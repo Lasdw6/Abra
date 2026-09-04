@@ -1,4 +1,5 @@
 use crate::Result;
+use abra_core::cas::Hash;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +26,10 @@ pub struct AdapterManifest {
     pub version: String,
     pub kinds: Vec<String>,
     pub verbs: Vec<String>,
+    /// Capsule kinds this adapter answers `control` for. A capsule kind is the
+    /// `kind` of its genesis, so it is usually not one of `kinds`.
+    #[serde(default)]
+    pub controls: Vec<String>,
     #[serde(default)]
     pub executable: Option<String>,
 }
@@ -34,38 +39,100 @@ pub struct AdapterRegistration {
     pub manifest: AdapterManifest,
     pub directory: PathBuf,
     pub executable: PathBuf,
+    /// Where this registration came from: `root`, `registry`, `flag`, or `env`.
+    pub source: &'static str,
+}
+
+impl AdapterRegistration {
+    pub fn supports(&self, verb: &str) -> bool {
+        self.manifest.verbs.iter().any(|x| x == verb)
+    }
+}
+
+/// A discovery directory supplied for one daemon process only. It is either an
+/// adapter directory or a parent whose immediate children are adapter
+/// directories. Nothing here is persisted.
+#[derive(Clone, Debug)]
+pub struct ExtraAdapterDir {
+    pub path: PathBuf,
+    pub source: &'static str,
+}
+
+impl ExtraAdapterDir {
+    pub fn flag(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            source: "flag",
+        }
+    }
+    pub fn env(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            source: "env",
+        }
+    }
+    /// Colon-separated `ABRA_ADAPTERS`, in the order it is written.
+    pub fn from_env() -> Vec<Self> {
+        let Some(value) = std::env::var_os("ABRA_ADAPTERS") else {
+            return Vec::new();
+        };
+        std::env::split_paths(&value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Self::env)
+            .collect()
+    }
 }
 
 #[derive(Debug)]
 pub struct AdapterRegistry {
-    by_kind: BTreeMap<String, AdapterRegistration>,
     by_name: BTreeMap<String, AdapterRegistration>,
+    /// Kind claim to adapter name; registrations are stored once, by name.
+    kinds: BTreeMap<String, String>,
+    /// Capsule kind to the adapter that handles `control` for it.
+    controls: BTreeMap<String, String>,
     errors: Vec<String>,
 }
 
 impl AdapterRegistry {
     pub fn discover(root: &Path) -> Result<Self> {
+        Self::discover_with(root, &[])
+    }
+    /// `extra` joins `<root>/adapters/*` and the persisted registry for this
+    /// process only; the first source that names a directory owns it.
+    pub fn discover_with(root: &Path, extra: &[ExtraAdapterDir]) -> Result<Self> {
         let adapters = root.join("adapters");
-        let mut dirs = Vec::new();
+        let mut errors = Vec::new();
+        let mut dirs: BTreeMap<PathBuf, &'static str> = BTreeMap::new();
         if let Ok(entries) = fs::read_dir(&adapters) {
             for entry in entries {
                 let path = entry?.path();
                 if path.is_dir() {
-                    dirs.push(path);
+                    dirs.entry(path).or_insert("root");
                 }
             }
         }
         let registry = adapters.join("registry.json");
         if let Ok(bytes) = fs::read(registry) {
-            dirs.extend(serde_json::from_slice::<Vec<PathBuf>>(&bytes)?);
+            for path in serde_json::from_slice::<Vec<PathBuf>>(&bytes)? {
+                dirs.entry(path).or_insert("registry");
+            }
         }
-        dirs.sort();
-        dirs.dedup();
-        let mut by_kind = BTreeMap::new();
+        for entry in extra {
+            match expand_adapter_dir(&entry.path) {
+                Ok(paths) => {
+                    for path in paths {
+                        dirs.entry(path).or_insert(entry.source);
+                    }
+                }
+                Err(error) => errors.push(format!("{}: {error}", entry.path.display())),
+            }
+        }
         let mut by_name = BTreeMap::new();
-        let mut errors = Vec::new();
+        let mut kinds = BTreeMap::new();
+        let mut controls: BTreeMap<String, String> = BTreeMap::new();
         let mut ambiguous_kinds = std::collections::BTreeSet::new();
-        for directory in dirs {
+        let mut ambiguous_controls = std::collections::BTreeSet::new();
+        for (directory, source) in dirs {
             let (manifest, executable) = match load_registration(&directory) {
                 Ok(value) => value,
                 Err(error) => {
@@ -73,38 +140,60 @@ impl AdapterRegistry {
                     continue;
                 }
             };
-            let registration = AdapterRegistration {
-                manifest: manifest.clone(),
-                directory,
-                executable,
-            };
             if by_name.contains_key(&manifest.name) {
                 errors.push(format!("duplicate adapter name {}", manifest.name));
                 continue;
             }
-            if let Some((kind, other)) = manifest.kinds.iter().find_map(|kind| {
-                by_kind
-                    .get(kind)
-                    .map(|other: &AdapterRegistration| (kind, other))
-            }) {
+            if let Some((kind, other)) = manifest
+                .kinds
+                .iter()
+                .find_map(|kind| kinds.get(kind).map(|other: &String| (kind, other)))
+            {
                 errors.push(format!(
-                    "duplicate adapter kind claim {kind}: {} and {}",
-                    other.manifest.name, manifest.name
+                    "duplicate adapter kind claim {kind}: {other} and {}",
+                    manifest.name
                 ));
                 ambiguous_kinds.insert(kind.clone());
-                by_kind.remove(kind);
+                kinds.remove(kind);
                 continue;
             }
-            by_name.insert(manifest.name.clone(), registration.clone());
+            if let Some((kind, other)) = manifest
+                .controls
+                .iter()
+                .find_map(|kind| controls.get(kind).map(|other: &String| (kind, other)))
+            {
+                errors.push(format!(
+                    "duplicate adapter control claim {kind}: {other} and {}",
+                    manifest.name
+                ));
+                ambiguous_controls.insert(kind.clone());
+                controls.remove(kind);
+                continue;
+            }
             for kind in &manifest.kinds {
                 if !ambiguous_kinds.contains(kind) {
-                    by_kind.insert(kind.clone(), registration.clone());
+                    kinds.insert(kind.clone(), manifest.name.clone());
                 }
             }
+            for kind in &manifest.controls {
+                if !ambiguous_controls.contains(kind) {
+                    controls.insert(kind.clone(), manifest.name.clone());
+                }
+            }
+            by_name.insert(
+                manifest.name.clone(),
+                AdapterRegistration {
+                    manifest,
+                    directory,
+                    executable,
+                    source,
+                },
+            );
         }
         Ok(Self {
-            by_kind,
             by_name,
+            kinds,
+            controls,
             errors,
         })
     }
@@ -112,29 +201,47 @@ impl AdapterRegistry {
         json!({"adapters":self.by_name.values().collect::<Vec<_>>(),"errors":self.errors})
     }
     pub fn for_kind(&self, kind: &str) -> Option<&AdapterRegistration> {
-        self.by_kind.get(kind)
+        self.by_name.get(self.kinds.get(kind)?)
+    }
+    /// The adapter that declared `controls` for this capsule kind.
+    pub fn for_control(&self, kind: &str) -> Option<&AdapterRegistration> {
+        self.by_name.get(self.controls.get(kind)?)
     }
     pub fn remove(root: &Path, name: &str) -> Result<()> {
         let registry = Self::discover(root)?;
-        let target = registry
+        let registration = registry
             .by_name
             .get(name)
-            .ok_or("adapter is not registered")?
-            .directory
-            .clone();
+            .ok_or("adapter is not registered")?;
+        if registration.source == "flag" || registration.source == "env" {
+            return Err(format!(
+                "adapter {name} comes from --adapters/ABRA_ADAPTERS and is not persisted"
+            )
+            .into());
+        }
+        let target = registration.directory.clone();
         update_registry(root, |dirs| dirs.retain(|d| d != &target))
     }
-    pub fn add(root: &Path, directory: &Path) -> Result<()> {
+    pub fn add(root: &Path, directory: &Path, extra: &[ExtraAdapterDir]) -> Result<()> {
         let directory = fs::canonicalize(directory)?;
         let (manifest, _) = load_registration(&directory)?;
-        let existing = Self::discover(root)?;
+        let existing = Self::discover_with(root, extra)?;
         if existing.by_name.contains_key(&manifest.name) {
             return Err(format!("duplicate adapter name {}", manifest.name).into());
         }
         for kind in &manifest.kinds {
-            if let Some(other) = existing.by_kind.get(kind) {
+            if let Some(other) = existing.for_kind(kind) {
                 return Err(format!(
                     "duplicate adapter kind claim {kind}: {} and {}",
+                    other.manifest.name, manifest.name
+                )
+                .into());
+            }
+        }
+        for kind in &manifest.controls {
+            if let Some(other) = existing.for_control(kind) {
+                return Err(format!(
+                    "duplicate adapter control claim {kind}: {} and {}",
                     other.manifest.name, manifest.name
                 )
                 .into());
@@ -193,10 +300,92 @@ impl AdapterRegistry {
         options: &BTreeMap<String, String>,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        self.import_with_workspace(
+            kind,
+            payload,
+            materialized_files,
+            destination,
+            None,
+            options,
+            timeout,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_with_workspace(
+        &self,
+        kind: &str,
+        payload: Value,
+        materialized_files: Option<&Path>,
+        destination: Value,
+        workspace: Option<&Path>,
+        options: &BTreeMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let adapter = self.for_kind(kind).ok_or("adapter disappeared")?;
         require_verb(adapter, "import")?;
-        invoke(adapter, json!({"verb":"import","kind":kind,"payload":payload,"materialized_files":materialized_files,"destination":destination,"options":options}), timeout).await
+        invoke(adapter, json!({"verb":"import","kind":kind,"payload":payload,"materialized_files":materialized_files,"destination":destination,"workspace":workspace,"options":options}), timeout).await
     }
+    /// Read-only pre-flight for a `send`. The response carries `warnings` and
+    /// `blocked` lists the daemon acts on; the adapter moves nothing.
+    pub async fn inspect(
+        &self,
+        kind: &str,
+        source: Value,
+        options: &BTreeMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let adapter = self
+            .for_kind(kind)
+            .ok_or_else(|| format!("no adapter registered for kind {kind}"))?;
+        require_verb(adapter, "inspect")?;
+        invoke(
+            adapter,
+            json!({"verb":"inspect","kind":kind,"source":source,"options":options}),
+            timeout,
+        )
+        .await
+    }
+    /// Hand a verified control message to the adapter that claims the capsule
+    /// kind. The value it returns is what the sender sees in the control ack.
+    pub async fn control(
+        &self,
+        request: &ControlRequest,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let adapter = self
+            .for_control(&request.kind)
+            .ok_or_else(|| format!("no adapter handles control for {}", request.kind))?;
+        require_verb(adapter, "control")?;
+        let mut value = serde_json::to_value(request)?;
+        value["verb"] = json!("control");
+        invoke(adapter, value, timeout).await
+    }
+}
+
+/// The `control` request body, exactly as the adapter receives it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ControlRequest {
+    /// The capsule's kind, not an adapter payload kind.
+    pub kind: String,
+    pub capsule_id: Hash,
+    /// `pause`, `stop`, or `instruct`.
+    pub op: String,
+    pub text: Option<String>,
+    /// Where this device last materialized the capsule, when it knows.
+    pub workspace: Option<PathBuf>,
+    pub options: BTreeMap<String, String>,
+}
+
+/// What an `inspect` response says about a source the daemon is about to send.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct InspectResult {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<Value>,
+    #[serde(default)]
+    pub blocked: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,8 +394,18 @@ pub struct ExportResult {
     pub files_path: Option<PathBuf>,
     #[serde(default)]
     pub floor: Option<Floor>,
+    /// Optional back-reference the adapter derived itself; the daemon copies it
+    /// into the partial manifest's `provenance`.
+    #[serde(default)]
+    pub provenance: Option<ExportProvenance>,
     #[serde(skip)]
     pub staging: Option<tempfile::TempDir>,
+}
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct ExportProvenance {
+    pub capsule_id: Hash,
+    #[serde(alias = "snapshot_hash")]
+    pub snapshot_id: Hash,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Floor {
@@ -215,6 +414,28 @@ pub struct Floor {
     pub link: Option<String>,
     pub thumbnail_path: Option<PathBuf>,
 }
+
+#[derive(Debug, Deserialize)]
+struct AdapterErrorBody {
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+pub struct AdapterError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AdapterError {}
 
 fn resolve_executable(dir: &Path, manifest: &AdapterManifest) -> Result<PathBuf> {
     let candidate = manifest
@@ -261,6 +482,28 @@ fn update_registry(root: &Path, mutate: impl FnOnce(&mut Vec<PathBuf>)) -> Resul
     fs::write(path, serde_json::to_vec(&dirs)?)?;
     Ok(())
 }
+/// An entry is an adapter directory, or a parent of adapter directories.
+fn expand_adapter_dir(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.join("abra-adapter.json").is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !path.is_dir() {
+        return Err("adapter path is not a directory".into());
+    }
+    let mut children = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let child = entry?.path();
+        if child.join("abra-adapter.json").is_file() {
+            children.push(child);
+        }
+    }
+    if children.is_empty() {
+        return Err("directory holds no abra-adapter.json and no adapter children".into());
+    }
+    children.sort();
+    Ok(children)
+}
+
 fn confined(root: &Path, path: &Path) -> Result<()> {
     let absolute = if path.is_absolute() {
         path.to_owned()
@@ -297,6 +540,11 @@ async fn invoke(
     mut request: Value,
     timeout: Option<Duration>,
 ) -> Result<Value> {
+    let verb = request
+        .get("verb")
+        .and_then(Value::as_str)
+        .ok_or("adapter request lacks verb")?
+        .to_owned();
     let mut id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut id);
     let request_id = hex::encode(id);
@@ -328,22 +576,45 @@ async fn invoke(
             return Err("adapter response request_id mismatch".into());
         }
         if response.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(format!(
-                "adapter error: {}",
-                response.get("error").unwrap_or(&Value::Null)
-            )
-            .into());
+            let error: AdapterErrorBody = serde_json::from_value(
+                response
+                    .get("error")
+                    .cloned()
+                    .ok_or("adapter failure response lacks error")?,
+            )?;
+            return Err(Box::new(AdapterError {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+            }) as Box<dyn std::error::Error + Send + Sync>);
         }
-        Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(
-            response.get("result").cloned().unwrap_or_else(|| {
-                let mut x = response;
-                if let Some(o) = x.as_object_mut() {
-                    o.remove("request_id");
-                    o.remove("ok");
+        let mut fields = response
+            .as_object()
+            .cloned()
+            .ok_or("adapter response must be an object")?;
+        fields.remove("request_id");
+        fields.remove("ok");
+        let value = Value::Object(fields);
+        let normalized = match verb.as_str() {
+            "export" => {
+                if !value.get("payload").is_some_and(Value::is_object) {
+                    return Err("adapter export response requires an object payload".into());
                 }
-                x
-            }),
-        )
+                value
+            }
+            "import" | "control" => value
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("adapter {verb} response requires result"))?,
+            "inspect" => {
+                if value.get("result").is_some() {
+                    return Err("adapter inspect response must use flat fields".into());
+                }
+                serde_json::to_value(serde_json::from_value::<InspectResult>(value)?)?
+            }
+            _ => return Err(format!("unsupported adapter response verb: {verb}").into()),
+        };
+        Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(normalized)
     };
     match tokio::time::timeout(timeout.unwrap_or(DEFAULT_TIMEOUT), operation).await {
         Ok(result) => {
@@ -446,7 +717,7 @@ mod tests {
             "a",
             "a",
             "com.test.escape",
-            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":true,"result":{"payload":{},"files_path":"/tmp"}}\n' "$id""#,
+            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":true,"payload":{},"files_path":"/tmp"}\n' "$id""#,
         );
         let registry = AdapterRegistry::discover(escape.path()).unwrap();
         assert!(registry
@@ -461,6 +732,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("escapes"));
+
+        let wrapped = tempfile::tempdir().unwrap();
+        adapter(
+            wrapped.path(),
+            "a",
+            "a",
+            "com.test.wrapped",
+            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":true,"result":{"payload":{},"files_path":null}}\n' "$id""#,
+        );
+        let registry = AdapterRegistry::discover(wrapped.path()).unwrap();
+        assert!(registry
+            .export(
+                "com.test.wrapped",
+                json!("x"),
+                &BTreeMap::new(),
+                wrapped.path(),
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("object payload"));
+
+        let failed = tempfile::tempdir().unwrap();
+        adapter(
+            failed.path(),
+            "a",
+            "a",
+            "com.test.failed",
+            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":false,"error":{"code":"busy","message":"try later","retryable":true}}\n' "$id""#,
+        );
+        let registry = AdapterRegistry::discover(failed.path()).unwrap();
+        let error = registry
+            .export(
+                "com.test.failed",
+                json!("x"),
+                &BTreeMap::new(),
+                failed.path(),
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap_err();
+        let adapter_error = error.downcast_ref::<AdapterError>().unwrap();
+        assert_eq!(adapter_error.code, "busy");
+        assert_eq!(adapter_error.message, "try later");
+        assert!(adapter_error.retryable);
+        assert_eq!(adapter_error.to_string(), "busy: try later");
     }
     #[tokio::test]
     async fn reference_folder_export_and_import() {
@@ -473,6 +791,7 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../adapters/reference-folder"
             )),
+            &[],
         )
         .unwrap();
         let registry = AdapterRegistry::discover(root.path()).unwrap();
@@ -506,6 +825,34 @@ mod tests {
             fs::read(destination.path().join("hello")).unwrap(),
             b"world"
         );
+        let inspected = registry
+            .inspect(
+                "dev.abra.folder",
+                json!(source.path()),
+                &BTreeMap::new(),
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspected["summary"], json!("1 files"));
+        assert_eq!(inspected["warnings"], json!([]));
+        assert_eq!(inspected["blocked"], json!([]));
+        let controlled = registry
+            .control(
+                &ControlRequest {
+                    kind: "dev.abra.workspace".into(),
+                    capsule_id: Hash::from_bytes([7; 32]),
+                    op: "instruct".into(),
+                    text: Some("continue".into()),
+                    workspace: Some(destination.path().to_owned()),
+                    options: BTreeMap::new(),
+                },
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(controlled["op"], json!("instruct"));
+        assert_eq!(controlled["workspace"], json!(destination.path()));
     }
 
     #[tokio::test]
@@ -518,7 +865,7 @@ mod tests {
             "capture",
             "com.test.capture",
             &format!(
-                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"result":{{"payload":{{}},"files_path":null}}}}\n' "$id""#,
+                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"payload":{{}},"files_path":null}}\n' "$id""#,
                 captured.display()
             ),
         );
@@ -567,11 +914,12 @@ mod tests {
         );
         let registry = AdapterRegistry::discover(root.path()).unwrap();
         registry
-            .import(
+            .import_with_workspace(
                 "com.test.import",
                 json!({}),
                 None,
                 json!({"profile":"work"}),
+                Some(Path::new("/work/demo")),
                 &BTreeMap::from([("merge".into(), "true".into())]),
                 Some(Duration::from_secs(1)),
             )
@@ -579,7 +927,27 @@ mod tests {
             .unwrap();
         let request: Value = serde_json::from_slice(&fs::read(captured).unwrap()).unwrap();
         assert_eq!(request["destination"], json!({"profile":"work"}));
+        assert_eq!(request["workspace"], json!("/work/demo"));
         assert_eq!(request["options"], json!({"merge":"true"}));
+    }
+
+    #[test]
+    fn two_adapters_claiming_one_control_kind_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            let path = root.path().join("adapters").join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("abra-adapter.json"),serde_json::to_vec(&json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"controls":["dev.abra.workspace"],"verbs":["control"],"executable":"run"})).unwrap()).unwrap();
+            let executable = path.join("run");
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let registry = AdapterRegistry::discover(root.path()).unwrap();
+        assert!(registry.for_control("dev.abra.workspace").is_none());
+        assert!(registry
+            .errors
+            .iter()
+            .any(|error| error.contains("duplicate adapter control claim")));
     }
 
     #[test]

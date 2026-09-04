@@ -14,7 +14,7 @@ pub use auth::*;
 pub use control::*;
 pub use delivery::*;
 pub use error::{Error, Result};
-pub use framing::{read_frame, write_frame};
+pub use framing::{read_frame, read_frame_timeout, write_frame};
 pub use outbox::*;
 pub use relay::*;
 pub use transport::*;

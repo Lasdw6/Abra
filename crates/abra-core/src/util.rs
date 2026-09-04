@@ -1,6 +1,29 @@
-//! Small shared helpers: hex, time.
+//! Small shared helpers: hex, time, durable writes.
 
 use crate::error::{Error, Result};
+use std::{fs, io::Write, path::Path};
+
+/// Writes `bytes` to `path` so readers only ever see the old or the new file:
+/// a fresh temporary file in the same directory, fsynced, renamed into place,
+/// then the parent directory fsynced so the rename itself survives a crash.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::invalid("path has no parent directory"))?;
+    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    let tmp = parent.join(format!(".tmp-{}", rand::random::<u64>()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| Error::io(&tmp, e))?;
+    file.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
+    file.sync_all().map_err(|e| Error::io(&tmp, e))?;
+    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| Error::io(parent, e))
+}
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     hex::encode(bytes)

@@ -5,6 +5,7 @@ use crate::{
     cas::{BlobStore, Hash},
     identity::{DeviceKeys, Identity, PeerId},
     manifest::{RawManifest, Scope},
+    util::atomic_write,
     Error, Result,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -13,7 +14,6 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -24,11 +24,6 @@ pub struct InboxEntry {
     pub from: String,
     pub received_at: String,
     pub read: bool,
-}
-#[derive(Clone, Debug)]
-pub struct OutboxEntry {
-    pub snapshot_id: Hash,
-    pub manifest: Vec<u8>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +49,6 @@ pub struct AbraStore {
     pub keys: DeviceKeys,
     pub capsules: BTreeMap<Hash, Capsule>,
     pub inbox: BTreeMap<Hash, InboxEntry>,
-    pub outbox: BTreeMap<Hash, OutboxEntry>,
 }
 impl AbraStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -113,7 +107,6 @@ impl AbraStore {
             keys,
             capsules: BTreeMap::new(),
             inbox: BTreeMap::new(),
-            outbox: BTreeMap::new(),
         };
         store.reload();
         Ok(store)
@@ -508,22 +501,4 @@ fn label_path(dir: &Path, op: &LabelOp) -> PathBuf {
         op.seq,
         Hash::of(&op.sig.to_bytes())
     ))
-}
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid("record path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    let tmp = parent.join(format!(".tmp-{}", rand::random::<u64>()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| Error::io(&tmp, e))?;
-    file.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
-    file.sync_all().map_err(|e| Error::io(&tmp, e))?;
-    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
-    fs::File::open(parent)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| Error::io(parent, e))
 }

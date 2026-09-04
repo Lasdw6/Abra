@@ -10,7 +10,7 @@ import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } fro
 import { capture, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
-import { allowedDomain, canonical, filterState, loadBundle, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
+import { allowedDomain, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
 import { createFacade } from '../facade/server.js';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -94,9 +94,12 @@ test('storage projection preserves partitioning and does not invent SameSite', (
   assert.equal(projected.cookies[0].partitionKey,'https://top.test');assert.equal(projected.cookies[0].sameSite,'None');assert.equal('sameSite' in projected.cookies[1],false);
 });
 
-test('DBSC heuristic remains explicitly heuristic and preserves flagged cookie', async () => {
+test('device-bound cookies are omitted from bundles and rejected during import filtering', async () => {
   const dir=await mkdtemp(path.join(os.tmpdir(),'abra-dbsc-')),state={cookies:[{name:'__Host-session',value:'secret',domain:'accounts.google.com',secure:true,httpOnly:true}],origins:[],tabs:[]},manifest=await saveBundle(dir,state);
-  assert.equal(manifest.non_teleportable[0].heuristic,true);assert.equal((await loadBundle(dir)).state.cookies[0].value,'secret');assert.match(summary(manifest),/heuristic/);
+  assert.equal(manifest.non_teleportable[0].heuristic,true);assert.equal(manifest.non_teleportable[0].action,'omitted');assert.equal((await loadBundle(dir)).state.cookies.length,0);assert.doesNotMatch(await readFile(path.join(dir,'storage_state.json'),'utf8'),/secret/);assert.match(summary(manifest),/heuristic/);
+  assert.equal(filterState(state).cookies.length,0);
+  assert.deepEqual(nonPortableCookieReasons({name:'device_bound_session',domain:'example.com',secure:true,httpOnly:true}),['device-bound cookie name and security attributes']);
+  assert.equal(nonPortableCookieReasons({name:'user_session',domain:'example.com',secure:true,httpOnly:true}).length,0);
 });
 
 test('adapter dispatches string and object export sources over NDJSON', async () => {

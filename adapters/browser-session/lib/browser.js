@@ -16,6 +16,17 @@ const CAPTURE_SCRIPT = `(() => {
   return {origin:location.origin, localStorage:entries(localStorage), sessionStorage:entries(sessionStorage)};
 })()`;
 
+const MEDIA_CAPTURE_SCRIPT = `(() => {
+  const media=[...document.querySelectorAll('video,audio')].find(item=>!item.paused)||document.querySelector('video,audio');
+  return media ? {
+    currentTime: media.currentTime,
+    paused: media.paused,
+    playbackRate: media.playbackRate,
+    volume: media.volume,
+    muted: media.muted
+  } : null;
+})()`;
+
 const IDB_CAPTURE_SCRIPT = `(() => new Promise(async resolve => {
   const out={databases:[]};
   if (!indexedDB.databases) return resolve(out);
@@ -56,11 +67,13 @@ export async function capture(wsUrl, policy = {}, options = {}) {
           origins.set(basic.origin, { ...basic, indexedDB });
         }
         const title = await evalValue(cdp, session, 'document.title');
+        const url = await evalValue(cdp, session, 'location.href');
         const scroll = await evalValue(cdp, session, '({x:scrollX,y:scrollY,historyLength:history.length})');
-        tabs.push({ url: target.url, title, scroll });
+        const media = await evalValue(cdp, session, MEDIA_CAPTURE_SCRIPT).catch(() => null);
+        tabs.push({ url, title, scroll, ...(media ? { media } : {}) });
       } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
     }
-    return filterState({ cookies, origins: [...origins.values()], tabs }, policy.includes || [], policy.excludes || []);
+    return filterState({ cookies, origins: [...origins.values()], tabs }, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
   } finally { cdp.close(); }
 }
 

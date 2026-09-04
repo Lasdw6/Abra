@@ -91,10 +91,20 @@ function cookieAllowed(cookie, includes, excludes) {
   if (cookie.domain && excludes.some(denied => domainMatches(denied, host))) return false;
   return true;
 }
-export function filterState(state, includes = [], excludes = []) {
+const BOUND_SESSION_DOMAINS = ['accounts.google.com','google.com','googleapis.com','workspace.google.com','youtube.com'];
+export function nonPortableCookieReasons(cookie) {
+  const domain = cookieDomain(cookie);
+  const reasons = [];
+  if (BOUND_SESSION_DOMAINS.some(candidate => domainMatches(domain, candidate))) reasons.push('known device-bound session domain');
+  if (cookie.secure && cookie.httpOnly && /(^|[-_.])(?:dbsc|device[-_.]?bound|bound[-_.]?session)([-_.]|$)/i.test(cookie.name || '')) {
+    reasons.push('device-bound cookie name and security attributes');
+  }
+  return reasons;
+}
+export function filterState(state, includes = [], excludes = [], options = {}) {
   includes = includes.map(normalizeHost); excludes = excludes.map(normalizeHost);
   const originAllowed = origin => { try { const url = new URL(origin), h = normalizeHost(url.hostname); return ['http:','https:'].includes(url.protocol) && !isPublicSuffix(h) && allowedDomain(h, includes, excludes); } catch { return false; } };
-  return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
+  return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes) && (options.allowNonPortable || !nonPortableCookieReasons(c).length)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
 }
 
 export async function loadBundle(dir, options = {}) {
@@ -113,11 +123,16 @@ export async function loadManifest(dir, options = {}) {
 }
 export async function saveBundle(dir, state, metadata = {}) {
   await privateDir(dir);
-  const storageState = metadata.storageState || toStorageState(state);
-  await writeJson(path.join(dir, 'state.json'), state);
-  await writePrivate(path.join(dir, 'storage_state.json'), metadata.storageStateRaw !== undefined ? metadata.storageStateRaw : `${JSON.stringify(storageState, null, 2)}\n`);
-  const manifest = buildManifest(state, metadata);
-  manifest.state_sha256 = sha256(state); manifest.storage_state_sha256 = sha256(await readFile(path.join(dir, 'storage_state.json')));
+  const blockedCookies = (state.cookies || []).filter(cookie => nonPortableCookieReasons(cookie).length);
+  const portableState = { ...state, cookies: (state.cookies || []).filter(cookie => !nonPortableCookieReasons(cookie).length) };
+  const storageState = blockedCookies.length ? toStorageState(portableState) : metadata.storageState || toStorageState(portableState);
+  const storageStateRaw = blockedCookies.length || metadata.storageStateRaw === undefined
+    ? `${JSON.stringify(storageState, null, 2)}\n`
+    : metadata.storageStateRaw;
+  await writeJson(path.join(dir, 'state.json'), portableState);
+  await writePrivate(path.join(dir, 'storage_state.json'), storageStateRaw);
+  const manifest = buildManifest(portableState, { ...metadata, blockedCookies });
+  manifest.state_sha256 = sha256(portableState); manifest.storage_state_sha256 = sha256(await readFile(path.join(dir, 'storage_state.json')));
   const identity = metadata.identity || await signingIdentity();
   manifest.signature = signObject(manifest, identity, 'browser-session-manifest');
   await writeJson(path.join(dir, 'manifest.json'), manifest); return manifest;
@@ -125,12 +140,21 @@ export async function saveBundle(dir, state, metadata = {}) {
 export function toStorageState(state) {
   return { cookies: (state.cookies || []).map(c => Object.fromEntries(['name','value','domain','path','expires','httpOnly','secure','sameSite','partitionKey'].filter(k => c[k] !== undefined).map(k => [k,c[k]]))), origins: (state.origins || []).map(o => ({ origin:o.origin, localStorage:o.localStorage || [] })) };
 }
-const DBSC_DOMAINS = ['accounts.google.com','google.com','googleapis.com','workspace.google.com'];
-function dbscReasons(domain,cookies) { const r=[]; if(DBSC_DOMAINS.some(d=>domainMatches(domain,d)))r.push('known DBSC-capable domain'); if(cookies.some(c=>c.secure&&c.httpOnly&&/(^__Host-|^(bound|device|session|sid)([-_.]|$))/i.test(c.name)))r.push('Secure+HttpOnly session-name attribute hint'); return r; }
+function dbscReasons(domain,cookies) { const r=[]; if(BOUND_SESSION_DOMAINS.some(d=>domainMatches(domain,d)))r.push('known device-bound session domain'); if(cookies.some(c=>c.secure&&c.httpOnly&&/(^__Host-|^(bound|device|session|sid)([-_.]|$))/i.test(c.name)))r.push('Secure+HttpOnly session-name attribute hint'); return r; }
+function blockedCookieGroups(cookies) {
+  const groups = new Map();
+  for (const cookie of cookies || []) {
+    const domain = cookieDomain(cookie);
+    if (!groups.has(domain)) groups.set(domain, { domain, cookie_count: 0, reasons: new Set() });
+    const group = groups.get(domain); group.cookie_count++;
+    for (const reason of nonPortableCookieReasons(cookie)) group.reasons.add(reason);
+  }
+  return [...groups.values()].map(group => ({ domain: group.domain, cookie_count: group.cookie_count, reasons: [...group.reasons], heuristic: true, action: 'omitted' }));
+}
 function safeTabUrl(value) { try { const u=new URL(value); u.search=''; u.hash=''; return u.href; } catch { return ''; } }
 export function buildManifest(state, metadata={}) {
   const groups=new Map(); for(const c of state.cookies||[]){const d=cookieDomain(c);if(!groups.has(d))groups.set(d,[]);groups.get(d).push(c);}
   const domains=[...groups].sort(([a],[b])=>a.localeCompare(b)).map(([domain,cookies])=>({domain,cookie_count:cookies.length,http_only_count:cookies.filter(c=>c.httpOnly).length,secure_count:cookies.filter(c=>c.secure).length}));
-  return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]}),cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
+  return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...blockedCookieGroups(metadata.blockedCookies),...[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]})],cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
 }
 export async function assertPrivateFile(file) { const mode=(await stat(file)).mode & 0o777; return mode === 0o600; }

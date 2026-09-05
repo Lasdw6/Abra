@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -10,7 +11,7 @@ import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } fro
 import { capture, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
-import { allowedDomain, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
+import { allowedDomain, assertPrivateFile, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
 import { createFacade } from '../facade/server.js';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -136,7 +137,7 @@ test('failed import cleanup reports a retained profile containing sender cookies
 test('adapter rejects invalid source and destination forms', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-adapter-validation-'));
   const exportBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export', options: {}, staging_dir: path.join(root, 'out') };
-  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', { type: 'cdp', cdp_url: 'http://127.0.0.1' }, { type: 'local' }].entries()) {
+  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', 'bundle:', { type: 'cdp', cdp_url: 'http://127.0.0.1' }, { type: 'local' }, { type: 'bundle' }].entries()) {
     const response = await adapterRequest({ ...exportBase, request_id: `c${index}`, source });
     assert.equal(response.error.code, 'invalid_request');
   }
@@ -317,4 +318,186 @@ test('Browser Use façade CRUD never returns cookie values', async t => {
   response = await fetch(`${base}/${created.id}`, { method: 'DELETE',headers }); assert.equal(response.status, 204);
   response = await fetch(`${base}/${created.id}`,{headers}); assert.equal(response.status, 404);
   response=await fetch(base,{method:'POST',headers,body:JSON.stringify({bundlePath:os.homedir()})});assert.equal(response.status,400);assert.equal(await response.text(),'{"error":"bad request"}');
+});
+
+async function runNode(script, args, env = process.env) {
+  const child = spawn(process.execPath, [path.resolve(script), ...args], { stdio: ['ignore', 'pipe', 'pipe'], env });
+  const stdout = [], stderr = [];
+  child.stdout.on('data', chunk => stdout.push(chunk));
+  child.stderr.on('data', chunk => stderr.push(chunk));
+  const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
+  return { code, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+}
+async function fixture(args) { const result = await runNode('bin/cdp-fixture.mjs', args); assert.equal(result.code, 0, result.stderr); return JSON.parse(result.stdout); }
+
+const SANDBOX_ORIGIN = 'http://127.0.0.1:8123';
+const SANDBOX_STATE = { cookies: [{ name: 'sid', value: 'alpha', domain: '127.0.0.1', path: '/' }], origins: [{ origin: SANDBOX_ORIGIN, localStorage: [{ name: 'k', value: 'v' }], sessionStorage: [], indexedDB: { databases: [] } }], tabs: [{ url: `${SANDBOX_ORIGIN}/marker.txt`, title: 'marker' }] };
+
+// Enough of a CDP browser (Target, Storage, Network, Page, Fetch, Runtime) to run
+// import and the fixture without Chrome. It speaks WebSocket by hand so the tests
+// stay dependency-free. Runtime.evaluate runs expressions in-process against fake
+// storage objects.
+class FakeStorage { setItem(name, value) { this[name] = String(value); } getItem(name) { return Object.hasOwn(this, name) ? this[name] : null; } removeItem(name) { delete this[name]; } clear() { for (const key of Object.keys(this)) delete this[key]; } }
+async function fakeCdp() {
+  const state = { cookies: [], contexts: new Set(), targets: new Map(), sessions: new Map(), intercepting: new Set(), stores: new Map(), calls: [] };
+  let seq = 0; const next = prefix => `${prefix}-${++seq}`;
+  const target = sessionId => { const t = state.targets.get(state.sessions.get(sessionId)); if (!t) throw new Error('No session'); return t; };
+  const storeFor = t => { const key = `${t.browserContextId}|${new URL(t.url).origin}`; if (!state.stores.has(key)) state.stores.set(key, { local: new FakeStorage(), session: new FakeStorage() }); return state.stores.get(key); };
+  const putCookie = (c, ctx) => {
+    const domain = c.domain || new URL(c.url).hostname, cookiePath = c.path || '/';
+    state.cookies = state.cookies.filter(x => !(x.ctx === ctx && x.name === c.name && x.domain === domain && x.path === cookiePath));
+    state.cookies.push({ ctx, name: c.name, value: c.value, domain, path: cookiePath, secure: Boolean(c.secure), httpOnly: Boolean(c.httpOnly), ...(c.sameSite ? { sameSite: c.sameSite } : {}), expires: c.expires ?? -1 });
+  };
+  const handlers = {
+    'Target.createBrowserContext': () => { const id = next('ctx'); state.contexts.add(id); return { browserContextId: id }; },
+    'Target.disposeBrowserContext': ({ browserContextId }) => { if (!state.contexts.delete(browserContextId)) throw new Error('Failed to find context'); for (const [id, t] of state.targets) if (t.browserContextId === browserContextId) state.targets.delete(id); state.cookies = state.cookies.filter(c => c.ctx !== browserContextId); return {}; },
+    'Target.getBrowserContexts': () => ({ browserContextIds: [...state.contexts] }),
+    'Target.createTarget': ({ url, browserContextId }) => { const id = next('target'); state.targets.set(id, { targetId: id, url, browserContextId: browserContextId || 'default' }); return { targetId: id }; },
+    'Target.getTargets': () => ({ targetInfos: [...state.targets.values()].map(t => ({ ...t, type: 'page', title: '', attached: false })) }),
+    'Target.attachToTarget': ({ targetId }) => { if (!state.targets.has(targetId)) throw new Error('No target'); const id = next('session'); state.sessions.set(id, targetId); return { sessionId: id }; },
+    'Target.detachFromTarget': ({ sessionId }) => { state.sessions.delete(sessionId); return {}; },
+    'Target.setAutoAttach': () => ({}), 'Page.enable': () => ({}), 'Page.reload': () => ({}), 'Network.enable': () => ({}), 'Fetch.fulfillRequest': () => ({}),
+    'Storage.getCookies': ({ browserContextId }) => ({ cookies: state.cookies.filter(c => c.ctx === (browserContextId || 'default')).map(({ ctx, ...c }) => c) }),
+    'Storage.setCookies': ({ cookies, browserContextId }) => { for (const c of cookies) putCookie(c, browserContextId || 'default'); return {}; },
+    'Network.setCookie': (params, sessionId) => { putCookie(params, target(sessionId).browserContextId); return { success: true }; },
+    'Fetch.enable': (_, sessionId) => { state.intercepting.add(sessionId); return {}; },
+    'Fetch.disable': (_, sessionId) => { state.intercepting.delete(sessionId); return {}; },
+    'Page.navigate': ({ url }, sessionId, emit) => { const t = target(sessionId); t.url = url; if (state.intercepting.has(sessionId)) setImmediate(() => emit('Fetch.requestPaused', { requestId: next('req'), request: { url } }, sessionId)); return { frameId: 'frame' }; },
+    'Runtime.evaluate': async ({ expression }, sessionId) => {
+      const t = target(sessionId), store = storeFor(t), url = new URL(t.url);
+      const scope = { localStorage: store.local, sessionStorage: store.session, location: { href: t.url, origin: url.origin, hostname: url.hostname }, document: { readyState: 'complete', title: '', querySelectorAll: () => [], querySelector: () => null }, indexedDB: { databases: async () => [], open() { throw new Error('no indexedDB in fake'); } }, history: { length: 1 }, scrollX: 0, scrollY: 0 };
+      try { const value = await new Function(...Object.keys(scope), `return (${expression});`)(...Object.values(scope)); return { result: { type: typeof value, value } }; }
+      catch (error) { return { result: { type: 'object' }, exceptionDetails: { text: error.message } }; }
+    }
+  };
+  const server = createServer((_, res) => { res.statusCode = 404; res.end(); });
+  server.on('upgrade', (req, socket) => {
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')}\r\n\r\n`);
+    const send = value => {
+      const body = Buffer.from(JSON.stringify(value)), len = body.length;
+      const head = len < 126 ? Buffer.from([0x81, len]) : len < 65536 ? Buffer.from([0x81, 126, len >> 8, len & 255]) : Buffer.concat([Buffer.from([0x81, 127]), (b => { b.writeBigUInt64BE(BigInt(len)); return b; })(Buffer.alloc(8))]);
+      if (!socket.destroyed) socket.write(Buffer.concat([head, body]));
+    };
+    const emit = (method, params, sessionId) => send({ method, params, ...(sessionId ? { sessionId } : {}) });
+    const handle = async msg => {
+      state.calls.push(msg.method);
+      try { const handler = handlers[msg.method]; if (!handler) throw new Error(`'${msg.method}' wasn't found`); send({ id: msg.id, result: await handler(msg.params || {}, msg.sessionId, emit) }); }
+      catch (error) { send({ id: msg.id, error: { message: error.message } }); }
+    };
+    let buffered = Buffer.alloc(0);
+    socket.on('data', chunk => {
+      buffered = Buffer.concat([buffered, chunk]);
+      while (buffered.length >= 2) {
+        const opcode = buffered[0] & 0x0f; let len = buffered[1] & 0x7f, offset = 2;
+        if (len === 126) { if (buffered.length < 4) return; len = buffered.readUInt16BE(2); offset = 4; }
+        else if (len === 127) { if (buffered.length < 10) return; len = Number(buffered.readBigUInt64BE(2)); offset = 10; }
+        if (buffered.length < offset + 4 + len) return;
+        const mask = buffered.subarray(offset, offset + 4), payload = Buffer.from(buffered.subarray(offset + 4, offset + 4 + len));
+        for (let i = 0; i < len; i++) payload[i] ^= mask[i & 3];
+        buffered = buffered.subarray(offset + 4 + len);
+        if (opcode === 8) { socket.end(); return; }
+        if (opcode === 1) handle(JSON.parse(payload.toString()));
+      }
+    });
+    socket.on('error', () => {});
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { ws: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`, state, close: () => { server.closeAllConnections?.(); return new Promise(resolve => server.close(resolve)); } };
+}
+
+test('adapter re-exports a foreign bundle unchanged and refuses non-re-exportable or tampered ones', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-bundle-source-')), other = await signingIdentity(path.join(root, 'other-install'));
+  const bundle = path.join(root, 'bundle'), manifest = await saveBundle(bundle, SANDBOX_STATE, { identity: other });
+  assert.notEqual(manifest.signature.fingerprint, (await signingIdentity()).fingerprint);
+  const base = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export', options: {} };
+  for (const [index, source] of [`bundle:${bundle}`, { type: 'bundle', path: bundle }].entries()) {
+    const staging = path.join(root, `staging-${index}`);
+    const response = await adapterRequest({ ...base, request_id: `f${index}`, source, staging_dir: staging });
+    assert.equal(response.ok, true, JSON.stringify(response));
+    assert.equal(response.files_path, staging);
+    assert.equal(response.payload.bundle_path, '.');
+    assert.equal(response.payload.manifest.signature.fingerprint, other.fingerprint);
+    assert.equal(response.floor.summary, '1 domains, 1 tabs');
+    assert.doesNotMatch(JSON.stringify(response), /alpha/);
+    for (const name of ['state.json', 'storage_state.json', 'manifest.json']) {
+      assert.deepEqual(await readFile(path.join(staging, name)), await readFile(path.join(bundle, name)));
+      assert.equal((await stat(path.join(staging, name))).mode & 0o777, 0o600);
+    }
+    assert.equal((await loadBundle(staging, { trustSender: other.fingerprint })).state.cookies[0].value, 'alpha');
+  }
+  const received = path.join(root, 'received');
+  await saveBundle(received, { cookies: [], origins: [], tabs: [] }, { provenance: { capture: 'direct-cdp', reexportable: false } });
+  const refused = await adapterRequest({ ...base, request_id: 'f2', source: `bundle:${received}`, staging_dir: path.join(root, 'staging-refused') });
+  assert.equal(refused.error.code, 'invalid_request'); assert.match(refused.error.message, /not re-exportable/);
+  await writeFile(path.join(bundle, 'state.json'), '{"cookies":[],"origins":[],"tabs":[]}\n');
+  const tampered = await adapterRequest({ ...base, request_id: 'f3', source: `bundle:${bundle}`, staging_dir: path.join(root, 'staging-tampered') });
+  assert.equal(tampered.error.code, 'internal');
+  await assert.rejects(stat(path.join(root, 'staging-tampered', 'manifest.json')));
+});
+
+test('cdp-fixture set then get round-trips a cookie, localStorage and tab', async t => {
+  const fake = await fakeCdp(); t.after(fake.close);
+  const url = `${SANDBOX_ORIGIN}/marker.txt`;
+  const seeded = await fixture(['set', '--cdp', fake.ws, '--url', url, '--cookie', 'sid=alpha', '--local', 'k=v']);
+  assert.deepEqual([seeded.cookies, seeded.local_storage], [['sid'], ['k']]);
+  const got = await fixture(['get', '--cdp', fake.ws, '--url', SANDBOX_ORIGIN]);
+  assert.equal(got.origin, SANDBOX_ORIGIN);
+  assert.deepEqual(got.cookies.map(c => [c.name, c.value, c.domain]), [['sid', 'alpha', '127.0.0.1']]);
+  assert.deepEqual(got.local_storage, [{ name: 'k', value: 'v' }]);
+  assert.deepEqual(got.tabs, [url]);
+  assert.deepEqual((await fixture(['get', '--cdp', fake.ws, '--url', 'http://other.test/'])).cookies, []);
+  assert.equal((await runNode('bin/cdp-fixture.mjs', ['set', '--cdp', fake.ws, '--url', url, '--cookie', 'novalue'])).code, 1);
+});
+
+test('CLI import into a CDP browser from a fresh data dir trusts only the named sender', async t => {
+  const fake = await fakeCdp(); t.after(fake.close);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-fresh-import-')), other = await signingIdentity(path.join(root, 'sandbox-install'));
+  const bundle = path.join(root, 'bundle'); await saveBundle(bundle, SANDBOX_STATE, { identity: other });
+  const fresh = path.join(root, 'fresh-data'), env = { ...process.env, ABRA_BROWSER_DATA_DIR: fresh };
+  const untrusted = await runNode('bin/abra-browser.js', ['import', bundle, '--to', 'cdp', fake.ws], env);
+  assert.equal(untrusted.code, 1); assert.match(untrusted.stderr, /untrusted sender/);
+  assert.equal(fake.state.calls.length, 0, 'nothing reaches the browser before trust is settled');
+  const imported = await runNode('bin/abra-browser.js', ['import', bundle, '--to', 'cdp', fake.ws, '--trust-sender', other.fingerprint], env);
+  assert.equal(imported.code, 0, imported.stderr);
+  const receiptPath = imported.stdout.trim();
+  assert.ok(receiptPath.startsWith(path.join(fresh, 'receipts')), receiptPath);
+  const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+  assert.deepEqual(receipt.cookies, [{ name: 'sid', domain: '127.0.0.1', path: '/' }]);
+  assert.equal(receipt.reexportable, false);
+  assert.equal(await assertPrivateFile(path.join(fresh, 'keys', 'ed25519-private.pem')), true, 'a key was created on first use');
+  const got = await fixture(['get', '--cdp', fake.ws, '--url', SANDBOX_ORIGIN]);
+  assert.deepEqual(got.cookies.map(c => [c.name, c.value]), [['sid', 'alpha']]);
+  assert.equal(fake.state.cookies[0].ctx, receipt.browser_context_id, 'cookie lands in the import context, not the default one');
+  assert.deepEqual(got.local_storage, [{ name: 'k', value: 'v' }]);
+  assert.equal(got.tabs.length, 1);
+});
+
+async function markerServer() {
+  const server = createServer((_, res) => { res.setHeader('content-type', 'text/plain'); res.end('marker'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { port: server.address().port, close: () => new Promise(resolve => server.close(resolve)) };
+}
+
+test('cdp-fixture seeds Chrome A and the CLI import from a fresh data dir lands in Chrome B', { timeout: 60000 }, async t => {
+  if (skipChromeTest(t)) return;
+  const server = await markerServer();
+  let a, b;
+  try { a = await chrome(); b = await chrome(); }
+  catch (error) { await a?.close(); await server.close(); t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  t.after(async () => { await a.close(); await b.close(); await server.close(); });
+  const origin = `http://127.0.0.1:${server.port}`, url = `${origin}/marker.txt`;
+  await fixture(['set', '--cdp', a.ws, '--url', url, '--cookie', 'sid=alpha', '--local', 'k=v']);
+  const seeded = await fixture(['get', '--cdp', a.ws, '--url', origin]);
+  assert.deepEqual(seeded.cookies.map(c => [c.name, c.value]), [['sid', 'alpha']]);
+  assert.deepEqual(seeded.local_storage, [{ name: 'k', value: 'v' }]);
+  assert.deepEqual(seeded.tabs, [url]);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-chrome-transfer-')), sandbox = await signingIdentity(path.join(root, 'sandbox-install'));
+  const bundle = path.join(root, 'bundle'); await saveBundle(bundle, await capture(a.ws), { identity: sandbox });
+  const imported = await runNode('bin/abra-browser.js', ['import', bundle, '--to', 'cdp', b.ws, '--trust-sender', sandbox.fingerprint], { ...process.env, ABRA_BROWSER_DATA_DIR: path.join(root, 'fresh-data') });
+  assert.equal(imported.code, 0, imported.stderr);
+  const got = await fixture(['get', '--cdp', b.ws, '--url', origin]);
+  assert.deepEqual(got.cookies.map(c => [c.name, c.value]), [['sid', 'alpha']]);
+  assert.deepEqual(got.local_storage, [{ name: 'k', value: 'v' }]);
+  assert.ok(got.tabs.some(tab => tab.startsWith(origin)), JSON.stringify(got.tabs));
+  assert.deepEqual((await fixture(['get', '--cdp', b.ws, '--url', 'http://other.test/'])).cookies, []);
 });

@@ -52,7 +52,8 @@ $ abra send <peer-b> --path ./work --wait
 
 An initialized directory has `.abra/capsule_id`. Sending that path creates and
 sends its next full snapshot. `--wait` returns after B acknowledges it.
-Sandbox observers write live facts to `.abra/observed.json`. Abra sends derived
+The sandbox collector writes facts to `.abra/observed-<barrier>.json` (or
+`.abra/observed.json` when it runs as a periodic service). Abra sends derived
 recipes and the `dev.abra.observed` ledger with the snapshot. On receipt,
 `.abra/recipes.json` and `.abra/received-observed.json` hold that data. Abra does
 not execute either file. See the [observation contract](OBSERVATION.md) for
@@ -79,6 +80,30 @@ $ abra handoffs
 ```
 
 `watch` streams events. `handoffs` gives one current row per snapshot kind.
+
+## Attach Abra to a sandbox you do not control
+
+A Daytona sandbox, an ssh box, or a Firecracker guest gives you "run a
+command" and "move files". That is enough. The
+[sandbox coordinator](../adapters/sandbox/README.md) runs on your machine next
+to the local daemon, pushes a one-shot collector into the sandbox, pulls the
+workspace and its ledger out into a local mirror, and takes the snapshot here:
+
+```console
+$ adapters/sandbox/bin/abra-sandbox capture --driver daytona --driver-opt sandbox=<id> --name work
+$ abra send <peer-b> --snapshot <id> --wait
+```
+
+On the receiving machine, restore pushes the files into another sandbox and
+lists service candidates. Nothing runs until you name an index:
+
+```console
+$ adapters/sandbox/bin/abra-sandbox restore --driver ssh --driver-opt host=<ip> --driver-opt key=<file> \
+    --name work --snapshot <id> --start 0
+```
+
+No Abra binary or daemon goes into the sandbox. Browser sessions ride along as
+their own partial snapshot; see the coordinator README for the bundle flow.
 
 ## Write a small adapter
 

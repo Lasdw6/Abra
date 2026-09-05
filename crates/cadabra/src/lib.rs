@@ -2109,6 +2109,11 @@ impl Daemon {
             materialize(&node.store.cas, &files, destination)?;
         }
         materialize_recipes(destination, raw.manifest())?;
+        // `--no-import` leaves the files for another tool to consume, such as
+        // the sandbox coordinator pushing a browser bundle into a remote browser.
+        if flag(request, "no_import") {
+            return Ok(None);
+        }
         let registry = self.registry()?;
         // The adapter runs unlocked: an import may take minutes.
         if !registry

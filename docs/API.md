@@ -45,7 +45,7 @@ Operations and request fields:
 | `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | list returns `{adapters:[...],errors:[...]}`; add/remove return the registration change |
 | `inspect` | `kind`, `source`, `options?` | `{summary?,warnings:[...],blocked:[...]}` from the adapter |
 | `inbox` | `kind?`, `from?`, `wait?`, `timeout_ms?` | partial floor cards, read state, and `provenance` |
-| `accept` | `to`; `id` or `latest:true` + `kind`; optional `from`, `replace`, `workspace`, `timeout_ms`, `no_lease`, `discard_local`, `allow_divergence`, `destination`, `options`; legacy `into` aliases `replace` | materializes, imports, marks read, and returns `replace` plus `import` (`{result, deep_link?}`) when an adapter ran |
+| `accept` | `to`; `id` or `latest:true` + `kind`; optional `from`, `replace`, `workspace`, `timeout_ms`, `no_lease`, `discard_local`, `allow_divergence`, `no_import`, `destination`, `options`; legacy `into` aliases `replace` | materializes, imports, marks read, and returns `replace` plus `import` (`{result, deep_link?}`) when an adapter ran; `no_import:true` skips the importer |
 | `handoffs` | `kind?`, `peer?` | rows shaped `{kind,last_acked_send,last_pending_send,last_unread_receive,last_read_receive,capsule}`; missing values are `null` |
 | `log` | `capsule?` | capsule snapshot history |
 | `capsules` | none | capsule ids, kinds, titles, and current main/fork heads |
@@ -94,7 +94,7 @@ Host facts require a barrier and are limited to 16 KiB. See the
 Adapter `source` and `destination` values parse as JSON only when they are JSON
 objects; all other values stay strings. Adapter options are string maps. `to`
 always names the materialization directory. The CLI form is
-`abra accept <id> <path> [--replace] [--discard-local] [--allow-divergence]`,
+`abra accept <id> <path> [--replace] [--discard-local] [--allow-divergence] [--no-import]`,
 where `--replace` sets `replace` and replaces the files in an existing
 workspace only when `.abra/capsule_id` matches; it preserves `.abra`. Local
 files that differ from the recorded `.abra/snapshot_id` are refused unless
@@ -282,6 +282,13 @@ ran. If the adapter starts and then fails, Abra keeps the entry unread and
 returns an error with `files_materialized_at=<path>`, where `<path>` is the
 accept path. The files remain there so the user can inspect or recover the
 partial import.
+
+A partial can also be materialized without its importer. When no registered
+adapter supports `import` for the kind, `accept` writes the files and marks the
+entry read. `accept --no-import` (`no_import:true`) does the same even when an
+adapter is registered, so another tool can consume the files; the sandbox
+coordinator uses it to accept a browser bundle it will push into a remote
+browser itself. The files keep ordinary modes and the result has no `import`.
 
 `abra policy clear` empties `policy/grant-errors.json`, removing saved
 auto-accept errors.

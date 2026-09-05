@@ -150,7 +150,7 @@ Native blobs are treated as an optional cache in the README and in the portable-
 
 ---
 
-### 15. Low — `adapters/firecracker/guest/observer.py:12`, `47-53`, `79-104`
+### 15. Low — `adapters/sandbox/collector/observer.py:12`, `47-53`, `79-104`
 
 **Defect.** Recipes are data only (good): atomic write of JSON, never `exec`, cadabra embeds them on snapshot (`lib.rs:689-693`) and restore prints them (`main.rs:460-463`). Env is **not** the whole environment; it is `ENV_KEYS` plus `ABRA_RECIPE_*`. That is stricter than a naive reading of SPEC §1.2 and is the right security default. Residual: full **argv** is captured (secrets on command lines); `ABRA_RECIPE_*` is an intentional leak channel; a non-UTF-8 env entry drops the **entire** recipe (`UnicodeError`) instead of omitting that entry as SPEC §1.2 requires; no bound on argv string size; observer runs as root every 2s over all PIDs whose cwd is under `/workspace`.
 

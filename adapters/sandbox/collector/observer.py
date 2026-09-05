@@ -357,7 +357,7 @@ def read_process(pid, workspace, proc, parent_pid, state, start, inodes, clock, 
     return row
 
 
-def scan_processes(workspace, proc, errors=None, cgroup=None, process_group=None):
+def scan_processes(workspace, proc, errors=None, cgroup=None, process_group=None, all_processes=False):
     parents, states, starts, groups = process_metadata(proc, errors)
     inodes = socket_map(proc, errors)
     workspace = os.path.realpath(workspace)
@@ -367,7 +367,9 @@ def scan_processes(workspace, proc, errors=None, cgroup=None, process_group=None
         if pid == os.getpid():
             continue
         try:
-            if cgroup is not None:
+            if all_processes:
+                selected[pid] = "all"
+            elif cgroup is not None:
                 paths = [line.split(":", 2)[2] for line in text(os.path.join(proc, str(pid), "cgroup")).splitlines() if line.startswith("0::")]
                 if any(path == cgroup or path.startswith(cgroup.rstrip("/") + "/") for path in paths):
                     selected[pid] = "cgroup"
@@ -436,6 +438,10 @@ def derive_services(processes):
                 break
             # Agent-launched services have their own lifecycle; ordinary workers do not.
             if command_name(parent["argv"]) in {"codex", "claude", "agent"}:
+                break
+            # With --all, init or a sandbox supervisor outside the workspace adopts
+            # every orphan; it is a boundary, not the root of those services.
+            if parent["pid"] == 1 and parent.get("cwd") is None:
                 break
             seen.add(parent["pid"])
             root = parent
@@ -666,7 +672,7 @@ def enforce_size_limit(ledger):
 def capture(args, runtimes, environment=None):
     started = canonical_time()
     errors = []
-    processes = scan_processes(args.workspace, args.proc, errors, getattr(args, "cgroup", None), getattr(args, "process_group", None))
+    processes = scan_processes(args.workspace, args.proc, errors, getattr(args, "cgroup", None), getattr(args, "process_group", None), getattr(args, "all", False))
     processes.sort(key=lambda row: (not bool(row.get("ports")), row.get("started_at", "9999"), row["pid"]))
     services = derive_services(processes)
     processes_dropped = max(0, len(processes) - 512)
@@ -691,7 +697,7 @@ def capture(args, runtimes, environment=None):
               "processes": processes, "service_candidates": services,
               "recipes": [c["recipe"] for c in services if c["restartability"] == "unverified"],
               "mounts": mounts, "collection_errors": errors,
-              "coverage": {"complete": False, "scope": "cgroup" if getattr(args, "cgroup", None) else "process_group" if getattr(args, "process_group", None) else "workspace-and-descendants",
+              "coverage": {"complete": False, "scope": "all" if getattr(args, "all", False) else "cgroup" if getattr(args, "cgroup", None) else "process_group" if getattr(args, "process_group", None) else "workspace-and-descendants",
                            "consistency": "best-effort", "applications_quiesced": False,
                            "limitations": ["observation_is_not_a_restart_guarantee", "environment_allowlist", "observer_network_namespace_only", "external_file_contents_not_captured", "app_checkpoints_require_adapters"]},
               "limits": {"processes_dropped": processes_dropped, "services_dropped": services_dropped}}
@@ -772,6 +778,7 @@ def create_parser():
     membership = parser.add_mutually_exclusive_group()
     membership.add_argument("--cgroup", help="cgroup v2 path, relative to the cgroup mount, e.g. /sandbox")
     membership.add_argument("--process-group", type=int)
+    membership.add_argument("--all", action="store_true", help="every process in /proc; use when the sandbox is the whole PID namespace")
     parser.add_argument("--cgroup-root", default="/sys/fs/cgroup")
     parser.add_argument("--environment-interval", type=float, default=300)
     parser.add_argument("--runtime-dirs", default="/usr/local/bin:/usr/bin:/bin")

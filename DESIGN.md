@@ -258,8 +258,11 @@ adapter's code.
 
 ### Observer-based recipe capture
 
-Inside a sandbox, an observer records platform and runtime facts, mounts, and a
-process tree. It derives unverified service candidates and records missing
+A collector run inside a sandbox records platform and runtime facts, mounts,
+and a process tree. It is a single Python file; a coordinator outside the
+sandbox pushes it in over the provider's exec and pulls the result out with the
+files, so no Abra process lives in the sandbox. The Firecracker guest image
+also runs it as a periodic service. It derives unverified service candidates and records missing
 requirements, collector failures and capture timing. Unique capture files bind
 one ledger to a snapshot without periodic overwrites. This is best-effort
 capture unless the application is quiesced separately. See §5 and the

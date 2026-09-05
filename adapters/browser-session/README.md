@@ -10,6 +10,13 @@ node bin/abra-browser.js import ./session --to cdp 'ws://…' --deny-domains adm
 node bin/abra-browser.js revoke "$HOME/Library/Application Support/Abra/browser-session/receipts/<id>.json"
 ```
 
+Tool data (signing key, receipts, install registry) lives under
+`~/Library/Application Support/Abra/browser-session` on macOS and
+`$XDG_DATA_HOME/abra/browser-session` (default `~/.local/share/...`) elsewhere.
+`ABRA_BROWSER_DATA_DIR` overrides both. A fresh directory works: the key is
+created on first use, so `import ... --to cdp <ws> --trust-sender <fp>` runs on
+a Linux box with only node and the bundle.
+
 `inspect` prints the persistent signing-key fingerprint. This installation trusts
 its own bundles. For a foreign bundle, verify the fingerprint separately and
 pass `--trust-sender <fingerprint>`. The signature proves integrity and key
@@ -63,6 +70,19 @@ On Mac B, accept the transfer into a fresh detached local Chrome:
 ```sh
 abra accept <id> <dir> --destination local
 ```
+
+A bundle captured elsewhere (for example by the sandbox coordinator, which runs
+`export --from cdp` inside a sandbox with an ephemeral key) is sent as-is with
+`--source bundle:<dir>` or `{"type":"bundle","path":"<dir>"}`. The adapter
+verifies the signature, refuses received (non-re-exportable) bundles, and
+copies the files unchanged, so the receiver sees the original signer's
+fingerprint. To land such a bundle on disk without importing it, use
+`abra accept <id> <dir> --no-import`, then push it into the target browser with
+`import <dir> --to cdp <ws> --trust-sender <fp>`.
+
+`bin/cdp-fixture.mjs` is a test helper for live tests: `set` seeds a cookie,
+localStorage entry and tab for one origin over CDP, `get` prints them as JSON
+(cookie values included, so test browsers only). It needs `lib/` next to it.
 
 GitHub with a test account is the recommended demo site. Google sessions can fail to transfer because Google uses device-bound session credentials.
 

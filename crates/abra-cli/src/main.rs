@@ -377,6 +377,10 @@ struct AcceptArgs {
     /// Replace even when the incoming snapshot does not descend from the recorded one.
     #[arg(long)]
     allow_divergence: bool,
+    /// Materialize the files and mark the delivery read without running the
+    /// registered importer.
+    #[arg(long)]
+    no_import: bool,
     #[arg(long)]
     destination: Option<String>,
     #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
@@ -552,7 +556,7 @@ async fn main() -> cadabra::Result<()> {
                 .adapter_options
                 .into_iter()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            json!({"op":"accept","id":args.id,"to":absolute,"replace":args.replace,"latest":args.latest,"kind":args.kind,"from":args.from,"workspace":workspace,"timeout_ms":args.timeout,"no_lease":args.no_lease,"discard_local":args.discard_local,"allow_divergence":args.allow_divergence,"destination":args.destination,"options":options})
+            json!({"op":"accept","id":args.id,"to":absolute,"replace":args.replace,"latest":args.latest,"kind":args.kind,"from":args.from,"workspace":workspace,"timeout_ms":args.timeout,"no_lease":args.no_lease,"discard_local":args.discard_local,"allow_divergence":args.allow_divergence,"no_import":args.no_import,"destination":args.destination,"options":options})
         }
         Command::Handoffs { kind, peer } => json!({"op":"handoffs","kind":kind,"peer":peer}),
         Command::Log { capsule } => json!({"op":"log","capsule":capsule}),
@@ -1339,6 +1343,7 @@ mod tests {
             "--replace",
             "--discard-local",
             "--allow-divergence",
+            "--no-import",
         ])
         .unwrap();
         let Command::Accept(args) = parsed.command else {
@@ -1346,6 +1351,7 @@ mod tests {
         };
         assert!(args.discard_local);
         assert!(args.allow_divergence);
+        assert!(args.no_import);
     }
 
     #[test]

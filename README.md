@@ -12,7 +12,8 @@ The receiver chooses how to use each snapshot.
 - A full snapshot updates a capsule. A partial snapshot lands in the inbox as a
   one-time handoff.
 - An adapter imports or exports one app's state through an NDJSON process.
-- A sandbox observer records runtime facts and derives service recipes. Abra
+- A sandbox collector records runtime facts and derives service recipes. It is
+  pushed into a sandbox and run once, or installed in a Firecracker guest. Abra
   transports this ledger as data and never executes it.
 
 ## Repo layout
@@ -28,7 +29,8 @@ The receiver chooses how to use each snapshot.
 | `adapters/reference-folder` | Python protocol reference adapter |
 | `adapters/codex-session` | Codex session adapter |
 | `adapters/browser-session` | Browser session adapter |
-| `adapters/firecracker` | Firecracker VM adapter and sandbox observer |
+| `adapters/sandbox` | Sandbox coordinator (Daytona, ssh, local drivers) and the collector |
+| `adapters/firecracker` | Firecracker VM adapter |
 
 ## Quickstart
 

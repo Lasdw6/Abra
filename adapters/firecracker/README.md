@@ -18,7 +18,8 @@ sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
 ```
 
 The installer adds `abra-daemon.service` (which execs `abra --root /var/lib/abra
-daemon`), an observer, `/workspace`, the `abra` binary, and the
+daemon`), the collector from `adapters/sandbox/collector/observer.py` as the
+periodic `abra-observer.service`, `/workspace`, the `abra` binary, and the
 `os-desktop-init.sh` PID 1 handoff named in the boot arguments.
 It does not install network packages.
 
@@ -191,6 +192,11 @@ On mismatch, missing native roles, snapshot-load error, resume error, or guest
 readiness timeout, the partial VM is torn down and a fresh base image is booted, the selected
 snapshot's file tree is materialized into `/workspace`, and recipes are printed
 without execution. Native blobs are never treated as source of truth.
+
+A guest can also be driven without its daemon: the
+[sandbox coordinator](../sandbox/README.md) ssh driver captures and restores a
+running guest from the host, and `adapters/sandbox/tests/firecracker_e2e.sh`
+proves that flow on the same kind of KVM host.
 
 E2B and other self-hosted orchestrators map directly onto this shim: allocate a
 slot, inject an enrollment token, call the same Firecracker endpoints listed

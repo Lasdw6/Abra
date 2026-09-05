@@ -134,6 +134,70 @@ printf '{"request_id":"%s","ok":false,"error":{"code":"import_failed"}}\n' "$id"
     a_run.shutdown().await;
 }
 
+#[tokio::test]
+async fn accept_no_import_materializes_and_marks_read_without_running_the_adapter() {
+    let network = LoopbackNetwork::default();
+    let a_root = private_root();
+    let b_root = private_root();
+    // An importer that always fails proves it was never invoked.
+    let failing = shell_adapter(
+        &b_root.path().join("failing-adapter"),
+        "failing-folder",
+        "dev.abra.folder",
+        &["import"],
+        r###"read line
+id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"request_id":"%s","ok":false,"error":{"code":"import_failed"}}\n' "$id""###,
+    );
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    a.handle(json!({
+        "op":"adapters-add",
+        "dir":Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters/reference-folder")
+    }))
+    .await
+    .unwrap();
+    b.handle(json!({"op":"adapters-add","dir":failing}))
+        .await
+        .unwrap();
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    pair_daemons(&a, &b).await;
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("kept.txt"), "kept").unwrap();
+    a.handle(json!({
+        "op":"send",
+        "peer":b.peer_id().await,
+        "kind":"dev.abra.folder",
+        "source":source.path()
+    }))
+    .await
+    .unwrap();
+    let inbox = wait_for(|| async {
+        let inbox = b.handle(json!({"op":"inbox"})).await?;
+        (!inbox.as_array().unwrap().is_empty())
+            .then_some(inbox)
+            .ok_or_else(|| "empty inbox".into())
+    })
+    .await;
+    let id = inbox[0]["id"].as_str().unwrap();
+    let destination = b_root.path().join("materialized");
+    let accepted = b
+        .handle(json!({"op":"accept","id":id,"to":destination,"no_import":true}))
+        .await
+        .unwrap();
+    assert_eq!(accepted["accepted"], id);
+    assert!(accepted.get("import").is_none());
+    assert_eq!(
+        fs::read_to_string(destination.join("kept.txt")).unwrap(),
+        "kept"
+    );
+    let inbox = b.handle(json!({"op":"inbox"})).await.unwrap();
+    assert_eq!(inbox[0]["read"], true);
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
 #[cfg(feature = "tcp")]
 #[tokio::test]
 async fn tcp_daemon_writes_port_and_opens_control_socket_under_three_seconds() {

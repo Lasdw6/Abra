@@ -126,7 +126,7 @@ fn python_checkpoint_round_trips_through_cli_and_signed_manifest() {
         String::from_utf8_lossy(&initialized.stderr)
     );
     let observer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../adapters/firecracker/guest/observer.py");
+        .join("../../adapters/sandbox/collector/observer.py");
     let capture = Command::new("python3")
         .arg(observer)
         .args([

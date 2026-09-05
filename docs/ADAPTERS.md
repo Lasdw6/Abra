@@ -122,6 +122,9 @@ The runner is implemented in Cadabra. `abra send <peer> --kind <kind> --source
 <value> [--adapter-option k=v ...]` exports into daemon-owned staging before
 signing and enqueueing. `abra accept <id> <dir> [--destination <value>]
 [--adapter-option k=v ...]` invokes a registered importer after materialization.
+`abra accept <id> <dir> --no-import` materializes the files and marks the entry
+read without invoking the importer; the same happens when no registered adapter
+supports `import` for the kind.
 Discovery skips broken registrations and reports them through `abra adapters
 list`. `abra adapters add` rejects a broken requested directory. Conflicting
 kind claims prevent dispatch for that kind.

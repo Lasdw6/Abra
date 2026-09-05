@@ -1,8 +1,16 @@
 # Sandbox observation contract
 
-The guest observer collects OS facts and derives service candidates. It does not
-start services, flush databases, capture browser sessions, or guarantee that a
-command will work on another machine. Application adapters own those operations.
+The collector (`adapters/sandbox/collector/observer.py`) collects OS facts and
+derives service candidates. It does not start services, flush databases,
+capture browser sessions, or guarantee that a command will work on another
+machine. Application adapters own those operations.
+
+It has two modes. The primary one is one-shot: the
+[sandbox coordinator](../adapters/sandbox/README.md) pushes the script into a
+sandbox over the provider's exec, runs it once with a barrier id, and pulls the
+pinned ledger out with the workspace files; nothing stays installed. The
+Firecracker guest image also installs it as a periodic systemd service
+(`install-rootfs.sh`), which `abra-fc` relies on; the coordinator never does.
 
 The ledger uses `schema: "dev.abra.observed/3"` and `observer.version: 3`.
 Abra carries it in `extensions["dev.abra.observed"]`. The top-level `recipes`
@@ -15,13 +23,18 @@ versions must remain data, without deriving restart actions from them.
 
 The periodic observer replaces `.abra/observed.json` every two seconds by
 default. It never writes received `recipes.json` or `received-observed.json`.
+One-shot runs never touch `observed.json`.
 
 A checkpoint gets a separate file:
 
 ```sh
-/usr/local/libexec/abra-observer --workspace /workspace --once --barrier capture_1
+python3 observer.py --workspace /workspace --all --once --barrier capture_1
 abra --json snapshot /workspace --observation-barrier capture_1
 ```
+
+The coordinator runs exactly this inside the sandbox (from a temp dir), then
+takes the snapshot on the mirror outside. In a Firecracker guest the same
+script is `/usr/local/libexec/abra-observer`.
 
 The first command returns `filename: "observed-capture_1.json"`, the barrier,
 observation time, and process/recipe counts. It writes that file inside `.abra`
@@ -36,6 +49,8 @@ or symlinked captures fail; it never falls back to live data for a named capture
 The result echoes `observation_barrier`. After success, the caller can delete
 the capture file. Failed captures remain available for inspection.
 
+`abra-sandbox capture` creates a random barrier, runs the collector once via
+the driver, pulls the tree, and passes the driver's facts as the host object.
 `abra-fc snapshot` creates a random barrier, collects host environment facts,
 and runs the observer and snapshot through SSH. It checks the returned barrier
 before pausing the VM. Its SSH command cleans up its own capture after the
@@ -102,9 +117,18 @@ orphaned process that already left the workspace before collection. For a
 sandbox with a defined boundary, use one of:
 
 ```sh
+abra-observer --workspace /workspace --all
 abra-observer --workspace /workspace --cgroup /sandbox
 abra-observer --workspace /workspace --process-group 1234
 ```
+
+`--all` selects every process in `/proc` except the collector, tagged
+`membership: "all"`, with `coverage.scope: "all"`. It is the right rule when
+the sandbox is the whole PID namespace (containers, Firecracker guests) and is
+the coordinator's default. Under `--all`, PID 1 with a cwd outside the
+workspace (init, or a provider supervisor that adopts orphans) is a grouping
+boundary: its children are their own service roots. PID 1 itself is still
+listed, blocked.
 
 `--cgroup` is a cgroup v2 path relative to the cgroup mount. It includes nested
 cgroups without including similarly named siblings. `--cgroup-root` defaults
@@ -165,7 +189,9 @@ A snapshot caller can pass `--observation-host '<JSON object>'` with a barrier.
 The local API field is `observation_host`; it accepts at most 16 KiB. Abra adds
 the object under the ledger's `host.facts` before signing the snapshot.
 
-Firecracker supplies BLAKE3 digests of the configured base-image file and kernel
+The coordinator supplies the driver's facts (provider name, sandbox id, cpu,
+memory, and similar) plus `native`, which is the provider's snapshot handle or
+null. Firecracker supplies BLAKE3 digests of the configured base-image file and kernel
 file at capture time, configured memory and CPU count, and host architecture.
 Unreadable configured artifacts produce `available: false` and
 `error: "digest_unavailable"` rather than preventing capture of a running VM.

@@ -11,7 +11,9 @@ export const RECEIPT_KIND = 'dev.abra.browser-session.receipt.v1';
 const SIGNING_PREFIX = 'abra-browser-session-v1';
 
 export function dataDir() {
-  return path.resolve(process.env.ABRA_BROWSER_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'Abra', 'browser-session'));
+  if (process.env.ABRA_BROWSER_DATA_DIR) return path.resolve(process.env.ABRA_BROWSER_DATA_DIR);
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Abra', 'browser-session');
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'abra', 'browser-session');
 }
 
 export function canonical(value) {

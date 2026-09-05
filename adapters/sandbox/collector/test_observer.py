@@ -225,6 +225,32 @@ class ObserverTest(unittest.TestCase):
         self.assertEqual([90], [row["pid"] for row in ledger["processes"]])
         self.assertEqual("cgroup", ledger["coverage"]["scope"])
 
+    def test_all_membership_selects_every_process_except_the_collector(self):
+        self.add_process(90, 1, ["database"], cwd=self.root)
+        self.add_process(91, 1, ["python3", "-m", "http.server", "8123"], [("tcp", 8123, "300")])
+        self.add_process(os.getpid(), 1, ["observer"])
+        ledger = observer.capture(self.args(all=True), {})
+        self.assertEqual([91, 90], [row["pid"] for row in ledger["processes"]])
+        self.assertEqual({"all"}, {row["membership"] for row in ledger["processes"]})
+        self.assertEqual("all", ledger["coverage"]["scope"])
+        self.assertEqual([[8123]], [recipe["ports"] for recipe in ledger["recipes"]])
+        parser = observer.create_parser()
+        self.assertTrue(parser.parse_args(["--all"]).all)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--all", "--cgroup", "/sandbox"])
+
+    def test_init_outside_workspace_is_a_boundary_not_a_service_root(self):
+        self.add_process(1, 0, ["sleep", "infinity"], [("tcp", 2280, "400")], cwd=self.root)
+        self.add_process(91, 1, ["python3", "-m", "http.server", "8123"], [("tcp", 8123, "300")])
+        self.add_process(92, 91, ["python3", "-m", "http.server", "8123"])
+        ledger = observer.capture(self.args(all=True), {})
+        by_root = {c["root_pid"]: c for c in ledger["service_candidates"]}
+        self.assertEqual({1, 91}, set(by_root))
+        self.assertEqual([91, 92], by_root[91]["source_pids"])
+        self.assertEqual("unverified", by_root[91]["restartability"])
+        self.assertEqual("blocked", by_root[1]["restartability"])
+        self.assertEqual([[8123]], [recipe["ports"] for recipe in ledger["recipes"]])
+
     def test_process_group_membership(self):
         self.add_process(90, 1, ["database"], cwd=self.root)
         self.add_process(91, 1, ["unrelated"])

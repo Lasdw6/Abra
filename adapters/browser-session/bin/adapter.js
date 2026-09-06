@@ -19,7 +19,7 @@ async function exportRequest(r) {
   if (source.type === 'bundle') return exported(await copyBundle(source.path, r.staging_dir), r.staging_dir);
   const policy = { includes: parseList(options.include_domains), excludes: parseList(options.exclude_domains) };
   const state = source.type === 'local' ? await withLocalChrome(source.profile, ws => capture(ws, policy)) : await capture(source.cdp_url, policy, { browserContextId: source.browser_context_id });
-  return exported(await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } }), r.staging_dir);
+  return exported(await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', allowNonPortable: options.allow_non_portable === 'true', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } }), r.staging_dir);
 }
 
 function exported(manifest, dir) {
@@ -44,7 +44,7 @@ async function importRequest(r) {
   const bundleDir = path.resolve(bundle);
   await secureTree(bundleDir);
   const { receipt, receiptPath } = await installBundle(bundleDir, destination, {
-    policy: { allows: parseList(options.allow_domains), denies: parseList(options.deny_domains) },
+    policy: { allows: parseList(options.allow_domains), denies: parseList(options.deny_domains), allowNonPortable: options.allow_non_portable === 'true' },
     watchMs: parseWatchMs(options.watch_ms),
     trustSender: options.trust_sender
   });

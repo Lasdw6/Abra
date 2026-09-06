@@ -501,3 +501,18 @@ test('cdp-fixture seeds Chrome A and the CLI import from a fresh data dir lands 
   assert.ok(got.tabs.some(tab => tab.startsWith(origin)), JSON.stringify(got.tabs));
   assert.deepEqual((await fixture(['get', '--cdp', b.ws, '--url', 'http://other.test/'])).cookies, []);
 });
+
+test('manual cookie override is explicit and still respects domain policy', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'abra-override-'));
+  const state = { cookies: [{ name: 'device_bound_session', value: 'fixture', domain: 'example.com', secure: true, httpOnly: true }], origins: [], tabs: [] };
+  try {
+    await saveBundle(dir, state, { allowNonPortable: 'true' });
+    assert.equal((await loadBundle(dir)).state.cookies.length, 0);
+    const manifest = await saveBundle(dir, state, { allowNonPortable: true });
+    assert.equal((await loadBundle(dir)).state.cookies.length, 1);
+    assert.ok(!manifest.non_teleportable.some(item => item.action === 'omitted'));
+    assert.equal(filterState(state, [], [], { allowNonPortable: true }).cookies.length, 1);
+    assert.equal(filterState(state, [], ['example.com'], { allowNonPortable: true }).cookies.length, 0);
+    assert.equal(filterState(state, [], [], { allowNonPortable: 'true' }).cookies.length, 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

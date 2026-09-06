@@ -93,6 +93,7 @@ function cookieAllowed(cookie, includes, excludes) {
   if (cookie.domain && excludes.some(denied => domainMatches(denied, host))) return false;
   return true;
 }
+export const supportsManualCookieOverride = true;
 const BOUND_SESSION_DOMAINS = ['accounts.google.com','google.com','googleapis.com','workspace.google.com','youtube.com'];
 export function nonPortableCookieReasons(cookie) {
   const domain = cookieDomain(cookie);
@@ -106,7 +107,7 @@ export function nonPortableCookieReasons(cookie) {
 export function filterState(state, includes = [], excludes = [], options = {}) {
   includes = includes.map(normalizeHost); excludes = excludes.map(normalizeHost);
   const originAllowed = origin => { try { const url = new URL(origin), h = normalizeHost(url.hostname); return ['http:','https:'].includes(url.protocol) && !isPublicSuffix(h) && allowedDomain(h, includes, excludes); } catch { return false; } };
-  return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes) && (options.allowNonPortable || !nonPortableCookieReasons(c).length)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
+  return { ...state, cookies: (state.cookies || []).filter(c => cookieAllowed(c, includes, excludes) && (options.allowNonPortable === true || !nonPortableCookieReasons(c).length)), origins: (state.origins || []).filter(o => originAllowed(o.origin)), tabs: (state.tabs || []).filter(t => originAllowed(t.url)) };
 }
 
 export async function loadBundle(dir, options = {}) {
@@ -125,8 +126,9 @@ export async function loadManifest(dir, options = {}) {
 }
 export async function saveBundle(dir, state, metadata = {}) {
   await privateDir(dir);
-  const blockedCookies = (state.cookies || []).filter(cookie => nonPortableCookieReasons(cookie).length);
-  const portableState = { ...state, cookies: (state.cookies || []).filter(cookie => !nonPortableCookieReasons(cookie).length) };
+  const allowNonPortable = metadata.allowNonPortable === true;
+  const blockedCookies = allowNonPortable ? [] : (state.cookies || []).filter(cookie => nonPortableCookieReasons(cookie).length);
+  const portableState = { ...state, cookies: (state.cookies || []).filter(cookie => allowNonPortable || !nonPortableCookieReasons(cookie).length) };
   const storageState = blockedCookies.length ? toStorageState(portableState) : metadata.storageState || toStorageState(portableState);
   const storageStateRaw = blockedCookies.length || metadata.storageStateRaw === undefined
     ? `${JSON.stringify(storageState, null, 2)}\n`

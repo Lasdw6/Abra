@@ -111,7 +111,7 @@ async function openBlankOrigin(cdp, sessionId, origin) {
 }
 
 export async function install(wsUrl, state, policy = {}, options = {}) {
-  const filtered = filterState(state, policy.allows || [], policy.denies || []);
+  const filtered = filterState(state, policy.allows || [], policy.denies || [], { allowNonPortable: policy.allowNonPortable === true });
   const cdp = await new CDP(wsUrl).connect();
   const browserContextId = (await cdp.send('Target.createBrowserContext', { disposeOnDetach: false })).browserContextId;
   try {

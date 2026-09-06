@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": { ".": "./lib/index.js" },
   "bin": {
     "abra-browser": "./bin/abra-browser.js",
     "abra-browser-adapter": "./bin/adapter.js",

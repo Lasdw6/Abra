@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } from '../lib/cdp.js';
-import { capture, install, revoke, stopLocalChrome } from '../lib/browser.js';
+import { capture, captureTarget, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
 import { allowedDomain, assertPrivateFile, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
@@ -141,6 +141,9 @@ test('adapter rejects invalid source and destination forms', async () => {
     const response = await adapterRequest({ ...exportBase, request_id: `c${index}`, source });
     assert.equal(response.error.code, 'invalid_request');
   }
+  const selected = await adapterRequest({ ...exportBase, request_id: 'f1', source: { type: 'cdp', cdp_url: 'ws://127.0.0.1:1', target_id: 'tab', expected_url: 'https://example.com/' }, options: { selected_cookie_keys: 'bad' } });
+  assert.equal(selected.error.code, 'invalid_request');
+  assert.match(selected.error.message, /selected_cookie_keys/);
 
   const bundle = path.join(root, 'bundle');
   await saveBundle(bundle, { cookies: [], origins: [], tabs: [] });
@@ -190,7 +193,7 @@ async function page(ws, url, context) {
   const cdp = await new CDP(ws).connect();
   const targetId = (await cdp.send('Target.createTarget', { url, ...(context ? { browserContextId: context } : {}) })).targetId;
   const session = await attachPage(cdp, targetId); await waitForLoad(cdp, session);
-  return { cdp, session, close: () => cdp.close() };
+  return { cdp, session, targetId, close: () => cdp.close() };
 }
 
 async function fixtureServer() {
@@ -248,6 +251,21 @@ test('CDP export/import, receiver deny, inspect secrecy, and revoke', { timeout:
   const originA = `http://localhost:${fixture.port}`, originB = `http://127.0.0.1:${fixture.port}`;
   const pa = await page(a.ws, originA), pb = await page(a.ws, originB);
   await delay(300); pa.close(); pb.close();
+
+  const selected = await captureTarget(a.ws, pa.targetId, originA);
+  assert.deepEqual(selected.tabs.map(tab => tab.url), [originA + '/']);
+  assert.equal(selected.cookies.some(cookie => cookie.value === 'alpha'), true);
+  assert.equal(selected.cookies.some(cookie => cookie.value === 'beta'), false);
+  assert.deepEqual(selected.origins.map(origin => origin.origin), [originA]);
+  const alphaKey = Buffer.from(JSON.stringify(['localhost', '/', 'server_cookie', null])).toString('base64url');
+  assert.deepEqual((await captureTarget(a.ws, pa.targetId, originA, { selectedCookieKeys: [alphaKey] })).cookies.map(cookie => cookie.value), ['alpha']);
+  assert.equal((await captureTarget(a.ws, pa.targetId, originA, { selectedCookieKeys: [] })).cookies.length, 0);
+  const selectedDir = await mkdtemp(path.join(os.tmpdir(), 'abra-selected-export-'));
+  const selectedExport = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'e1', verb: 'export', kind: 'dev.abra.browser.session.v1',
+    source: { type: 'cdp', cdp_url: a.ws, target_id: pa.targetId, expected_url: originA }, staging_dir: selectedDir,
+    options: { exclude_domains: 'localhost' } });
+  assert.equal(selectedExport.ok, true);
+  assert.deepEqual((await loadBundle(selectedDir)).state, { cookies: [], origins: [], tabs: [] });
 
   const state = await capture(a.ws);
   const dir = await mkdtemp(path.join(os.tmpdir(), 'abra-bundle-'));

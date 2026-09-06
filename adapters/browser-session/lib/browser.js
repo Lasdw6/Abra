@@ -77,6 +77,49 @@ export async function capture(wsUrl, policy = {}, options = {}) {
   } finally { cdp.close(); }
 }
 
+// Capture one exact page. This is the stable primitive used by clients that let
+// a user choose a tab instead of exporting an entire browser context.
+export async function captureTarget(wsUrl, targetId, expectedUrl, options = {}) {
+  const expected = new URL(expectedUrl);
+  if (!['http:', 'https:'].includes(expected.protocol)) throw new Error('selected target must use HTTP or HTTPS');
+  const cdp = await new CDP(wsUrl).connect();
+  let session;
+  try {
+    const { targetInfo } = await cdp.send('Target.getTargetInfo', { targetId: String(targetId || '') });
+    if (targetInfo.type !== 'page' || new URL(targetInfo.url).href !== expected.href) throw new Error('selected target changed before capture');
+    session = await attachPage(cdp, targetInfo.targetId);
+    await waitForLoad(cdp, session);
+    const tab = {
+      url: await evalValue(cdp, session, 'location.href'),
+      title: await evalValue(cdp, session, 'document.title'),
+      scroll: await evalValue(cdp, session, '({x:scrollX,y:scrollY,historyLength:history.length})'),
+      media: await evalValue(cdp, session, MEDIA_CAPTURE_SCRIPT).catch(() => null)
+    };
+    let cookies = (await cdp.send('Network.getCookies', { urls: [expected.href] }, session)).cookies;
+    if (options.selectedCookieKeys !== undefined) {
+      const selected = new Set(options.selectedCookieKeys);
+      cookies = cookies.filter(cookie => selected.has(cookieKey(cookie)));
+    }
+    const origins = [];
+    if (options.includeStorage !== false && options.metadataOnly !== true) {
+      const basic = await evalValue(cdp, session, CAPTURE_SCRIPT);
+      const indexedDB = await evalValue(cdp, session, IDB_CAPTURE_SCRIPT);
+      origins.push({ ...basic, indexedDB });
+    }
+    const finalUrl = await evalValue(cdp, session, 'location.href');
+    if (tab.url !== expected.href || finalUrl !== expected.href) throw new Error('selected target navigated during capture');
+    return { cookies: cookies.map(cookie => options.metadataOnly ? { ...cookie, value: '' } : cookie), origins, tabs: [tab] };
+  } finally {
+    if (session) await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {});
+    cdp.close();
+  }
+}
+
+function cookieKey(cookie) {
+  const host = String(cookie.domain || new URL(cookie.url).hostname).replace(/^\./, '').toLowerCase();
+  return Buffer.from(JSON.stringify([host, cookie.path || '/', cookie.name, cookie.partitionKey || null])).toString('base64url');
+}
+
 function storageRestoreScript(originState) {
   return `(() => { const local=${JSON.stringify(originState.localStorage || [])}; const session=${JSON.stringify(originState.sessionStorage || [])}; localStorage.clear(); sessionStorage.clear(); for(const x of local)localStorage.setItem(x.name,x.value); for(const x of session)sessionStorage.setItem(x.name,x.value); return true })()`;
 }
@@ -130,8 +173,23 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
     }
     for (const tab of filtered.tabs || []) {
       let origin; try { origin = new URL(tab.url).origin; } catch { continue; }
-      if (targetByOrigin.has(origin)) { targetByOrigin.delete(origin); continue; }
-      await cdp.send('Target.createTarget', { url: tab.url, browserContextId, background: false });
+      let targetId = targetByOrigin.get(origin);
+      if (targetId) targetByOrigin.delete(origin);
+      else targetId = (await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId, background: false })).targetId;
+      const session = await attachPage(cdp, targetId);
+      try {
+        await cdp.send('Page.navigate', { url: tab.url }, session);
+        await waitForLoad(cdp, session);
+        const x = Number.isFinite(tab.scroll?.x) ? tab.scroll.x : 0;
+        const y = Number.isFinite(tab.scroll?.y) ? tab.scroll.y : 0;
+        if (x || y) await evalValue(cdp, session, `window.scrollTo(${x}, ${y})`).catch(() => {});
+        if (tab.media && Number.isFinite(tab.media.currentTime)) {
+          const media = { currentTime: Math.max(0, tab.media.currentTime), paused: tab.media.paused !== false,
+            playbackRate: Number.isFinite(tab.media.playbackRate) ? tab.media.playbackRate : 1,
+            volume: Number.isFinite(tab.media.volume) ? Math.min(1, Math.max(0, tab.media.volume)) : 1, muted: Boolean(tab.media.muted) };
+          await evalValue(cdp, session, `(async()=>{const wanted=${JSON.stringify(media)},deadline=Date.now()+10000;let item;while(Date.now()<deadline){item=[...document.querySelectorAll('video,audio')].find(x=>!x.paused)||document.querySelector('video,audio');if(item)break;await new Promise(resolve=>setTimeout(resolve,100))}if(!item)return false;item.currentTime=wanted.currentTime;item.playbackRate=wanted.playbackRate;item.volume=wanted.volume;item.muted=wanted.muted;if(wanted.paused)item.pause();else await item.play().catch(()=>{});return true})()`).catch(() => {});
+        }
+      } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
     }
     // Re-apply the filtered cookie set to targets/contexts created during this live import operation.
     await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });

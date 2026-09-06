@@ -2,9 +2,9 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runAdapter } from '../../lib/adapter.js';
-import { capture, withLocalChrome } from '../lib/browser.js';
+import { capture, captureTarget, withLocalChrome } from '../lib/browser.js';
 import { installBundle } from '../lib/import.js';
-import { KIND, LEGACY_KIND, loadBundle, parseList, saveBundle, secureTree, writePrivate } from '../lib/util.js';
+import { KIND, LEGACY_KIND, filterState, loadBundle, parseList, saveBundle, secureTree, writePrivate } from '../lib/util.js';
 
 const BUNDLE_FILES = ['state.json', 'storage_state.json', 'manifest.json'];
 
@@ -18,7 +18,12 @@ async function exportRequest(r) {
   const options = requestOptions(r), source = parseSource(r.source, options);
   if (source.type === 'bundle') return exported(await copyBundle(source.path, r.staging_dir), r.staging_dir);
   const policy = { includes: parseList(options.include_domains), excludes: parseList(options.exclude_domains) };
-  const state = source.type === 'local' ? await withLocalChrome(source.profile, ws => capture(ws, policy)) : await capture(source.cdp_url, policy, { browserContextId: source.browser_context_id });
+  let state = source.type === 'local'
+    ? await withLocalChrome(source.profile, ws => capture(ws, policy))
+    : source.target_id
+      ? await captureTarget(source.cdp_url, source.target_id, source.expected_url, { includeStorage: options.include_storage !== 'false', selectedCookieKeys: selectedCookieKeys(options.selected_cookie_keys) })
+      : await capture(source.cdp_url, policy, { browserContextId: source.browser_context_id });
+  if (source.target_id) state = filterState(state, policy.includes, policy.excludes, { allowNonPortable: true });
   return exported(await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', allowNonPortable: options.allow_non_portable === 'true', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } }), r.staging_dir);
 }
 
@@ -57,6 +62,15 @@ function requestOptions(request) {
   return request.options;
 }
 
+function selectedCookieKeys(value) {
+  if (value === undefined) return undefined;
+  try {
+    const keys = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!Array.isArray(keys) || keys.some(key => typeof key !== 'string')) throw new Error();
+    return keys;
+  } catch { throw coded('invalid_request', 'selected_cookie_keys must be a base64url JSON string array'); }
+}
+
 function parseSource(source, options) {
   if (typeof source === 'string') {
     if (source.startsWith('local:') && (source.slice(6) || options.profile)) return { type: 'local', profile: source.slice(6) || options.profile };
@@ -68,7 +82,10 @@ function parseSource(source, options) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) throw coded('invalid_request', 'source must be a string or object');
   if (source.type === 'bundle' && typeof source.path === 'string' && source.path) return { type: 'bundle', path: path.resolve(source.path) };
   if (source.type === 'local' && (source.profile || options.profile)) return { type: 'local', profile: source.profile || options.profile };
-  if (source.type === 'cdp' && typeof source.cdp_url === 'string' && /^wss?:\/\//.test(source.cdp_url)) return { ...source, browser_context_id: source.browser_context_id || options.browser_context_id };
+  if (source.type === 'cdp' && typeof source.cdp_url === 'string' && /^wss?:\/\//.test(source.cdp_url)) {
+    if (source.target_id !== undefined && (typeof source.target_id !== 'string' || !source.target_id || typeof source.expected_url !== 'string')) throw coded('invalid_request', 'selected CDP source requires target_id and expected_url');
+    return { ...source, browser_context_id: source.browser_context_id || options.browser_context_id };
+  }
   throw coded('invalid_request', 'invalid browser-session source object');
 }
 

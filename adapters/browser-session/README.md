@@ -48,6 +48,17 @@ Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 
 ## Adapter and façade
 
+Applications can import the supported JavaScript surface from `lib/index.js`.
+It exports whole-context and exact-target capture, bundle save/install, live
+install/revoke, manifest construction, and cookie portability helpers. Internal
+files may change independently of this entrypoint.
+
+The adapter also accepts an exact CDP target as a structured source:
+`{"type":"cdp","cdp_url":"ws://…","target_id":"…","expected_url":"https://…"}`.
+Set adapter option `include_storage=false` to capture cookies and tab metadata only.
+Set `selected_cookie_keys` to a base64url-encoded JSON string array to include
+only chosen cookies. A key is base64url JSON of `[domain,path,name,partitionKey]`.
+
 `bin/adapter.js` implements `abra-adapter/1`. Export puts the real bundle in `files_path`; its `payload` field contains manifest metadata only. Imports mark receipts non-re-exportable and never return a CDP URL.
 
 Import destinations are explicit. Use `--destination local` to launch a new

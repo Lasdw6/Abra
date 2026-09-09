@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runAdapter } from '../../lib/adapter.js';
-import { capture, captureTarget, withLocalChrome } from '../lib/browser.js';
+import { capture, captureFrom, captureTarget } from '../lib/browser.js';
 import { browserWebSocketFromUrl } from '../lib/cdp.js';
 import { installBundle } from '../lib/import.js';
 import { KIND, LEGACY_KIND, filterState, loadBundle, parseList, saveBundle, secureTree, writePrivate } from '../lib/util.js';
@@ -19,11 +19,17 @@ async function exportRequest(r) {
   const options = requestOptions(r), source = await parseSource(r.source, options);
   if (source.type === 'bundle') return exported(await copyBundle(source.path, r.staging_dir), r.staging_dir);
   const policy = { includes: parseList(options.include_domains), excludes: parseList(options.exclude_domains) };
-  let state = source.type === 'local'
-    ? await withLocalChrome(source.profile, ws => capture(ws, policy))
-    : source.target_id
-      ? await captureTarget(source.cdp_url, source.target_id, source.expected_url, { includeStorage: options.include_storage !== 'false', selectedCookieKeys: selectedCookieKeys(options.selected_cookie_keys) })
-      : await capture(source.cdp_url, policy, { browserContextId: source.browser_context_id });
+  let state;
+  try {
+    state = source.type === 'local' || source.type === 'managed'
+      ? await captureFrom(source, policy)
+      : source.target_id
+        ? await captureTarget(source.cdp_url, source.target_id, source.expected_url, { includeStorage: options.include_storage !== 'false', selectedCookieKeys: selectedCookieKeys(options.selected_cookie_keys) })
+        : await capture(source.cdp_url, policy, { browserContextId: source.browser_context_id });
+  } catch (error) {
+    if (error.code === 'not_found') throw coded('not_found', error.message);
+    throw error;
+  }
   if (source.target_id) state = filterState(state, policy.includes, policy.excludes, { allowNonPortable: true });
   return exported(await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', allowNonPortable: options.allow_non_portable === 'true', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } }), r.staging_dir);
 }
@@ -72,17 +78,31 @@ function selectedCookieKeys(value) {
   } catch { throw coded('invalid_request', 'selected_cookie_keys must be a base64url JSON string array'); }
 }
 
+function parseMaxTabs(value) {
+  if (value === undefined || value === '') return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw coded('invalid_request', 'max_tabs must be a positive integer');
+  return parsed;
+}
+
 async function parseSource(source, options) {
+  const maxTabs = parseMaxTabs(options.max_tabs);
   if (typeof source === 'string') {
-    if (source.startsWith('local:') && (source.slice(6) || options.profile)) return { type: 'local', profile: source.slice(6) || options.profile };
+    if (source === 'local' || source === 'managed') return { type: source, profile: options.profile, max_tabs: maxTabs };
+    if (source.startsWith('local:') && (source.slice(6) || options.profile)) {
+      return { type: 'local', profile: source.slice(6) || options.profile, max_tabs: maxTabs };
+    }
     if (source.startsWith('cdp:') && isCdpEndpoint(source.slice(4))) return { type: 'cdp', cdp_url: await resolveCdpUrl(source.slice(4)), browser_context_id: options.browser_context_id };
     if (/^wss?:\/\//.test(source)) return { type: 'cdp', cdp_url: source, browser_context_id: options.browser_context_id };
     if (source.startsWith('bundle:') && source.slice(7)) return { type: 'bundle', path: path.resolve(source.slice(7)) };
-    throw coded('invalid_request', 'source must be local:<profile>, cdp:<ws-or-http-url>, bundle:<dir>, or a ws(s) URL');
+    throw coded('invalid_request', 'source must be local, local:<profile>, managed, cdp:<ws-or-http-url>, bundle:<dir>, or a ws(s) URL');
   }
   if (!source || typeof source !== 'object' || Array.isArray(source)) throw coded('invalid_request', 'source must be a string or object');
   if (source.type === 'bundle' && typeof source.path === 'string' && source.path) return { type: 'bundle', path: path.resolve(source.path) };
-  if (source.type === 'local' && (source.profile || options.profile)) return { type: 'local', profile: source.profile || options.profile };
+  if (source.type === 'managed') return { type: 'managed' };
+  if (source.type === 'local') {
+    return { type: 'local', profile: source.profile || options.profile, max_tabs: parseMaxTabs(source.max_tabs) ?? maxTabs };
+  }
   if (source.type === 'cdp' && typeof source.cdp_url === 'string' && isCdpEndpoint(source.cdp_url)) {
     if (source.target_id !== undefined && (typeof source.target_id !== 'string' || !source.target_id || typeof source.expected_url !== 'string')) throw coded('invalid_request', 'selected CDP source requires target_id and expected_url');
     return { ...source, cdp_url: await resolveCdpUrl(source.cdp_url), browser_context_id: source.browser_context_id || options.browser_context_id };
@@ -91,16 +111,17 @@ async function parseSource(source, options) {
 }
 
 async function parseDestination(destination) {
+  if (destination === undefined || destination === null || destination === '') return { type: 'managed' };
   if (typeof destination === 'string') {
-    if (destination === 'local') return { type: 'local' };
+    if (destination === 'local' || destination === 'managed') return { type: 'managed' };
     if (destination.startsWith('cdp:') && isCdpEndpoint(destination.slice(4))) return { type: 'cdp', cdpUrl: await resolveCdpUrl(destination.slice(4)) };
     if (/^wss?:\/\//.test(destination)) return { type: 'cdp', cdpUrl: destination };
   }
   if (destination && typeof destination === 'object' && !Array.isArray(destination)) {
-    if (destination.type === 'local') return { type: 'local' };
+    if (destination.type === 'local' || destination.type === 'managed') return { type: 'managed' };
     if (destination.type === 'cdp' && typeof destination.cdp_url === 'string' && isCdpEndpoint(destination.cdp_url)) return { type: 'cdp', cdpUrl: await resolveCdpUrl(destination.cdp_url) };
   }
-  throw coded('invalid_request', 'browser-session import requires --destination local or --destination cdp:<ws-or-http-url>');
+  throw coded('invalid_request', 'browser-session import requires --destination local, managed, or cdp:<ws-or-http-url>');
 }
 
 function isCdpEndpoint(value) {

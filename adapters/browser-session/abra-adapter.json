@@ -4,5 +4,26 @@
   "version": "0.1.0",
   "kinds": ["dev.abra.browser.session.v1", "dev.abra.browser-session.v1"],
   "verbs": ["export", "import"],
-  "executable": "bin/adapter.js"
+  "executable": "bin/adapter.js",
+  "presets": {
+    "source": [
+      {
+        "label": "Your browser",
+        "value": "local",
+        "description": "Open tabs and their sign-ins from your own Chrome. Where there is no desktop, the Abra browser."
+      },
+      {
+        "label": "Abra browser",
+        "value": "managed",
+        "description": "Sessions already imported into the browser Abra opened on this machine."
+      }
+    ],
+    "destination": [
+      {
+        "label": "Abra browser",
+        "value": "local",
+        "description": "A browser Abra opens or reuses here. Headless where there is no desktop."
+      }
+    ]
+  }
 }

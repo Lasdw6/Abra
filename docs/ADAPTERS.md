@@ -29,6 +29,12 @@ Cadabra discovers `<root>/adapters/*/abra-adapter.json`; `abra adapters add
 be omitted when the executable filename exactly equals `name`, which keeps the
 browser-session manifest shape loadable.
 
+`presets` is optional. It names choices a user interface may offer for `source`
+and `destination`. Each list has at most 16 entries. A preset has a `label` of
+1 to 80 characters, a `value` that is a string or an object, and an optional
+`description` of at most 240 characters. The interface may show those choices
+and passes the value to the adapter unchanged.
+
 Every request contains `protocol:"abra-adapter/1"`, a hex `request_id`, and a
 `verb`. Every response repeats `request_id` and has either `ok:true` plus result
 fields, or `ok:false,error:{code,message,retryable}`. Codes are

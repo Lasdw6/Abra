@@ -81,7 +81,7 @@ The inner manifest signature remains verifiable after transport encryption is re
 
 Import MUST create a fresh isolated browser context and MUST NOT install into the user's default profile. Cookies are installed with CDP `Storage.setCookies` for that browser-context id. Storage is restored in an origin-bound page; tabs are then opened. Cookies SHOULD be reapplied when new targets/contexts appear during the live import operation, because providers may create pages lazily.
 
-The external adapter MUST require an explicit browser destination. Accepted string forms are exactly `local`, `cdp:<ws-url>`, or a bare `ws://` or `wss://` URL; equivalent typed object forms are also accepted. Any other string, including the materialization directory supplied as Abra's default destination, MUST fail without launching a browser. The adapter MUST read bundle files only from `materialized_files`; sender payload metadata MUST NOT select a local path.
+Accepted destinations are omitted, `local`, `managed`, `{type:"local"}`, `{type:"managed"}`, `cdp:<ws-url>`, a bare `ws://` or `wss://` URL, and the equivalent typed CDP object. Omitted, `local`, and `managed` install into the adapter-owned browser. Any other string, including the materialization directory supplied as Abra's default destination, MUST fail without launching a browser. The adapter MUST read bundle files only from `materialized_files`; sender payload metadata MUST NOT select a local path.
 
 An importer writes a receipt signed by the pinned local installation key containing: receipt kind, install time, opaque install id, isolated context id, cookie identifiers (never values), installed origins, effective policy, source-bundle digest, and `reexportable: false`. It MUST NOT contain a PID, path, or CDP URL. The capability mapping lives in a private `0600` registry. Revocation MUST verify kind, signature domain, fingerprint, pinned key, and registry/context match before action. It MUST never kill a PID or delete a path supplied by a receipt; registered processes require command-line verification and tool paths require `realpath` containment.
 
@@ -104,4 +104,4 @@ STATE is equivalent to a bag of bearer credentials. Payloads, receipts, and regi
 
 The external adapter MUST reset a materialized bundle to these private modes before reading it. Cadabra may materialize files as `0644` and directories as `0755`.
 
-Copied-profile local export is cookies-only in v1 because Chrome's last-session files do not have a stable format available to this zero-dependency adapter. Direct CDP capture is the supported demo path for tabs and origin storage.
+On macOS, `local` export reads open tabs through a copied profile in a temporary headless Chrome. With no open tabs it captures cookies only, as before. Direct CDP capture remains available.

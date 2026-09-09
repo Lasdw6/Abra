@@ -40,6 +40,50 @@ pub struct AdapterManifest {
     pub controls: Vec<String>,
     #[serde(default)]
     pub executable: Option<String>,
+    /// Optional choices a user interface can offer for `source` and
+    /// `destination`. Values are passed to the adapter unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Presets>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Presets {
+    #[serde(default)]
+    pub source: Vec<Preset>,
+    #[serde(default)]
+    pub destination: Vec<Preset>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preset {
+    pub label: String,
+    pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl Presets {
+    pub fn validate(&self) -> Result<()> {
+        for list in [&self.source, &self.destination] {
+            if list.len() > 16 {
+                return Err("adapter manifest lists more than 16 presets".into());
+            }
+            for preset in list {
+                if preset.label.is_empty() || preset.label.len() > 80 {
+                    return Err("adapter preset label must have 1 to 80 characters".into());
+                }
+                if preset.description.as_ref().is_some_and(|d| d.len() > 240) {
+                    return Err("adapter preset description exceeds 240 characters".into());
+                }
+                if !(preset.value.is_string() || preset.value.is_object()) {
+                    return Err("adapter preset value must be a string or an object".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -459,6 +503,11 @@ fn load_registration(directory: &Path) -> Result<(AdapterManifest, PathBuf)> {
     let manifest: AdapterManifest = serde_json::from_slice(&fs::read(&path)?)?;
     if manifest.spec != "abra-adapter/1" || manifest.kinds.is_empty() {
         return Err(format!("invalid adapter manifest {}", path.display()).into());
+    }
+    if let Some(presets) = &manifest.presets {
+        presets
+            .validate()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let executable = resolve_executable(directory, &manifest)?;
     Ok((manifest, executable))
@@ -908,5 +957,118 @@ mod tests {
         let registry = AdapterRegistry::discover(root.path()).unwrap();
         assert!(registry.for_kind("com.test.good").is_some());
         assert_eq!(registry.errors.len(), 1);
+    }
+
+    fn write_manifest(root: &Path, name: &str, extra: Value) {
+        let path = root.join("adapters").join(name);
+        fs::create_dir_all(&path).unwrap();
+        let mut manifest = json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"verbs":["export"],"executable":"run"});
+        if let Some(object) = extra.as_object() {
+            for (key, value) in object {
+                manifest[key] = value.clone();
+            }
+        }
+        fs::write(
+            path.join("abra-adapter.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let executable = path.join("run");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn presets_parse_and_reject_invalid_values() {
+        let ok = tempfile::tempdir().unwrap();
+        write_manifest(
+            ok.path(),
+            "ok",
+            json!({"presets":{"source":[{"label":"Local","value":"local","description":"from here"},{"label":"Object","value":{"type":"cdp"}}],"destination":[{"label":"Here","value":"local"}]}}),
+        );
+        let registry = AdapterRegistry::discover(ok.path()).unwrap();
+        let presets = registry
+            .for_kind("com.test.ok")
+            .unwrap()
+            .manifest
+            .presets
+            .as_ref()
+            .unwrap();
+        assert_eq!(presets.source.len(), 2);
+        assert_eq!(presets.destination.len(), 1);
+        presets.validate().unwrap();
+
+        let too_many = tempfile::tempdir().unwrap();
+        let entries: Vec<Value> = (0..17)
+            .map(|i| json!({"label": format!("P{i}"), "value": "x"}))
+            .collect();
+        write_manifest(
+            too_many.path(),
+            "many",
+            json!({"presets":{"source":entries}}),
+        );
+        let registry = AdapterRegistry::discover(too_many.path()).unwrap();
+        assert!(registry
+            .errors
+            .iter()
+            .any(|error| error.contains("more than 16 presets")));
+
+        let long_label = "a".repeat(81);
+        let long_desc = "a".repeat(241);
+        for (name, presets, fragment) in [
+            (
+                "empty",
+                json!({"source":[{"label":"","value":"x"}]}),
+                "label must have 1 to 80",
+            ),
+            (
+                "long-label",
+                json!({"source":[{"label":long_label,"value":"x"}]}),
+                "label must have 1 to 80",
+            ),
+            (
+                "long-desc",
+                json!({"source":[{"label":"ok","value":"x","description":long_desc}]}),
+                "description exceeds 240",
+            ),
+            (
+                "array-value",
+                json!({"source":[{"label":"ok","value":[]}]}),
+                "string or an object",
+            ),
+            (
+                "number-value",
+                json!({"source":[{"label":"ok","value":1}]}),
+                "string or an object",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_manifest(root.path(), name, json!({"presets": presets}));
+            let registry = AdapterRegistry::discover(root.path()).unwrap();
+            assert!(
+                registry.errors.iter().any(|error| error.contains(fragment)),
+                "{name}: {:?}",
+                registry.errors
+            );
+        }
+    }
+
+    #[test]
+    fn browser_session_manifest_loads_presets() {
+        let dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../adapters/browser-session"
+        ));
+        let (manifest, _) = load_registration(dir).unwrap();
+        let presets = manifest.presets.expect("browser-session presets");
+        assert_eq!(presets.source.len(), 2);
+        assert_eq!(presets.destination.len(), 1);
+        assert_eq!(presets.source[0].label, "Your browser");
+        assert_eq!(presets.source[0].value, json!("local"));
+        assert_eq!(presets.source[1].label, "Abra browser");
+        assert_eq!(presets.source[1].value, json!("managed"));
+        assert_eq!(presets.destination[0].label, "Abra browser");
+        assert_eq!(presets.destination[0].value, json!("local"));
+        presets.validate().unwrap();
     }
 }

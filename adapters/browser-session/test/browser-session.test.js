@@ -9,18 +9,19 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, browserWebSocketFromUrl, evalValue, resolveCdpEndpoint, waitForLoad } from '../lib/cdp.js';
 import { capture, captureTarget, install, revoke, stopLocalChrome } from '../lib/browser.js';
+import { chromeBinary, ensureManagedBrowser, stopChrome, stopManagedBrowser } from '../lib/managed.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
 import { allowedDomain, assertPrivateFile, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
 import { createFacade } from '../facade/server.js';
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const NO_CHROME_MESSAGE = 'Chrome tests disabled by ABRA_BROWSER_TEST_NO_CHROME=1';
 process.env.ABRA_BROWSER_DATA_DIR = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-data-test-'));
+process.env.ABRA_BROWSER_CHROME_ROOT = path.join(process.env.ABRA_BROWSER_DATA_DIR, 'missing-chrome-root');
 test.after(() => rm(process.env.ABRA_BROWSER_DATA_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
-async function adapterRequest(request) {
-  const child = spawn(process.execPath, [path.resolve('bin/adapter.js')], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+async function adapterRequest(request, env = process.env) {
+  const child = spawn(process.execPath, [path.resolve('bin/adapter.js')], { stdio: ['pipe', 'pipe', 'pipe'], env });
   const stdout = [], stderr = [];
   child.stdout.on('data', chunk => stdout.push(chunk));
   child.stderr.on('data', chunk => stderr.push(chunk));
@@ -192,7 +193,7 @@ test('http debugging endpoints resolve through /json/version', async () => {
 test('adapter rejects invalid source and destination forms', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-adapter-validation-'));
   const exportBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export', options: {}, staging_dir: path.join(root, 'out') };
-  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', 'bundle:', { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }, { type: 'local' }, { type: 'bundle' }].entries()) {
+  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', 'bundle:', { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }, { type: 'other' }, { type: 'bundle' }].entries()) {
     const response = await adapterRequest({ ...exportBase, request_id: `c${index}`, source });
     assert.equal(response.error.code, 'invalid_request');
   }
@@ -206,8 +207,11 @@ test('adapter rejects invalid source and destination forms', async () => {
   for (const [index, destination] of ['/tmp/materialized', 'cdp:ftp://127.0.0.1', { cdp_url: 'ws://127.0.0.1:1' }, { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }].entries()) {
     const response = await adapterRequest({ ...importBase, request_id: `d${index}`, destination });
     assert.equal(response.error.code, 'invalid_request');
-    assert.match(response.error.message, /requires --destination local or --destination cdp/);
+    assert.match(response.error.message, /requires --destination local, managed, or cdp/);
   }
+  const missing = await adapterRequest({ ...exportBase, request_id: 'c9', source: 'managed' });
+  assert.equal(missing.error.code, 'not_found');
+  assert.match(missing.error.message, /no managed browser is running/);
 });
 
 test('adapter ignores sender payload paths and does not chmod them', async () => {
@@ -232,7 +236,7 @@ function skipChromeTest(t) {
 async function chrome() {
   if (process.env.ABRA_BROWSER_TEST_NO_CHROME === '1') throw new Error(NO_CHROME_MESSAGE);
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-test-'));
-  const child = spawn(CHROME, ['--headless=new', '--no-sandbox', `--user-data-dir=${root}`, '--remote-debugging-port=0', '--no-first-run', 'about:blank'], { stdio: 'ignore' });
+  const child = spawn(await chromeBinary(), ['--headless=new', '--no-sandbox', `--user-data-dir=${root}`, '--remote-debugging-port=0', '--no-first-run', 'about:blank'], { stdio: 'ignore' });
   try {
     let port;
     for (let i = 0; i < 200; i++) { try { port = Number((await readFile(path.join(root, 'DevToolsActivePort'), 'utf8')).split('\n')[0]); break; } catch { await delay(50); } }
@@ -359,7 +363,7 @@ test('adapter rejects the daemon filesystem destination without changing bundle 
   const destinationPath = path.join(bundle, 'daemon-default-destination');
   const imported = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'b2', verb: 'import', kind: 'dev.abra.browser.session.v1', payload: {}, materialized_files: bundle, destination: destinationPath, options: {} });
   assert.equal(imported.error.code, 'invalid_request');
-  assert.match(imported.error.message, /requires --destination local or --destination cdp/);
+  assert.match(imported.error.message, /requires --destination local, managed, or cdp/);
   assert.equal((await stat(bundle)).mode & 0o777, 0o755);
   for (const name of ['state.json', 'storage_state.json', 'manifest.json']) assert.equal((await stat(path.join(bundle, name))).mode & 0o777, 0o644);
 });
@@ -588,4 +592,88 @@ test('manual cookie override is explicit and still respects domain policy', asyn
     assert.equal(filterState(state, [], ['example.com'], { allowNonPortable: true }).cookies.length, 0);
     assert.equal(filterState(state, [], [], { allowNonPortable: 'true' }).cookies.length, 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('managed browser import reuses one Chrome and recapture sees the session', { timeout: 60000 }, async t => {
+  if (skipChromeTest(t)) return;
+  let started;
+  try { started = await ensureManagedBrowser({ headless: true }); }
+  catch (error) { t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  t.after(async () => { await stopManagedBrowser().catch(() => {}); });
+  const fixture = await fixtureServer();
+  t.after(fixture.close);
+  const origin = `http://127.0.0.1:${fixture.port}`;
+  const bundle = await mkdtemp(path.join(os.tmpdir(), 'abra-managed-bundle-'));
+  await saveBundle(bundle, {
+    cookies: [{ name: 'sid', value: 'alpha', domain: '127.0.0.1', path: '/' }],
+    origins: [{ origin, localStorage: [{ name: 'k', value: 'v' }], sessionStorage: [], indexedDB: { databases: [] } }],
+    tabs: [{ url: `${origin}/`, title: 'marker' }]
+  });
+  const importBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'import', payload: {}, materialized_files: bundle, options: {} };
+  const first = await adapterRequest({ ...importBase, request_id: '11', destination: 'local' });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.result.receipt.managed, true);
+  const reused = await ensureManagedBrowser({ headless: true });
+  assert.equal(reused.pid, started.pid);
+  const second = await adapterRequest({ ...importBase, request_id: '12', destination: { type: 'local' } });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal((await ensureManagedBrowser({ headless: true })).pid, started.pid);
+  const staging = await mkdtemp(path.join(os.tmpdir(), 'abra-managed-export-'));
+  const exported = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export',
+    request_id: '13', source: 'managed', staging_dir: staging, options: {}
+  });
+  assert.equal(exported.ok, true, JSON.stringify(exported));
+  const state = (await loadBundle(staging)).state;
+  assert.equal(state.cookies.some(cookie => cookie.name === 'sid' && cookie.value === 'alpha' && cookie.domain === '127.0.0.1'), true);
+  assert.equal(state.tabs.some(tab => tab.url.startsWith(origin)), true);
+});
+
+test('local macOS profile export captures cookies, storage, and open tabs', { timeout: 60000 }, async t => {
+  if (process.platform !== 'darwin') { t.skip('local Chrome profile capture is macOS-only'); return; }
+  if (skipChromeTest(t)) return;
+  let binary;
+  try { binary = await chromeBinary(); }
+  catch (error) { t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  const fixture = await fixtureServer();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-chrome-root-'));
+  t.after(async () => { await fixture.close(); await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
+  const origin = `http://127.0.0.1:${fixture.port}`;
+  const child = spawn(binary, ['--headless=new', '--no-sandbox', `--user-data-dir=${root}`, '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
+  try {
+    let port;
+    for (let i = 0; i < 300; i++) {
+      try {
+        port = Number((await readFile(path.join(root, 'DevToolsActivePort'), 'utf8')).split('\n')[0]);
+        if (Number.isInteger(port) && port > 0) break;
+      } catch { /* still starting */ }
+      await delay(50);
+    }
+    if (!port) throw new Error('Chrome failed to start');
+    const ws = await browserWebSocketFromPort(port);
+    const opened = await page(ws, origin);
+    await delay(300);
+    opened.close();
+    const cdp = await new CDP(ws).connect();
+    await cdp.send('Browser.close').catch(() => {});
+    cdp.close();
+    await stopChrome(child.pid, root);
+  } catch (error) {
+    await stopChrome(child.pid, root).catch(() => {});
+    t.skip(`headless Chrome unavailable: ${error.message}`);
+    return;
+  }
+  const staging = await mkdtemp(path.join(os.tmpdir(), 'abra-local-export-'));
+  const tab = { url: `${origin}/`, title: 'fixture' };
+  const exported = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export',
+    request_id: '21', source: 'local', staging_dir: staging, options: {}
+  }, { ...process.env, ABRA_BROWSER_CHROME_ROOT: root, ABRA_BROWSER_TABS_JSON: JSON.stringify([tab]) });
+  assert.equal(exported.ok, true, JSON.stringify(exported));
+  const state = (await loadBundle(staging)).state;
+  assert.equal(state.cookies.some(cookie => cookie.name === 'server_cookie' && cookie.value === 'beta'), true);
+  const originState = state.origins.find(item => item.origin === origin);
+  assert.ok(originState);
+  assert.equal(originState.localStorage.some(item => item.name === 'local-secret' && item.value === '127.0.0.1-local'), true);
+  assert.equal(state.tabs.some(item => item.url === tab.url && item.title === tab.title), true);
 });

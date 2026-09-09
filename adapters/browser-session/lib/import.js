@@ -3,7 +3,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { install, launchLocalChrome, stopChrome } from './browser.js';
+import { install } from './browser.js';
+import { ensureManagedBrowser, stopChrome } from './managed.js';
 import { dataDir, loadBundle, signObject, signingIdentity, writeJson } from './util.js';
 
 const execFileAsync = promisify(execFile);
@@ -52,34 +53,22 @@ export async function installBundle(bundleDir, destination, options = {}) {
   }
 
   const installId = randomUUID();
-  let local;
-  let wsUrl;
-  if (destination.type === 'cdp') wsUrl = destination.cdpUrl;
-  else {
-    const profileDir = path.join(dataDir(), 'profiles', installId);
-    local = await launchLocalChrome(undefined, { fresh: true, root: profileDir });
-    wsUrl = local.wsUrl;
-  }
+  const managed = destination.type !== 'cdp';
+  const wsUrl = managed ? (await ensureManagedBrowser()).wsUrl : destination.cdpUrl;
 
-  try {
-    const receipt = await install(wsUrl, state, options.policy || {}, { watchMs: options.watchMs || 0 });
-    receipt.install_id = installId;
-    receipt.source_bundle_sha256 = manifest.state_sha256;
-    receipt.reexportable = false;
-    const localIdentity = local ? await processIdentity(local.child.pid) : null;
-    await writeJson(registryFile(installId), {
-      cdp_url: wsUrl,
-      browser_context_id: receipt.browser_context_id,
-      origins: receipt.origins,
-      ...(local ? { pid: local.child.pid, profile_dir: local.tempRoot, ...localIdentity } : {})
-    });
-    receipt.signature = signObject(receipt, await signingIdentity(), 'browser-session-install-receipt');
-    const output = options.receiptPath ? path.resolve(options.receiptPath) : receiptFile(installId);
-    await writeJson(output, receipt);
-    if (local) local.child.unref();
-    return { receipt, receiptPath: output };
-  } catch (error) {
-    if (local) await cleanupLocalProfile(local);
-    throw error;
-  }
+  const receipt = await install(wsUrl, state, options.policy || {}, { watchMs: options.watchMs || 0 });
+  receipt.install_id = installId;
+  receipt.source_bundle_sha256 = manifest.state_sha256;
+  receipt.reexportable = false;
+  if (managed) receipt.managed = true;
+  await writeJson(registryFile(installId), {
+    cdp_url: wsUrl,
+    browser_context_id: receipt.browser_context_id,
+    origins: receipt.origins,
+    ...(managed ? { managed: true } : {})
+  });
+  receipt.signature = signObject(receipt, await signingIdentity(), 'browser-session-install-receipt');
+  const output = options.receiptPath ? path.resolve(options.receiptPath) : receiptFile(installId);
+  await writeJson(output, receipt);
+  return { receipt, receiptPath: output };
 }

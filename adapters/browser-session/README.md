@@ -28,19 +28,24 @@ Destination capabilities live in a private registry. Receiver policy normalizes 
 
 It also rejects a parent-domain cookie when it could reach a denied child host.
 
-## Local Chrome
+## Your browser
 
-`export --from local --profile Default` makes a private profile copy. It removes
-the copy after Chrome exits, including errors and interrupts. Symlinked source
-profiles are refused. `import --to local --detach` launches a new empty profile
-under the tool data directory. It binds debugging to loopback. `--detach` is
-explicit because Chrome remains alive until verified revocation.
+`export --from local` on macOS copies open tabs and their cookies and origin
+storage from your Chrome. It copies profile state into a temporary directory,
+reads it through a headless Chrome, then deletes the copy, including on errors
+and interrupts. `--profile` selects a directory under the Chrome root (`Default`
+if omitted, or the last-used profile from Local State). `local:<profile>` is the
+same choice. Symlinked source profiles are refused.
 
-Local export captures cookies only. Chrome's last-session files lack a stable,
-cheap-to-read format. The copied profile starts with a blank tab. Use direct
-CDP capture when tabs or origin storage matter.
+On Linux, and when Chrome's profile root is missing, `local` is the managed
+browser this tool opens under the data directory. `export --from managed` always
+reads that browser. It errors if none is running.
 
-Chrome is expected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
+`import --to local --detach` installs into the managed browser, creating a fresh
+isolated context. Chrome stays running until you revoke that context. Debugging
+binds to loopback. `--to managed --detach` is the same destination.
+
+Chrome is found at `CHROME_BIN`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, or `google-chrome` / `google-chrome-stable` / `chromium` / `chromium-browser` on PATH. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
 
 ## Playwright compatibility
 
@@ -61,25 +66,33 @@ only chosen cookies. A key is base64url JSON of `[domain,path,name,partitionKey]
 
 `bin/adapter.js` implements `abra-adapter/1`. Export puts the real bundle in `files_path`; its `payload` field contains manifest metadata only. Imports mark receipts non-re-exportable and never return a CDP URL.
 
-Import destinations are explicit. Use `--destination local` to launch a new
-detached Chrome. Use `--destination cdp:<ws-url>` for a CDP browser. Omitting
-`--destination` fails the import. Abra only uses its default destination path
-to materialize the bundle. That path never authorizes a browser launch.
+Import destinations `local`, `managed`, `{type:"local"}`, and an omitted value
+all reuse the managed browser. Use `--destination cdp:<ws-url>` for a CDP
+browser you already started. A filesystem path, including Abra's default
+materialization directory, is rejected. That path never authorizes a browser
+launch.
 
 ## Through Abra
 
-On Mac A, start a separate Chrome profile with remote debugging. Sign into the demo site in that Chrome window, then send the session. `cdp:http://127.0.0.1:9222` is enough; the adapter looks up `/json/version` itself. `cdp:ws://…` still works if you already have the WebSocket URL.
+On Mac A, send the tabs and sign-ins from your own Chrome:
 
 ```sh
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$HOME/.abra-demo-chrome"
-abra send <peer> --kind dev.abra.browser.session.v1 --source cdp:http://127.0.0.1:9222
+abra send <peer> --kind dev.abra.browser.session.v1 --source local
 ```
 
-On Mac B, accept the transfer into a fresh detached local Chrome:
+On Mac B, accept them into a browser Abra opens or reuses there. It is headless
+when there is no desktop:
 
 ```sh
 abra accept <id> <dir> --destination local
 ```
+
+`cdp:http://127.0.0.1:9222` still works if you already started Chrome with
+remote debugging. The adapter looks up `/json/version` itself. `cdp:ws://…`
+works when you already have the WebSocket URL.
+
+`--source managed` captures sessions already imported into the Abra browser on
+that machine.
 
 A bundle captured elsewhere (for example by the sandbox coordinator, which runs
 `export --from cdp` inside a sandbox with an ephemeral key) is sent as-is with

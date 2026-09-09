@@ -5,11 +5,33 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } from './cdp.js';
+import { chromeBinary, exists, managedBrowserStatus, stopChrome } from './managed.js';
 import { filterState } from './util.js';
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+export { stopChrome } from './managed.js';
+
 const execFileAsync = promisify(execFile);
 const REMOVE_OPTIONS = { recursive: true, force: true, maxRetries: 10, retryDelay: 200 };
+const PROFILE_STATE_ENTRIES = [
+  'Cookies', 'Cookies-journal', 'Cookies-wal',
+  'Preferences', 'Secure Preferences',
+  'Local Storage', 'Session Storage', 'IndexedDB', 'WebStorage', 'Storage',
+  'Network'
+];
+const CHROME_TABS_SCRIPT = `
+const chrome = Application('Google Chrome');
+if (!chrome.running()) JSON.stringify([]);
+else JSON.stringify(chrome.windows().flatMap((window, windowIndex) =>
+  window.tabs().map((tab, tabIndex) => ({
+    id: String(window.id()) + ':' + String(tabIndex + 1),
+    windowId: String(window.id()),
+    windowIndex: windowIndex + 1,
+    tabIndex: tabIndex + 1,
+    title: tab.title(),
+    url: tab.url(),
+    active: window.activeTabIndex() === tabIndex + 1
+  }))
+));`;
 
 const CAPTURE_SCRIPT = `(() => {
   const entries = s => Object.keys(s).sort().map(name => ({name, value:s.getItem(name)}));
@@ -49,31 +71,67 @@ function cookieForCdp(cookie) {
   return Object.fromEntries(allowed.filter(k => cookie[k] !== undefined).map(k => [k, cookie[k]]));
 }
 
+function cookieIdentity(cookie) {
+  return JSON.stringify([cookie.domain, cookie.path || '/', cookie.name, cookie.partitionKey || null]);
+}
+
+function mergeCookies(lists) {
+  const seen = new Set(), cookies = [];
+  for (const list of lists) {
+    for (const cookie of list || []) {
+      const key = cookieIdentity(cookie);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cookies.push(cookie);
+    }
+  }
+  return cookies;
+}
+
+async function capturePages(cdp, targets) {
+  const origins = new Map();
+  const tabs = [];
+  for (const target of targets) {
+    const session = await attachPage(cdp, target.targetId);
+    try {
+      await waitForLoad(cdp, session);
+      const basic = await evalValue(cdp, session, CAPTURE_SCRIPT);
+      if (!origins.has(basic.origin)) {
+        let indexedDB = { databases: [] };
+        try { indexedDB = await evalValue(cdp, session, IDB_CAPTURE_SCRIPT); } catch { /* best effort */ }
+        origins.set(basic.origin, { ...basic, indexedDB });
+      }
+      const title = await evalValue(cdp, session, 'document.title');
+      const url = await evalValue(cdp, session, 'location.href');
+      const scroll = await evalValue(cdp, session, '({x:scrollX,y:scrollY,historyLength:history.length})');
+      const media = await evalValue(cdp, session, MEDIA_CAPTURE_SCRIPT).catch(() => null);
+      tabs.push({ url, title, scroll, ...(media ? { media } : {}) });
+    } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
+  }
+  return { origins: [...origins.values()], tabs };
+}
+
 export async function capture(wsUrl, policy = {}, options = {}) {
   const cdp = await new CDP(wsUrl).connect();
   try {
     const cookies = (await cdp.send('Storage.getCookies', options.browserContextId ? { browserContextId: options.browserContextId } : {})).cookies;
     const targets = (await cdp.send('Target.getTargets')).targetInfos.filter(t => t.type === 'page' && /^https?:/.test(t.url) && (!options.browserContextId || t.browserContextId === options.browserContextId));
-    const origins = new Map();
-    const tabs = [];
-    for (const target of targets) {
-      const session = await attachPage(cdp, target.targetId);
-      try {
-        await waitForLoad(cdp, session);
-        const basic = await evalValue(cdp, session, CAPTURE_SCRIPT);
-        if (!origins.has(basic.origin)) {
-          let indexedDB = { databases: [] };
-          try { indexedDB = await evalValue(cdp, session, IDB_CAPTURE_SCRIPT); } catch { /* best effort */ }
-          origins.set(basic.origin, { ...basic, indexedDB });
-        }
-        const title = await evalValue(cdp, session, 'document.title');
-        const url = await evalValue(cdp, session, 'location.href');
-        const scroll = await evalValue(cdp, session, '({x:scrollX,y:scrollY,historyLength:history.length})');
-        const media = await evalValue(cdp, session, MEDIA_CAPTURE_SCRIPT).catch(() => null);
-        tabs.push({ url, title, scroll, ...(media ? { media } : {}) });
-      } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
+    const { origins, tabs } = await capturePages(cdp, targets);
+    return filterState({ cookies, origins, tabs }, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+  } finally { cdp.close(); }
+}
+
+export async function captureAllContexts(wsUrl, policy = {}) {
+  const cdp = await new CDP(wsUrl).connect();
+  try {
+    const extra = (await cdp.send('Target.getBrowserContexts')).browserContextIds || [];
+    const cookieLists = [(await cdp.send('Storage.getCookies', {})).cookies];
+    for (const browserContextId of extra) {
+      cookieLists.push((await cdp.send('Storage.getCookies', { browserContextId })).cookies);
     }
-    return filterState({ cookies, origins: [...origins.values()], tabs }, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+    const targets = (await cdp.send('Target.getTargets')).targetInfos.filter(t => t.type === 'page' && /^https?:/.test(t.url));
+    const { origins, tabs } = await capturePages(cdp, targets);
+    return filterState({ cookies: mergeCookies(cookieLists), origins, tabs }, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
   } finally { cdp.close(); }
 }
 
@@ -228,6 +286,9 @@ export async function revoke(wsUrl, browserContextId, origins = []) {
 }
 
 async function rejectSymlinks(root) {
+  const rootInfo = await lstat(root);
+  if (rootInfo.isSymbolicLink()) throw new Error(`refusing Chrome profile containing symlink: ${path.basename(root)}`);
+  if (!rootInfo.isDirectory()) return;
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const file = path.join(root, entry.name), info = await lstat(file);
     if (info.isSymbolicLink()) throw new Error(`refusing Chrome profile containing symlink: ${entry.name}`);
@@ -235,45 +296,165 @@ async function rejectSymlinks(root) {
   }
 }
 
-async function chromePids(profileDir) {
-  if (!profileDir) return [];
-  const { stdout } = await execFileAsync('/bin/ps', ['-ax', '-o', 'pid=', '-o', 'command=']);
-  const marker = `--user-data-dir=${profileDir}`;
-  return stdout.split('\n').flatMap(line => {
-    const match = line.match(/^\s*(\d+)\s+([\s\S]+)$/);
-    return match && match[2].includes(marker) ? [Number(match[1])] : [];
+export function chromeRoot() {
+  if (process.env.ABRA_BROWSER_CHROME_ROOT) return path.resolve(process.env.ABRA_BROWSER_CHROME_ROOT);
+  return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
+}
+
+export async function hasDesktopChromeRoot() {
+  return process.platform === 'darwin' && await exists(chromeRoot());
+}
+
+async function httpTabs(tabs) {
+  return (tabs || []).filter(tab => {
+    try { return ['http:', 'https:'].includes(new URL(tab.url).protocol); }
+    catch { return false; }
   });
 }
 
-function processExists(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+async function listChromeTabs() {
+  if (process.env.ABRA_BROWSER_TABS_JSON) {
+    try { return JSON.parse(process.env.ABRA_BROWSER_TABS_JSON); }
+    catch { throw new Error('ABRA_BROWSER_TABS_JSON must be a JSON array'); }
+  }
+  try {
+    const { stdout } = await execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', CHROME_TABS_SCRIPT]);
+    return JSON.parse(stdout);
+  } catch { return []; }
 }
 
-async function waitForChromeExit(pids, profileDir, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!pids.some(processExists) && !(await chromePids(profileDir)).length) return true;
-    await delay(50);
+async function resolveProfile(name) {
+  const root = chromeRoot();
+  if (name) {
+    if (!await exists(path.join(root, name))) throw new Error(`Chrome profile does not exist: ${name}`);
+    return name;
   }
-  return !pids.some(processExists) && !(await chromePids(profileDir)).length;
+  let lastUsed;
+  try {
+    lastUsed = JSON.parse(await readFile(path.join(root, 'Local State'), 'utf8')).profile?.last_used;
+  } catch { /* fall back to Default */ }
+  if (lastUsed && await exists(path.join(root, lastUsed))) return lastUsed;
+  if (await exists(path.join(root, 'Default'))) return 'Default';
+  throw new Error('Chrome profile does not exist: Default');
 }
 
-export async function stopChrome(pid, profileDir, timeoutMs = 5000) {
-  const initial = new Set([pid, ...await chromePids(profileDir)].filter(value => Number.isSafeInteger(value) && value > 0));
-  for (const processId of initial) {
-    try { process.kill(processId, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+async function copyProfileState(source, destination) {
+  await mkdir(destination, { recursive: true, mode: 0o700 });
+  await Promise.all(PROFILE_STATE_ENTRIES.map(async name => {
+    const from = path.join(source, name);
+    if (!await exists(from)) return;
+    await rejectSymlinks(from);
+    await cp(from, path.join(destination, name), { recursive: true, dereference: false });
+  }));
+}
+
+async function withHeadlessProfile(profile, fn) {
+  const sourceRoot = chromeRoot();
+  const temporary = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-profile-'));
+  let child;
+  try {
+    await copyProfileState(path.join(sourceRoot, profile), path.join(temporary, profile));
+    await cp(path.join(sourceRoot, 'Local State'), path.join(temporary, 'Local State'), { dereference: false }).catch(() => {});
+    const binary = await chromeBinary();
+    child = spawn(binary, [
+      `--user-data-dir=${temporary}`,
+      `--profile-directory=${profile}`,
+      '--remote-debugging-address=127.0.0.1',
+      '--remote-debugging-port=0',
+      '--headless=new',
+      '--no-first-run',
+      '--no-default-browser-check',
+      ...(process.getuid?.() === 0 || process.platform === 'linux' ? ['--no-sandbox'] : []),
+      ...(process.platform === 'linux' ? ['--disable-dev-shm-usage'] : []),
+      'about:blank'
+    ], { stdio: 'ignore' });
+    let port;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      try {
+        port = Number((await readFile(path.join(temporary, 'DevToolsActivePort'), 'utf8')).split('\n')[0]);
+        if (port) break;
+      } catch { /* Chrome is still starting. */ }
+      if (child.exitCode !== null) break;
+      await delay(50);
+    }
+    if (!port) throw new Error('the copied Chrome profile did not start');
+    return await fn(await browserWebSocketFromPort(port));
+  } finally {
+    if (child) await stopChrome(child.pid, temporary).catch(() => {});
+    await rm(temporary, REMOVE_OPTIONS).catch(() => {});
   }
-  if (await waitForChromeExit([...initial], profileDir, timeoutMs)) return;
-  const remaining = new Set([[...initial].filter(processExists), await chromePids(profileDir)].flat());
-  for (const processId of remaining) {
-    try { process.kill(processId, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
+
+async function captureCopiedTab(wsUrl, url) {
+  const expected = new URL(url).href;
+  const cdp = await new CDP(wsUrl).connect();
+  let targetId;
+  try {
+    const existing = (await cdp.send('Target.getTargets')).targetInfos.filter(item => item.type === 'page');
+    for (const target of existing) await cdp.send('Target.closeTarget', { targetId: target.targetId }).catch(() => {});
+    targetId = (await cdp.send('Target.createTarget', { url: 'about:blank', background: false })).targetId;
+    const session = await attachPage(cdp, targetId);
+    try {
+      await cdp.send('Page.navigate', { url: expected }, session);
+      await waitForLoad(cdp, session);
+    } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
+  } finally { cdp.close(); }
+  return captureTarget(wsUrl, targetId, expected);
+}
+
+function parseMaxTabs(value) {
+  if (value === undefined || value === '') return 25;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error('max_tabs must be a positive integer');
+  return parsed;
+}
+
+export async function captureLocalProfile(source = {}, policy = {}) {
+  const profile = await resolveProfile(source.profile);
+  const tabs = await httpTabs(await listChromeTabs());
+  const maxTabs = parseMaxTabs(source.max_tabs);
+  if (!tabs.length) return withLocalChrome(profile, ws => capture(ws, policy));
+  const captured = await withHeadlessProfile(profile, async wsUrl => {
+    const cookieLists = [], origins = [], seenOrigins = new Set();
+    const urls = [];
+    const seenUrls = new Set();
+    for (const tab of tabs) {
+      const href = new URL(tab.url).href;
+      if (seenUrls.has(href)) continue;
+      seenUrls.add(href);
+      urls.push(href);
+      if (urls.length >= maxTabs) break;
+    }
+    for (const url of urls) {
+      const page = await captureCopiedTab(wsUrl, url);
+      cookieLists.push(page.cookies);
+      for (const origin of page.origins || []) {
+        if (seenOrigins.has(origin.origin)) continue;
+        seenOrigins.add(origin.origin);
+        origins.push(origin);
+      }
+    }
+    return { cookies: mergeCookies(cookieLists), origins, tabs: tabs.map(({ url, title }) => ({ url, title })) };
+  });
+  return filterState(captured, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+}
+
+export async function captureManaged(policy = {}) {
+  const chrome = await managedBrowserStatus();
+  if (!chrome) {
+    throw Object.assign(new Error('no managed browser is running'), { code: 'not_found' });
   }
-  if (!await waitForChromeExit([...remaining], profileDir, 2000)) throw new Error(`Chrome did not exit within ${timeoutMs + 2000}ms`);
+  return captureAllContexts(chrome.wsUrl, policy);
+}
+
+export async function captureFrom(source, policy = {}) {
+  if (source.type === 'managed' || (source.type === 'local' && !await hasDesktopChromeRoot())) return captureManaged(policy);
+  if (source.type === 'local') return captureLocalProfile(source, policy);
+  throw new Error('unsupported browser-session source');
 }
 
 export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
-  const sourceRoot = path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
+  const sourceRoot = chromeRoot();
   const profileName = profile || 'Default';
   const tempRoot = root || await mkdtemp(path.join(os.tmpdir(), fresh ? 'abra-browser-import-' : 'abra-browser-export-'));
   await mkdir(tempRoot, { recursive: true, mode: 0o700 });
@@ -285,7 +466,8 @@ export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
       await cp(path.join(sourceRoot, profileName), path.join(tempRoot, profileName), { recursive: true, dereference: false });
       await cp(path.join(sourceRoot, 'Local State'), path.join(tempRoot, 'Local State'), { dereference: false }).catch(() => {});
     }
-    child = spawn(CHROME, [`--user-data-dir=${tempRoot}`, ...(fresh ? [] : [`--profile-directory=${profileName}`]), '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
+    const binary = await chromeBinary();
+    child = spawn(binary, [`--user-data-dir=${tempRoot}`, ...(fresh ? [] : [`--profile-directory=${profileName}`]), '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' });
     let port;
     for (let i = 0; i < 200; i++) {
       try { port = Number((await readFile(path.join(tempRoot, 'DevToolsActivePort'), 'utf8')).split('\n')[0]); break; } catch { await delay(50); }

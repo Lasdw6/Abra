@@ -1,6 +1,6 @@
-import { chmod, copyFile, rm } from 'node:fs/promises';
+import { chmod, copyFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { capture, captureFrom, revoke, stopChrome } from './browser.js';
+import { capture, captureFrom, previewFrom, revoke, stopChrome } from './browser.js';
 import { resolveCdpEndpoint } from './cdp.js';
 import { installBundle, processIdentity, registryFile, safeContainedDelete } from './import.js';
 import { dataDir, loadBundle, loadManifest, parseList, readJson, RECEIPT_KIND, saveBundle, signingIdentity, verifyObject, writeJson } from './util.js';
@@ -44,7 +44,20 @@ export async function run(argv,io=console){
     const record=await readJson(registryFile(receipt.install_id));if(record.browser_context_id!==receipt.browser_context_id)throw new Error('receipt does not match the private install registry');
     const result=await revoke(record.cdp_url,record.browser_context_id,record.origins);await stopRegisteredChrome(record);if(record.profile_dir)await safeContainedDelete(record.profile_dir,path.join(dataDir(),'profiles'));await rm(registryFile(receipt.install_id),{force:true});const output=`${file}.revoked.json`;await writeJson(output,result);io.log(output);return result;
   }
+  if(command==='preview'){
+    const from=need(flags,'from');
+    const source=from==='cdp'?{type:'cdp',cdp_url:await resolveCdpEndpoint(positionals[1]||need(flags,'cdp'))}:(from==='local'||from==='managed')?{type:from,profile:flags.profile}:(()=>{throw new Error('--from must be local, managed, or cdp');})();
+    const preview=await previewFrom(source);
+    if(flags.out){
+      const dest=path.resolve(flags.out);
+      await writeFile(dest,Buffer.from(preview.data,'base64'));
+      await chmod(dest,0o600);
+    }
+    const {data,...meta}=preview;
+    io.log(JSON.stringify(flags.out?{...meta,out:path.resolve(flags.out)}:{...meta,data},null,2));
+    return preview;
+  }
   if(command==='storage-state')return storageState(positionals.slice(1),flags,io);
-  throw new Error('usage: abra-browser export|inspect|import|revoke|storage-state');
+  throw new Error('usage: abra-browser export|inspect|import|revoke|preview|storage-state');
 }
 async function storageState(positionals,flags,io){const verb=positionals[0];if(verb==='import'){const input=path.resolve(positionals[1]||need(flags,'in')),out=path.resolve(flags.out||`browser-session-${Date.now()}`),raw=await import('node:fs/promises').then(fs=>fs.readFile(input)),storage=JSON.parse(raw),state={cookies:storage.cookies||[],origins:(storage.origins||[]).map(o=>({...o,sessionStorage:[],indexedDB:{databases:[]}})),tabs:[]};await saveBundle(out,state,{source:'playwright-storage-state',sourceBrowser:'Playwright storage_state',storageStateRaw:raw,provenance:{capture:'storage_state-import',reexportable:true}});io.log(out);return{out};}if(verb==='export'){const input=path.resolve(positionals[1]||need(flags,'in')),out=path.resolve(flags.out||'storage_state.json'),{manifest}=await trustedBundle(input,flags);if(manifest.provenance?.reexportable===false)throw new Error('received bundles are not re-exportable');await copyFile(path.join(input,'storage_state.json'),out);await chmod(out,0o600);io.log(out);return{out};}throw new Error('usage: abra-browser storage-state import <file> --out <bundle> | export <bundle> --out <file>');}

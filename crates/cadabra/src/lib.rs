@@ -10,6 +10,7 @@ use abra_core::{
     identity::{PeerId, Signature},
     manifest::{
         Fingerprint, Manifest, NativeBlobRef, Origin, Provenance, RawManifest, Recipe, Scope,
+        Thumbnail,
     },
     now_ms,
 };
@@ -1647,6 +1648,9 @@ impl Daemon {
                 .as_ref()
                 .and_then(|value| value.title.clone())
                 .unwrap_or_else(|| kind.clone());
+            let thumbnail_path = floor
+                .as_ref()
+                .and_then(|value| value.thumbnail_path.clone());
             let mut manifest = base_manifest(&node, Scope::Partial, &kind, &title);
             manifest.payload = payload
                 .as_object()
@@ -1656,6 +1660,9 @@ impl Daemon {
             manifest.link = floor.and_then(|value| value.link);
             if let Some(path) = files_path {
                 manifest.files = Some(snapshot_dir(&node.store.cas, &path)?);
+            }
+            if let Some(path) = thumbnail_path {
+                manifest.thumbnail = Some(ingest_thumbnail(&node.store.cas, &path)?);
             }
             if let Some(staging) = staging {
                 if let Err(error) = staging.close() {
@@ -3693,6 +3700,28 @@ fn secure_adapter_tree(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn secure_adapter_tree(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn ingest_thumbnail(store: &abra_core::cas::BlobStore, path: &Path) -> Result<Thumbnail> {
+    let data = fs::read(path)?;
+    if data.is_empty() || data.len() > 512 * 1024 {
+        return Err("adapter thumbnail must be 1 to 512 KiB".into());
+    }
+    let media_type = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if data.len() >= 2 && data[0] == 0xff && data[1] == 0xd8 {
+        "image/jpeg"
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        return Err("adapter thumbnail must be jpeg, png, or webp".into());
+    };
+    let (blob, bytes) = store.put_file(path)?;
+    Ok(Thumbnail {
+        blob,
+        media_type: media_type.into(),
+        bytes,
+    })
 }
 
 fn capture_path(store: &abra_core::cas::BlobStore, path: &Path) -> Result<Hash> {

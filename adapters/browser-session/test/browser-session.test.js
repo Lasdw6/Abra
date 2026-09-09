@@ -212,6 +212,12 @@ test('adapter rejects invalid source and destination forms', async () => {
   const missing = await adapterRequest({ ...exportBase, request_id: 'c9', source: 'managed' });
   assert.equal(missing.error.code, 'not_found');
   assert.match(missing.error.message, /no managed browser is running/);
+  const previewStopped = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'preview',
+    request_id: 'd0', source: 'managed', options: {}
+  }, { ...process.env, ABRA_BROWSER_DATA_DIR: path.join(root, 'empty-managed') });
+  assert.equal(previewStopped.error.code, 'not_found');
+  assert.match(previewStopped.error.message, /no managed browser is running/);
 });
 
 test('adapter ignores sender payload paths and does not chmod them', async () => {
@@ -627,6 +633,70 @@ test('managed browser import reuses one Chrome and recapture sees the session', 
   const state = (await loadBundle(staging)).state;
   assert.equal(state.cookies.some(cookie => cookie.name === 'sid' && cookie.value === 'alpha' && cookie.domain === '127.0.0.1'), true);
   assert.equal(state.tabs.some(tab => tab.url.startsWith(origin)), true);
+});
+
+test('adapter preview of a managed browser returns a jpeg and tab items', { timeout: 60000 }, async t => {
+  if (skipChromeTest(t)) return;
+  const data = await mkdtemp(path.join(os.tmpdir(), 'abra-preview-managed-'));
+  const previous = process.env.ABRA_BROWSER_DATA_DIR;
+  process.env.ABRA_BROWSER_DATA_DIR = data;
+  t.after(async () => {
+    await stopManagedBrowser().catch(() => {});
+    process.env.ABRA_BROWSER_DATA_DIR = previous;
+    await rm(data, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+  let started;
+  try { started = await ensureManagedBrowser({ headless: true }); }
+  catch (error) { t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  const fixture = await fixtureServer();
+  t.after(fixture.close);
+  const origin = `http://127.0.0.1:${fixture.port}`;
+  const opened = await page(started.wsUrl, origin);
+  t.after(() => opened.close());
+  await delay(300);
+  const response = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'preview',
+    request_id: 'd1', source: 'managed', options: {}
+  }, { ...process.env, ABRA_BROWSER_DATA_DIR: data });
+  assert.equal(response.ok, true, JSON.stringify({ ...response, data: response.data?.slice?.(0, 24) }));
+  assert.equal(response.media_type, 'image/jpeg');
+  assert.equal(typeof response.width, 'number');
+  assert.equal(typeof response.height, 'number');
+  assert.ok(response.width > 0 && response.height > 0);
+  const bytes = Buffer.from(response.data, 'base64');
+  assert.equal(bytes[0], 0xff);
+  assert.equal(bytes[1], 0xd8);
+  assert.ok(bytes.length <= 512 * 1024);
+  assert.ok(response.items.some(item => item.detail?.startsWith(origin) && item.active === true), JSON.stringify(response.items));
+});
+
+test('adapter export from a cdp source includes a png thumbnail', { timeout: 60000 }, async t => {
+  if (skipChromeTest(t)) return;
+  const fixture = await fixtureServer();
+  let browser;
+  try { browser = await chrome(); }
+  catch (error) { await fixture.close(); t.skip(`headless Chrome unavailable: ${error.message}`); return; }
+  t.after(async () => { await browser.close(); await fixture.close(); });
+  const origin = `http://127.0.0.1:${fixture.port}`;
+  const opened = await page(browser.ws, origin);
+  t.after(() => opened.close());
+  await delay(300);
+  const staging = await mkdtemp(path.join(os.tmpdir(), 'abra-cdp-thumb-'));
+  const exported = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export',
+    request_id: 'd2', source: { type: 'cdp', cdp_url: browser.ws }, staging_dir: staging, options: {}
+  });
+  assert.equal(exported.ok, true, JSON.stringify(exported.floor));
+  const thumb = exported.floor.thumbnail_path;
+  assert.ok(thumb);
+  assert.equal(path.resolve(thumb).startsWith(os.tmpdir()), true);
+  assert.equal(path.resolve(thumb).startsWith(path.resolve(staging)), false);
+  const bytes = await readFile(thumb);
+  assert.equal(bytes[0], 0x89);
+  assert.equal(bytes[1], 0x50);
+  assert.equal(bytes[2], 0x4e);
+  assert.equal(bytes[3], 0x47);
+  assert.ok(bytes.length <= 512 * 1024);
 });
 
 test('local macOS profile export captures cookies, storage, and open tabs', { timeout: 60000 }, async t => {

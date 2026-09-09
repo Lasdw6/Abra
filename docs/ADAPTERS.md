@@ -41,6 +41,7 @@ fields, or `ok:false,error:{code,message,retryable}`. Codes are
 `invalid_request`, `unsupported_kind`, `unsupported_verb`, `not_found`,
 `permission_denied`, `busy`, `cancelled`, and `internal`. There is one process
 per operation. Export, import, inspect, and control time out after ten minutes.
+`preview` should finish within five seconds; the daemon gives up after ten.
 Cancellation sends `cancel {request_id}` and kills the process after five seconds.
 
 ## Verbs
@@ -56,6 +57,9 @@ Cancellation sends `cancel {request_id}` and kills the process after five second
   full snapshot before it sends the partial.
   The daemon hashes files, attaches observed recipes/native blobs, and authors
   and signs the manifest.
+  `floor.thumbnail_path` is an optional jpeg, png, or webp of at most 512 KiB.
+  The daemon copies it into the signed manifest. It must not live among the
+  staged bundle files. The browser-session adapter writes it for live sources.
 
 - `import`: request
   `{kind,payload,materialized_files|null,destination,workspace,options}`.
@@ -75,6 +79,17 @@ Cancellation sends `cancel {request_id}` and kills the process after five second
   `{ok:true,summary?,warnings:[{code,message,item?}],blocked:[...]}`. This verb
   only examines the source. Before an adapter `send`, the daemon runs it when
   present. A non-empty `blocked` list stops the send unless `--force` was set.
+
+- `preview`: optional. Request `{kind,source,options}`. Success returns
+  `{media_type,data,width,height,title?,items?}`. `media_type` is `image/jpeg`,
+  `image/png`, or `image/webp`. `data` is base64. The decoded image is at most
+  512 KiB. `width` and `height` are pixels. `items` is at most 64 entries of
+  `{label,detail?,active?}`. `label` is at most 200 characters. The verb is
+  read-only: it must not change the source. It should answer within five
+  seconds. The browser-session adapter previews `local`, `managed`, and `cdp:`
+  sources. On macOS, `local` against a real Chrome profile has no debugging
+  port, so that adapter returns the osascript tab list, a small placeholder
+  PNG, and no live screenshot.
 
 - `control`: request `{kind,capsule_id,op,text,workspace,options}`. Success
   returns top-level `{result}`. `op` is `pause`, `stop`, or `instruct`. `text` is present

@@ -1,6 +1,7 @@
-import { cp, lstat, mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { cp, lstat, mkdtemp, mkdir, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { crc32, deflateSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -451,6 +452,256 @@ export async function captureFrom(source, policy = {}) {
   if (source.type === 'managed' || (source.type === 'local' && !await hasDesktopChromeRoot())) return captureManaged(policy);
   if (source.type === 'local') return captureLocalProfile(source, policy);
   throw new Error('unsupported browser-session source');
+}
+
+const PREVIEW_MS = 5000;
+const PREVIEW_MAX_WIDTH = 1280;
+const THUMB_MAX_WIDTH = 640;
+const MAX_IMAGE_BYTES = 512 * 1024;
+const JPEG_QUALITIES = [55, 40, 30];
+const PLACEHOLDER_WIDTH = 64;
+const PLACEHOLDER_HEIGHT = 36;
+const PLACEHOLDER_PNG = solidPng(PLACEHOLDER_WIDTH, PLACEHOLDER_HEIGHT, [0x2b, 0x2b, 0x2b]);
+
+function solidPng(width, height, rgb) {
+  const raw = Buffer.alloc((1 + width * 3) * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * (1 + width * 3);
+    for (let x = 0; x < width; x++) {
+      raw[row + 1 + x * 3] = rgb[0];
+      raw[row + 2 + x * 3] = rgb[1];
+      raw[row + 3 + x * 3] = rgb[2];
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body) >>> 0, 8 + data.length);
+    return out;
+  };
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0))
+  ]);
+}
+
+function jpegSize(bytes) {
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error('not a jpeg');
+  let offset = 2;
+  while (offset + 8 < bytes.length) {
+    if (bytes[offset] !== 0xff) break;
+    const marker = bytes[offset + 1];
+    const length = bytes.readUInt16BE(offset + 2);
+    if (marker >= 0xc0 && marker <= 0xc3) {
+      return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) };
+    }
+    offset += 2 + length;
+  }
+  throw new Error('jpeg size not found');
+}
+
+function pngSize(bytes) {
+  if (bytes.length < 24 || bytes[0] !== 0x89) throw new Error('not a png');
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+function httpPageTargets(targets, browserContextId) {
+  return targets.filter(target => target.type === 'page' && /^https?:/.test(target.url) && (!browserContextId || target.browserContextId === browserContextId));
+}
+
+function pickActivePage(pages, targetId) {
+  if (targetId) {
+    const match = pages.find(page => page.targetId === targetId);
+    if (match) return match;
+  }
+  return pages[pages.length - 1] || pages[0] || null;
+}
+
+function previewItems(pages, activeId) {
+  return pages.slice(0, 64).map(page => ({
+    label: String(page.title || page.url || '').slice(0, 200) || page.url,
+    detail: page.url,
+    active: page.targetId === activeId
+  }));
+}
+
+async function viewportSize(cdp, session) {
+  const metrics = await cdp.send('Page.getLayoutMetrics', {}, session);
+  const box = metrics.cssLayoutViewport || metrics.layoutViewport || {};
+  return { width: box.clientWidth || 0, height: box.clientHeight || 0 };
+}
+
+async function withScaledViewport(cdp, session, maxWidth, fn) {
+  let scaled = false;
+  try {
+    const { width, height } = await viewportSize(cdp, session);
+    if (width > maxWidth && width > 0) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: maxWidth,
+        height: Math.max(1, Math.round(height * maxWidth / width)),
+        deviceScaleFactor: 1,
+        mobile: false
+      }, session);
+      scaled = true;
+    }
+    return await fn();
+  } finally {
+    if (scaled) await cdp.send('Emulation.clearDeviceMetricsOverride', {}, session).catch(() => {});
+  }
+}
+
+async function captureJpeg(cdp, session) {
+  return withScaledViewport(cdp, session, PREVIEW_MAX_WIDTH, async () => {
+    for (const quality of JPEG_QUALITIES) {
+      const { data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality, captureBeyondViewport: false }, session);
+      const bytes = Buffer.from(data, 'base64');
+      if (bytes.length <= MAX_IMAGE_BYTES) return bytes;
+    }
+    throw Object.assign(new Error('preview image exceeds 512 KiB'), { code: 'internal' });
+  });
+}
+
+async function capturePng(cdp, session) {
+  return withScaledViewport(cdp, session, THUMB_MAX_WIDTH, async () => {
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, session);
+    return Buffer.from(data, 'base64');
+  });
+}
+
+async function attachActivePage(cdp, { browserContextId, targetId } = {}) {
+  const targets = (await cdp.send('Target.getTargets')).targetInfos;
+  const pages = httpPageTargets(targets, browserContextId);
+  const active = pickActivePage(pages, targetId);
+  if (!active) throw Object.assign(new Error('no page to preview'), { code: 'not_found' });
+  const session = await attachPage(cdp, active.targetId);
+  await cdp.send('Page.enable', {}, session);
+  return { session, pages, active };
+}
+
+async function previewCdp(wsUrl, options = {}, holder = {}) {
+  const cdp = await new CDP(wsUrl).connect();
+  holder.cdp = cdp;
+  let session;
+  try {
+    const attached = await attachActivePage(cdp, options);
+    session = attached.session;
+    const bytes = await captureJpeg(cdp, session);
+    const size = jpegSize(bytes);
+    return {
+      media_type: 'image/jpeg',
+      data: bytes.toString('base64'),
+      width: size.width,
+      height: size.height,
+      title: attached.active.title || attached.active.url,
+      items: previewItems(attached.pages, attached.active.targetId)
+    };
+  } finally {
+    if (session) await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {});
+    cdp.close();
+    holder.cdp = null;
+  }
+}
+
+async function previewLocalTabs() {
+  const tabs = await httpTabs(await listChromeTabs());
+  return {
+    media_type: 'image/png',
+    data: PLACEHOLDER_PNG.toString('base64'),
+    width: PLACEHOLDER_WIDTH,
+    height: PLACEHOLDER_HEIGHT,
+    title: 'Your browser',
+    items: tabs.slice(0, 64).map(tab => ({
+      label: String(tab.title || tab.url || '').slice(0, 200) || tab.url,
+      detail: tab.url,
+      active: Boolean(tab.active)
+    }))
+  };
+}
+
+async function previewResolved(source, holder) {
+  if (source.type === 'managed' || (source.type === 'local' && !await hasDesktopChromeRoot())) {
+    const chrome = await managedBrowserStatus();
+    if (!chrome) throw Object.assign(new Error('no managed browser is running'), { code: 'not_found' });
+    return previewCdp(chrome.wsUrl, {}, holder);
+  }
+  if (source.type === 'local') return previewLocalTabs();
+  if (source.type === 'cdp') {
+    return previewCdp(source.cdp_url, { browserContextId: source.browser_context_id, targetId: source.target_id }, holder);
+  }
+  throw Object.assign(new Error('preview requires a live browser source'), { code: 'invalid_request' });
+}
+
+// Live view of a running browser. macOS `local` against a real Chrome profile
+// has no debugging port, so this returns the osascript tab list and a
+// placeholder PNG instead of a screenshot.
+export async function previewFrom(source, options = {}) {
+  const holder = { cdp: null };
+  const work = previewResolved(source, holder);
+  work.catch(() => {});
+  let timer;
+  const limit = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      holder.cdp?.close();
+      reject(Object.assign(new Error('preview timed out'), { code: 'internal' }));
+    }, PREVIEW_MS);
+    options.signal?.addEventListener('abort', () => {
+      holder.cdp?.close();
+      reject(Object.assign(new Error('cancelled'), { code: 'cancelled' }));
+    }, { once: true });
+  });
+  try {
+    return await Promise.race([work, limit]);
+  } finally {
+    clearTimeout(timer);
+    holder.cdp?.close();
+  }
+}
+
+// PNG of the active page for a live export. Returns null when capture is
+// impossible (real macOS Chrome with no debug port) or when it fails.
+export async function captureExportThumbnail(source) {
+  try {
+    if (source.type === 'local' && await hasDesktopChromeRoot()) return null;
+    const wsUrl = source.type === 'cdp' ? source.cdp_url : (await managedBrowserStatus())?.wsUrl;
+    if (!wsUrl) return null;
+    const cdp = await new CDP(wsUrl).connect();
+    let session;
+    try {
+      const attached = await attachActivePage(cdp, { browserContextId: source.browser_context_id, targetId: source.target_id });
+      session = attached.session;
+      const bytes = await capturePng(cdp, session);
+      if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) return null;
+      pngSize(bytes);
+      return bytes;
+    } finally {
+      if (session) await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {});
+      cdp.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+// Writes thumbnail.png under os.tmpdir() so it is not hashed into the bundle.
+// The adapter process usually exits right after the response, so leftover files
+// are left for the OS temp cleaner. A 60s unref timer deletes the file if this
+// process is still running.
+export async function writeExportThumbnail(source) {
+  const bytes = await captureExportThumbnail(source);
+  if (!bytes) return undefined;
+  const file = path.join(os.tmpdir(), `abra-browser-thumb-${process.pid}-${Date.now()}.png`);
+  await writeFile(file, bytes);
+  setTimeout(() => unlink(file).catch(() => {}), 60_000).unref();
+  return file;
 }
 
 export async function launchLocalChrome(profile, { fresh = false, root } = {}) {

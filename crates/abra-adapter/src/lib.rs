@@ -331,7 +331,7 @@ impl AdapterRegistry {
         }
         if let Some(floor) = &export.floor {
             if let Some(path) = &floor.thumbnail_path {
-                confined(staging.path(), path)?;
+                validate_thumbnail(path)?;
             }
         }
         // Keep daemon-owned staging alive for the caller's immediate CAS import.
@@ -395,6 +395,26 @@ impl AdapterRegistry {
             adapter,
             json!({"verb":"inspect","kind":kind,"source":source,"options":options}),
             timeout,
+        )
+        .await
+    }
+    /// Read-only picture of a live source: `{media_type, data, width, height,
+    /// title?, items?}`. The adapter must not change the source.
+    pub async fn preview(
+        &self,
+        kind: &str,
+        source: Value,
+        options: &BTreeMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let adapter = self
+            .for_kind(kind)
+            .ok_or_else(|| format!("no adapter registered for kind {kind}"))?;
+        require_verb(adapter, "preview")?;
+        invoke(
+            adapter,
+            json!({"verb":"preview","kind":kind,"source":source,"options":options}),
+            timeout.or(Some(Duration::from_secs(10))),
         )
         .await
     }
@@ -552,6 +572,17 @@ fn expand_adapter_dir(path: &Path) -> Result<Vec<PathBuf>> {
     }
     children.sort();
     Ok(children)
+}
+
+fn validate_thumbnail(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path).map_err(|_| "adapter thumbnail_path is not a readable file")?;
+    if !meta.is_file() {
+        return Err("adapter thumbnail_path is not a file".into());
+    }
+    if meta.len() == 0 || meta.len() > 512 * 1024 {
+        return Err("adapter thumbnail must be 1 to 512 KiB".into());
+    }
+    Ok(())
 }
 
 fn confined(root: &Path, path: &Path) -> Result<()> {

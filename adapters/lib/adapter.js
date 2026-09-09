@@ -13,8 +13,9 @@ export function coded(code, message) {
 /**
  * Run the stdin/stdout loop until stdin ends.
  *
- * `verbs.export`, `verbs.import`, `verbs.inspect`, and `verbs.control` receive
- * `(request, { signal, emit })` and resolve with the response fields.
+ * `verbs.export`, `verbs.import`, `verbs.inspect`, `verbs.preview`, and
+ * `verbs.control` receive `(request, { signal, emit })` and resolve with the
+ * response fields.
  * Reserved until the Rust runner has a streaming operation: `verbs.watch` is
  * answered with `{watching:true}` first and then emits
  * `{event,cursor,hint}` objects through `emit` until `signal` aborts.

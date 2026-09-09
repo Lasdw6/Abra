@@ -7,6 +7,7 @@ no dependencies. Inspect and adapter export do not expose credential values.
 node bin/abra-browser.js export --from cdp 'ws://…' --out ./session
 node bin/abra-browser.js inspect ./session
 node bin/abra-browser.js import ./session --to cdp 'ws://…' --deny-domains admin.example.com
+node bin/abra-browser.js preview --from managed --out ./preview.jpg
 node bin/abra-browser.js revoke "$HOME/Library/Application Support/Abra/browser-session/receipts/<id>.json"
 ```
 
@@ -40,6 +41,17 @@ same choice. Symlinked source profiles are refused.
 On Linux, and when Chrome's profile root is missing, `local` is the managed
 browser this tool opens under the data directory. `export --from managed` always
 reads that browser. It errors if none is running.
+
+`preview --from local|managed|cdp` prints JSON metadata (`media_type`, `width`,
+`height`, `title`, `items`) and writes the image when `--out` is set. A
+debuggable browser yields a JPEG of the active page and the http(s) tab list.
+On macOS, `local` against a real Chrome profile has no debugging port, so
+preview returns that tab list and a small placeholder PNG instead of a
+screenshot. The same limitation skips the export thumbnail. Live export writes
+`floor.thumbnail_path` to a file under `os.tmpdir()` so it is not hashed into
+the bundle. The adapter process exits after the response; leftover thumbnails
+are left for the OS temp cleaner. A 60s timer deletes the file if the process
+is still running.
 
 `import --to local --detach` installs into the managed browser, creating a fresh
 isolated context. Chrome stays running until you revoke that context. Debugging

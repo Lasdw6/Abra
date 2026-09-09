@@ -3,7 +3,7 @@
   "name": "dev.abra.browser-session",
   "version": "0.1.0",
   "kinds": ["dev.abra.browser.session.v1", "dev.abra.browser-session.v1"],
-  "verbs": ["export", "import"],
+  "verbs": ["export", "import", "preview"],
   "executable": "bin/adapter.js",
   "presets": {
     "source": [

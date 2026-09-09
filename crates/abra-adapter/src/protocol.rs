@@ -92,6 +92,33 @@ pub fn parse_response(verb: &str, request_id: &str, line: &str) -> Result<Value>
                 InspectResult,
             >(value)?)?)
         }
+        "preview" => {
+            let media_type = value.get("media_type").and_then(Value::as_str);
+            if !matches!(media_type, Some("image/jpeg" | "image/png" | "image/webp")) {
+                return Err("adapter preview response requires media_type image/jpeg, image/png, or image/webp".into());
+            }
+            if !value.get("data").is_some_and(Value::is_string) {
+                return Err("adapter preview response requires base64 data".into());
+            }
+            if !(value.get("width").is_some_and(Value::is_u64)
+                && value.get("height").is_some_and(Value::is_u64))
+            {
+                return Err("adapter preview response requires width and height".into());
+            }
+            if let Some(items) = value.get("items") {
+                let items = items
+                    .as_array()
+                    .ok_or("adapter preview items must be an array")?;
+                if items.len() > 64
+                    || items
+                        .iter()
+                        .any(|i| !i.get("label").is_some_and(Value::is_string))
+                {
+                    return Err("adapter preview items need a label each, at most 64".into());
+                }
+            }
+            Ok(value)
+        }
         _ => Err(format!("unsupported adapter response verb: {verb}").into()),
     }
 }

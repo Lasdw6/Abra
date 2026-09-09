@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runAdapter } from '../../lib/adapter.js';
-import { capture, captureFrom, captureTarget } from '../lib/browser.js';
+import { capture, captureFrom, captureTarget, previewFrom, writeExportThumbnail } from '../lib/browser.js';
 import { browserWebSocketFromUrl } from '../lib/cdp.js';
 import { installBundle } from '../lib/import.js';
 import { KIND, LEGACY_KIND, filterState, loadBundle, parseList, saveBundle, secureTree, writePrivate } from '../lib/util.js';
@@ -11,7 +11,7 @@ const BUNDLE_FILES = ['state.json', 'storage_state.json', 'manifest.json'];
 
 await runAdapter({
   kinds: [KIND, LEGACY_KIND],
-  verbs: { export: exportRequest, import: importRequest },
+  verbs: { export: exportRequest, import: importRequest, preview: previewRequest },
   internalMessage: 'browser-session operation failed'
 });
 
@@ -31,11 +31,25 @@ async function exportRequest(r) {
     throw error;
   }
   if (source.target_id) state = filterState(state, policy.includes, policy.excludes, { allowNonPortable: true });
-  return exported(await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', allowNonPortable: options.allow_non_portable === 'true', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } }), r.staging_dir);
+  const manifest = await saveBundle(r.staging_dir, state, { source: source.type || 'cdp', allowNonPortable: options.allow_non_portable === 'true', policy: { include_domains: policy.includes, exclude_domains: policy.excludes } });
+  return exported(manifest, r.staging_dir, await writeExportThumbnail(source));
 }
 
-function exported(manifest, dir) {
-  return { payload: { kind: KIND, bundle_path: '.', manifest }, files_path: dir, floor: { title: 'Browser session', summary: `${manifest.domains.length} domains, ${manifest.tabs.length} tabs` } };
+async function previewRequest(r, { signal }) {
+  const options = requestOptions(r), source = await parseSource(r.source, options);
+  if (source.type === 'bundle') throw coded('invalid_request', 'preview requires a live browser source');
+  try {
+    return await previewFrom(source, { signal });
+  } catch (error) {
+    if (error.code === 'not_found' || error.code === 'cancelled') throw coded(error.code, error.message);
+    throw error;
+  }
+}
+
+function exported(manifest, dir, thumbnailPath) {
+  const floor = { title: 'Browser session', summary: `${manifest.domains.length} domains, ${manifest.tabs.length} tabs` };
+  if (thumbnailPath) floor.thumbnail_path = thumbnailPath;
+  return { payload: { kind: KIND, bundle_path: '.', manifest }, files_path: dir, floor };
 }
 
 // Re-export a bundle another installation captured, such as one the sandbox

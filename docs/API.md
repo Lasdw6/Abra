@@ -6,6 +6,11 @@ a newline and receives one JSON object followed by a newline. Connections may be
 reused. Requests have an `op`; successful responses are
 `{"ok":true,"result":...}` and failures are `{"ok":false,"error":"..."}`.
 
+`abra observe`, `abra process`, and the internal sandbox helpers run directly
+in the CLI. They do not use this socket, start a daemon, or create an Abra
+identity. See [observations](OBSERVATION.md) and
+[process checkpoints](PROCESS_CHECKPOINTS.md) for those commands.
+
 The store root and every store directory are owner-only (`0700`). Cadabra
 refuses an existing root that is group- or world-accessible. The listener checks
 kernel peer credentials and accepts only the daemon uid. A control line is at
@@ -37,10 +42,12 @@ Operations and request fields:
 | `pair-add` | `ticket` | paired peer id |
 | `pending-pairs` | none | requests awaiting confirmation |
 | `pair-confirm` | `id` | confirmation result |
+| `pair-remove` | `id` | `{peer_id,removed}`; persists device revocation and rejects self-removal |
 | `peers` | none | trusted peer records |
 | `capsule-create` | `path` | capsule id |
 | `snapshot` | `path`, `label?`, `no_lease?` | capsule and snapshot ids |
 | `native-attach` | `capsule`, `parent_snapshot`, `snapshot_type:"Full"`, `fingerprint`, `artifact_root`, `artifacts[{role,path}]` | signed child snapshot and exactly `vmstate,memory,disk` refs; paths must remain under `artifact_root` (adapter API) |
+| `restore-plan` | `id`, `fingerprint?`, `native_roles?` | read-only `{snapshot_id,mode,portable,native,recipes,observation}`; verifies local objects and reports native eligibility or portable-file availability |
 | `send` | `peer`; one payload: `snapshot_id`, `path`, `link`, or `kind` + `source`; optional send fields | ids; linked workspace fields; inspect fields; wait entries |
 | `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | list returns `{adapters:[...],errors:[...]}`; add/remove return the registration change |
 | `inspect` | `kind`, `source`, `options?` | `{summary?,warnings:[...],blocked:[...]}` from the adapter |
@@ -313,6 +320,8 @@ native blobs that are not also part of the portable tree.
 `log` results are guaranteed to be topologically ordered: every locally known
 parent appears before its children, with deterministic snapshot-id sibling order.
 
+## Offline relay
+
 Relay configuration is stored at `<store-root>/config/relays.json`. The CLI forms
 are `abra relay add <url> [--secret <deploy-secret>]`, `abra relay list`, and
 `abra relay remove <url>`; `abra config set relay_after_attempts N` and
@@ -326,11 +335,48 @@ custom modes publish endpoint ids through DNS/pkarr discovery. `none` disables
 that discovery and relay traffic.
 
 `abra-relay` is a separate sealed, offline store-and-forward service. Start it
-with `ABRA_RELAY_SECRET=<secret> abra-relay --listen <address>`, then register
-its HTTP URL on each device with `abra relay add <url> --secret <secret>`. Put
-it behind TLS on the Internet. It sees rotating tags, expiry metadata, and
+with `ABRA_RELAY_SECRET=<secret> abra-relay --listen 127.0.0.1:8787 --data-dir /path/to/queue`,
+then put it behind a TLS reverse proxy and register the public HTTPS URL with
+`abra relay add https://relay.example/ --secret <secret>`. The client verifies
+TLS, refuses redirects and rejects remote HTTP. Loopback HTTP is allowed for
+development. URLs cannot contain credentials, queries or fragments.
+
+The relay persists accepted envelopes in `--data-dir`, default `.abra-relay`,
+or `ABRA_RELAY_DATA_DIR`. Keep that directory across restarts. One process owns
+the directory at a time. Enqueue succeeds only after an atomic write and sync;
+corrupt stored envelopes or storage failures produce errors instead of silent
+loss. `--max-storage-bytes` defaults to 1 GiB total, and `--max-bytes` defaults to
+16 MiB per envelope, also the protocol maximum. A full queue returns HTTP 507.
+Requests have a 16 KiB header limit and a 10-second deadline. The server permits
+32 concurrent requests by default, configurable with `--max-concurrent-requests`.
+Authentication is checked before reading the body. Polls return at most 64
+items and 16 MiB of envelope bytes; items outside the batch remain queued.
+The client caps encoded responses at 80 MiB and uses a 15-second timeout.
+Envelopes expire; the default
+sender retention is 72 hours. The relay sees rotating tags, expiry metadata and
 recipient-sealed ciphertext. A deposit leaves the outbox in `awaiting_ack` until
 the receiver returns a verified acknowledgement.
+
+## Restore planning
+
+`abra --json restore-plan <snapshot-id>` is a read-only preflight. To check native
+resume, pass the actual receiving host's fingerprint JSON with `--fingerprint`
+and repeat `--native-role` for the roles its adapter requires. The planner never
+uses captured host facts as the receiver's fingerprint. It streams local objects
+through hash verification, reports missing or corrupt state, and leaves the
+store unchanged. Tree checks include sizes, depth, path length and link targets.
+Native status `eligible` means required objects and declared fingerprints match;
+the adapter must still load and verify the state.
+
+`mode` is `native`, `portable`, or `unavailable`. `portable.available` describes
+file-tree integrity only. Recipes and the observation ledger remain data; the
+caller handles target runtimes, application checkpoints and startup. Full field
+descriptions and a cross-architecture example are in [Portability](PORTABILITY.md).
+
+Device removal is `abra pair remove <peer-id>`. It invalidates local trust and
+outstanding local pairing tickets, including stale attempts to restore removed
+trust. It does not erase delivered snapshots or stop remote workloads. See
+[Compatibility and recovery](COMPATIBILITY.md#revoke-access) for its scope.
 
 ## Capability links
 

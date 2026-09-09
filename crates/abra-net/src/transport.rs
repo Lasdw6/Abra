@@ -1,15 +1,25 @@
 use crate::{Error, Result};
-use abra_core::identity::{Identity, PeerId, Signature};
+use abra_core::identity::PeerId;
+#[cfg(feature = "tcp")]
+use abra_core::identity::{Identity, Signature};
 use async_trait::async_trait;
 use std::{
     collections::BTreeMap,
-    pin::Pin,
     sync::{Arc, Mutex},
+};
+#[cfg(feature = "tcp")]
+use std::{
+    pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(feature = "tcp")]
+use tokio::io::AsyncWriteExt;
+#[cfg(feature = "tcp")]
+use tokio::io::{AsyncReadExt, ReadBuf};
+#[cfg(feature = "tcp")]
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
     sync::{mpsc, Mutex as AsyncMutex},
 };
 
@@ -21,10 +31,8 @@ enum Streams {
         uni_send: mpsc::Sender<Vec<u8>>,
         uni_recv: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
     },
-    Tcp {
-        send: SharedWrite,
-        recv: SharedRead,
-    },
+    #[cfg(feature = "tcp")]
+    Tcp { send: SharedWrite, recv: SharedRead },
     #[cfg(feature = "iroh")]
     Iroh(iroh::endpoint::Connection),
 }
@@ -53,6 +61,7 @@ impl Connection {
                 .send(bytes)
                 .await
                 .map_err(|_| Error::Transport("connection closed".into())),
+            #[cfg(feature = "tcp")]
             Streams::Tcp { send, .. } => {
                 let mut send = send.clone();
                 send.write_all(&(bytes.len() as u64).to_be_bytes()).await?;
@@ -91,6 +100,7 @@ impl Connection {
                 }
                 Ok(bytes)
             }
+            #[cfg(feature = "tcp")]
             Streams::Tcp { recv, .. } => {
                 let mut recv = recv.clone();
                 let len = recv.read_u64().await?;
@@ -117,7 +127,9 @@ impl Connection {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "tcp")]
 struct SharedRead(Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>);
+#[cfg(feature = "tcp")]
 impl AsyncRead for SharedRead {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -128,7 +140,9 @@ impl AsyncRead for SharedRead {
     }
 }
 #[derive(Clone)]
+#[cfg(feature = "tcp")]
 struct SharedWrite(Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>);
+#[cfg(feature = "tcp")]
 impl AsyncWrite for SharedWrite {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -145,6 +159,7 @@ impl AsyncWrite for SharedWrite {
     }
 }
 
+#[cfg(feature = "tcp")]
 pub struct TcpTransport {
     identity: Identity,
     listener: TcpListener,
@@ -152,6 +167,7 @@ pub struct TcpTransport {
     addresses: Mutex<BTreeMap<PeerId, std::net::SocketAddr>>,
 }
 
+#[cfg(feature = "tcp")]
 impl TcpTransport {
     pub async fn bind(secret: [u8; 32]) -> Result<Self> {
         Self::bind_port(secret, 0).await
@@ -228,6 +244,7 @@ impl TcpTransport {
 }
 
 #[async_trait]
+#[cfg(feature = "tcp")]
 impl Transport for TcpTransport {
     fn local_peer_id(&self) -> PeerId {
         self.identity.peer_id()
@@ -589,6 +606,7 @@ fn iroh_address_is_dialable(address: &iroh::EndpointAddr) -> bool {
     address.relay_urls().next().is_some() || address.ip_addrs().next().is_some()
 }
 
+#[cfg(feature = "tcp")]
 fn parse_tcp_address(address: &str) -> Result<std::net::SocketAddr> {
     address
         .strip_prefix("tcp://")
@@ -625,21 +643,22 @@ fn validate_iroh_relay_policy(address: &iroh::EndpointAddr, mode: &IrohRelayMode
 }
 
 /// True when a persisted hint contains a direct network address.
-pub fn peer_address_has_direct_hint(address: &str) -> bool {
-    if address.starts_with("tcp://") {
+pub fn peer_address_has_direct_hint(_address: &str) -> bool {
+    #[cfg(feature = "tcp")]
+    if _address.starts_with("tcp://") {
         return true;
     }
     #[cfg(feature = "iroh")]
-    if let Ok(address) = parse_iroh_address(address) {
+    if let Ok(address) = parse_iroh_address(_address) {
         return address.ip_addrs().next().is_some();
     }
     false
 }
 
 /// True when a serialized iroh hint names a relay.
-pub fn peer_address_has_relay_hint(address: &str) -> bool {
+pub fn peer_address_has_relay_hint(_address: &str) -> bool {
     #[cfg(feature = "iroh")]
-    if let Ok(address) = parse_iroh_address(address) {
+    if let Ok(address) = parse_iroh_address(_address) {
         return address.relay_urls().next().is_some();
     }
     false
@@ -665,13 +684,14 @@ pub fn merge_peer_address_hints(existing: &str, observed: &str) -> Option<String
 }
 
 /// Validate a persisted dial hint with the same parser used by a transport.
-pub fn validate_peer_address(address: &str) -> Result<()> {
-    if address.starts_with("tcp://") {
-        return parse_tcp_address(address).map(drop);
+pub fn validate_peer_address(_address: &str) -> Result<()> {
+    #[cfg(feature = "tcp")]
+    if _address.starts_with("tcp://") {
+        return parse_tcp_address(_address).map(drop);
     }
     #[cfg(feature = "iroh")]
     {
-        parse_iroh_address(address).map(drop)
+        parse_iroh_address(_address).map(drop)
     }
     #[cfg(not(feature = "iroh"))]
     {

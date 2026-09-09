@@ -1,6 +1,7 @@
 use abra_core::{
     cas::{materialize, Hash},
     manifest::{Fingerprint, NativeBlobRef},
+    restore::{plan_restore, NativeStatus, RestoreMode},
     store::AbraStore,
 };
 use clap::{Parser, Subcommand};
@@ -102,6 +103,12 @@ struct RestoreOverrides {
     ssh_key: Option<PathBuf>,
     mem_mib: Option<u32>,
     vcpus: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum RestoreConfigNeed {
+    Native,
+    Portable,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -579,11 +586,32 @@ fn restore(
     let record = cap
         .snapshot(&snapshot_id)
         .ok_or("snapshot not found in capsule")?;
-    let config = resolve_restore_config(root, overrides)?;
     // Always probe the live receiver; a captured fingerprint never identifies it.
     let local = fingerprint(fc)?;
-    let matched = matching_native(record.raw.manifest().native.as_deref(), &local);
+    let plan = plan_restore(
+        &store.cas,
+        &record.raw,
+        Some(&local),
+        &["vmstate", "memory", "disk"],
+    )?;
+    if plan.mode == RestoreMode::Unavailable {
+        return Err(format!(
+            "snapshot cannot be restored: {}",
+            plan.portable
+                .error
+                .as_deref()
+                .unwrap_or("portable tree unavailable")
+        )
+        .into());
+    }
+    let mut fallback_reason = serde_json::to_value(&plan.native.status)?;
+    let matched = if plan.native.status == NativeStatus::Eligible {
+        matching_native(Some(&plan.native.artifacts), &local)
+    } else {
+        None
+    };
     if let Some((vmstate, memory, disk)) = matched {
+        let config = resolve_restore_config(root, overrides.clone(), RestoreConfigNeed::Native)?;
         let native_attempt = (|| -> Result<Value> {
             let _ = down(root, slot);
             let dir = slot_dir(root, slot);
@@ -611,27 +639,36 @@ fn restore(
             api(&vm.socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
             finish_start(root, slot, vm, &config, disk_path, Duration::from_secs(30))?;
             Ok(
-                json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis()}),
+                json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"restore_plan":plan}),
             )
         })();
         match native_attempt {
             Ok(result) => return Ok(result),
             Err(error) => {
                 eprintln!("native restore unavailable; using portable fallback: {error}");
+                fallback_reason = json!({"native_restore_failed":error.to_string()});
                 let _ = down(root, slot);
             }
         }
     }
-    let state = up(root, fc, slot, config.clone(), None)?;
+    if !plan.portable.available {
+        return Err(format!(
+            "native restore failed and portable fallback is unavailable: {}",
+            plan.portable
+                .error
+                .as_deref()
+                .unwrap_or("snapshot lacks files")
+        )
+        .into());
+    }
+    let config = resolve_restore_config(root, overrides, RestoreConfigNeed::Portable)?;
     let temp = tempfile::tempdir()?;
     materialize(
         &store.cas,
         &record.raw.manifest().files.ok_or("snapshot lacks files")?,
         temp.path(),
     )?;
-    let metadata = temp.path().join(".abra");
-    fs::create_dir_all(&metadata)?;
-    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o700))?;
+    let metadata = fresh_workspace_metadata(temp.path())?;
     let recipes = record.raw.manifest().recipes.clone().unwrap_or_default();
     let recipes_path = metadata.join("recipes.json");
     fs::write(&recipes_path, serde_json::to_vec(&recipes)?)?;
@@ -647,7 +684,8 @@ fn restore(
         fs::write(&observed_path, serde_json::to_vec(observed)?)?;
         fs::set_permissions(&observed_path, fs::Permissions::from_mode(0o600))?;
     }
-    rsync_guest(temp.path(), &state, &config.ssh_key, "/workspace/")?;
+    let state = up(root, fc, slot, config.clone(), None)?;
+    restore_workspace(temp.path(), &state, &config.ssh_key)?;
     ssh(
         &state,
         &config.ssh_key,
@@ -658,7 +696,7 @@ fn restore(
         serde_json::to_string_pretty(&recipes)?
     );
     Ok(
-        json!({"mode":"portable-fallback","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"recipes":recipes}),
+        json!({"mode":"portable-fallback","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"recipes":recipes,"fallback_reason":fallback_reason,"restore_plan":plan}),
     )
 }
 
@@ -690,7 +728,11 @@ fn snapshot_output(
     }))
 }
 
-fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Config> {
+fn resolve_restore_config(
+    root: &Path,
+    overrides: RestoreOverrides,
+    need: RestoreConfigNeed,
+) -> Result<Config> {
     let path = adapter_root(root).join("config.json");
     let existing = match fs::read(&path) {
         Ok(bytes) => Some(serde_json::from_slice::<Config>(&bytes)?),
@@ -698,35 +740,12 @@ fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Co
         Err(error) => return Err(error.into()),
     };
     let config_was_absent = existing.is_none();
-    let missing = if config_was_absent {
-        let mut names = Vec::new();
-        if overrides.kernel.is_none() {
-            names.push("--kernel or ABRA_FC_KERNEL");
-        }
-        if overrides.rootfs.is_none() {
-            names.push("--rootfs or ABRA_FC_ROOTFS");
-        }
-        if overrides.ssh_key.is_none() {
-            names.push("--ssh-key or ABRA_FC_SSH_KEY");
-        }
-        names
-    } else {
-        Vec::new()
-    };
-    if !missing.is_empty() {
-        return Err(format!(
-            "restore config is absent at {}; missing: {}",
-            path.display(),
-            missing.join(", ")
-        )
-        .into());
-    }
     let mut config = match existing {
         Some(config) => config,
         None => Config {
-            kernel: overrides.kernel.clone().unwrap(),
-            base_rootfs: overrides.rootfs.clone().unwrap(),
-            ssh_key: overrides.ssh_key.clone().unwrap(),
+            kernel: overrides.kernel.clone().unwrap_or_default(),
+            base_rootfs: overrides.rootfs.clone().unwrap_or_default(),
+            ssh_key: overrides.ssh_key.clone().unwrap_or_default(),
             mem_mib: overrides.mem_mib.unwrap_or(512),
             vcpus: overrides.vcpus.unwrap_or(1),
         },
@@ -746,8 +765,23 @@ fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Co
     if let Some(value) = overrides.vcpus {
         config.vcpus = value;
     }
-    require_file(&config.kernel)?;
-    require_file(&config.base_rootfs)?;
+    let mut missing = Vec::new();
+    if matches!(need, RestoreConfigNeed::Portable) && config.kernel.as_os_str().is_empty() {
+        missing.push("--kernel or ABRA_FC_KERNEL");
+    }
+    if matches!(need, RestoreConfigNeed::Portable) && config.base_rootfs.as_os_str().is_empty() {
+        missing.push("--rootfs or ABRA_FC_ROOTFS");
+    }
+    if config.ssh_key.as_os_str().is_empty() {
+        missing.push("--ssh-key or ABRA_FC_SSH_KEY");
+    }
+    if !missing.is_empty() {
+        return Err(format!("restore config is missing: {}", missing.join(", ")).into());
+    }
+    if matches!(need, RestoreConfigNeed::Portable) {
+        require_file(&config.kernel)?;
+        require_file(&config.base_rootfs)?;
+    }
     resolve_key(Some(config.ssh_key.clone()))?;
     if config_was_absent {
         create_adapter_root(root)?;
@@ -757,6 +791,7 @@ fn resolve_restore_config(root: &Path, overrides: RestoreOverrides) -> Result<Co
 }
 
 fn fingerprint(fc: &Path) -> Result<Fingerprint> {
+    #[cfg(test)]
     if let Ok(fake) = std::env::var("ABRA_FC_FAKE_FINGERPRINT") {
         return Ok(serde_json::from_str(&fake)?);
     }
@@ -780,7 +815,8 @@ fn fingerprint(fc: &Path) -> Result<Fingerprint> {
         arch: std::env::consts::ARCH.into(),
         hypervisor: "firecracker".into(),
         snapshot_format_major: major,
-        cpu_template: std::env::var("ABRA_FC_CPU_TEMPLATE").unwrap_or_else(|_| "-".into()),
+        // This adapter does not set a Firecracker CPU template.
+        cpu_template: "-".into(),
         cpu_identity: live_cpu_identity()?,
     })
 }
@@ -1036,17 +1072,106 @@ fn wait_ssh(state: &SlotState, key: &Path, timeout: Duration) -> Result<()> {
     .into())
 }
 
-fn rsync_guest(source: &Path, state: &SlotState, key: &Path, destination: &str) -> Result<()> {
-    ssh(state, key, &format!("mkdir -p {destination}"))?;
-    let status = transport_command("scp", key)
-        .arg("-r")
-        .arg(format!("{}/.", source.display()))
-        .arg(format!("root@{}:{destination}", state.guest_ip))
+fn create_tree_archive(source: &Path, archive: &Path) -> Result<()> {
+    let status = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-C")
+        .arg(source)
+        .arg("-cf")
+        .arg(archive)
+        .arg(".")
         .status()?;
     if !status.success() {
-        return Err("scp to guest failed".into());
+        return Err("failed to archive portable workspace".into());
     }
     Ok(())
+}
+
+fn fresh_workspace_metadata(workspace: &Path) -> Result<PathBuf> {
+    let metadata = workspace.join(".abra");
+    // This is reserved local metadata. Never write through links supplied by a snapshot.
+    match fs::symlink_metadata(&metadata) {
+        Ok(entry) if entry.is_dir() && !entry.file_type().is_symlink() => {
+            fs::remove_dir_all(&metadata)?
+        }
+        Ok(_) => fs::remove_file(&metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::create_dir(&metadata)?;
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o700))?;
+    Ok(metadata)
+}
+
+fn replace_tree_command(archive: &Path, destination: &Path, token: u128) -> Result<String> {
+    if !destination.is_absolute() || destination == Path::new("/") {
+        return Err("workspace destination must be an absolute non-root path".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or("workspace destination lacks a parent")?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("workspace destination is not UTF-8")?;
+    let staging = parent.join(format!(".{name}.abra-staging-{token:032x}"));
+    let previous = parent.join(format!(".{name}.abra-previous-{token:032x}"));
+    let archive = shell_quote(archive.to_str().ok_or("archive path is not UTF-8")?);
+    let destination = shell_quote(
+        destination
+            .to_str()
+            .ok_or("workspace destination is not UTF-8")?,
+    );
+    let staging = shell_quote(staging.to_str().ok_or("staging path is not UTF-8")?);
+    let previous = shell_quote(previous.to_str().ok_or("previous path is not UTF-8")?);
+    Ok(format!(
+        "set -eu
+cleanup() {{
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ! ( [ -e {destination} ] || [ -L {destination} ] ) && ( [ -e {previous} ] || [ -L {previous} ] ); then
+    mv -- {previous} {destination}
+  fi
+  rm -rf -- {staging}
+  rm -f -- {archive}
+  exit \"$status\"
+}}
+trap cleanup EXIT HUP INT TERM
+rm -rf -- {staging} {previous}
+mkdir -- {staging}
+tar -C {staging} -xf {archive}
+if [ -e {destination} ] || [ -L {destination} ]; then
+  mv -- {destination} {previous}
+fi
+mv -- {staging} {destination}
+rm -rf -- {previous}
+rm -f -- {archive}
+trap - EXIT HUP INT TERM"
+    ))
+}
+
+fn restore_workspace(source: &Path, state: &SlotState, key: &Path) -> Result<()> {
+    let local = tempfile::tempdir()?;
+    let archive = local.path().join("workspace.tar");
+    create_tree_archive(source, &archive)?;
+    let token = rand::random::<u128>();
+    let remote_archive = PathBuf::from(format!("/tmp/abra-workspace-{token:032x}.tar"));
+    let status = transport_command("scp", key)
+        .arg(&archive)
+        .arg(format!(
+            "root@{}:{}",
+            state.guest_ip,
+            remote_archive.display()
+        ))
+        .status()?;
+    if !status.success() {
+        return Err("portable workspace archive copy failed".into());
+    }
+    ssh(
+        state,
+        key,
+        &replace_tree_command(&remote_archive, Path::new("/workspace"), token)?,
+    )
 }
 
 fn control(root: &Path, request: &Value) -> Result<Value> {
@@ -1476,9 +1601,13 @@ mod tests {
     #[test]
     fn fresh_restore_config_lists_every_missing_required_input() {
         let root = tempfile::tempdir().unwrap();
-        let error = resolve_restore_config(root.path(), RestoreOverrides::default())
-            .unwrap_err()
-            .to_string();
+        let error = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("--kernel or ABRA_FC_KERNEL"));
         assert!(error.contains("--rootfs or ABRA_FC_ROOTFS"));
         assert!(error.contains("--ssh-key or ABRA_FC_SSH_KEY"));
@@ -1498,6 +1627,7 @@ mod tests {
                 ssh_key: Some(key.clone()),
                 ..Default::default()
             },
+            RestoreConfigNeed::Portable,
         )
         .unwrap();
         assert_eq!(config.mem_mib, 512);
@@ -1527,9 +1657,112 @@ mod tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
-        let resolved = resolve_restore_config(root.path(), RestoreOverrides::default()).unwrap();
+        let resolved = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap();
         assert_eq!(resolved.mem_mib, 768);
         assert_eq!(resolved.vcpus, 2);
+    }
+
+    #[test]
+    fn native_restore_does_not_require_fallback_images() {
+        let root = tempfile::tempdir().unwrap();
+        let key = fixture_file(root.path(), "key", 0o600);
+        let config = resolve_restore_config(
+            root.path(),
+            RestoreOverrides {
+                ssh_key: Some(key.clone()),
+                ..Default::default()
+            },
+            RestoreConfigNeed::Native,
+        )
+        .unwrap();
+        assert_eq!(config.ssh_key, key);
+        assert!(config.kernel.as_os_str().is_empty());
+        let error = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--kernel"));
+        assert!(error.contains("--rootfs"));
+    }
+
+    #[test]
+    fn workspace_archive_preserves_links_and_replaces_stale_files() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let outside = root.path().join("outside");
+        let destination = root.path().join("work space's");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(outside.join("private"), b"stay outside").unwrap();
+        fs::write(source.join("checkpoint"), b"saved").unwrap();
+        fs::write(destination.join("stale"), b"remove me").unwrap();
+        symlink(&outside, source.join("link")).unwrap();
+        let archive = root.path().join("files.tar");
+        create_tree_archive(&source, &archive).unwrap();
+        let command = replace_tree_command(&archive, &destination, 1).unwrap();
+        let result = Command::new("sh").args(["-c", &command]).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!destination.join("stale").exists());
+        assert_eq!(fs::read(destination.join("checkpoint")).unwrap(), b"saved");
+        assert!(fs::symlink_metadata(destination.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(destination.join("link")).unwrap(), outside);
+        assert_eq!(fs::read(outside.join("private")).unwrap(), b"stay outside");
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn invalid_archive_keeps_existing_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("workspace");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("original"), b"keep").unwrap();
+        let archive = root.path().join("invalid.tar");
+        fs::write(&archive, b"not an archive").unwrap();
+        let command = replace_tree_command(&archive, &destination, 2).unwrap();
+        assert!(!Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert_eq!(fs::read(destination.join("original")).unwrap(), b"keep");
+        assert!(!archive.exists());
+        assert!(replace_tree_command(&archive, Path::new("/"), 3).is_err());
+    }
+
+    #[test]
+    fn portable_metadata_never_follows_snapshot_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let private = outside.path().join("recipes.json");
+        fs::write(&private, b"private").unwrap();
+        symlink(outside.path(), root.path().join(".abra")).unwrap();
+        let metadata = fresh_workspace_metadata(root.path()).unwrap();
+        fs::write(metadata.join("recipes.json"), b"[]").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"private");
+        fs::remove_file(metadata.join("recipes.json")).unwrap();
+        symlink(&private, metadata.join("recipes.json")).unwrap();
+        let metadata = fresh_workspace_metadata(root.path()).unwrap();
+        fs::write(metadata.join("recipes.json"), b"[]").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"private");
     }
 
     #[test]

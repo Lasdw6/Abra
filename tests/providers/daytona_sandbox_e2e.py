@@ -26,6 +26,7 @@ SANDBOX = REPO / "adapters/sandbox"
 ADAPTER = REPO / "adapters/browser-session"
 sys.path.insert(0, str(SANDBOX))
 
+from abra_sandbox import coordinator  # noqa: E402
 from abra_sandbox.coordinator import ADAPTER_SKIP, CDP_PROBE, last_line  # noqa: E402
 from abra_sandbox.drivers.daytona import DaytonaDriver  # noqa: E402
 
@@ -85,6 +86,8 @@ class Run:
 
     def coordinator(self, root, name, *args):
         argv = [sys.executable, str(SANDBOX / "bin/abra-sandbox")] + list(args) + ["--abra", str(self.args.abra), "--abra-root", root, "--json"]
+        if self.args.remote_abra:
+            argv += ["--remote-abra", str(self.args.remote_abra)]
         completed = subprocess.run(argv, capture_output=True, text=True, timeout=1200)
         self.log("coordinator-%s.log" % name, "$ %s\n%s\n%s" % (shlex.join(argv[2:]), completed.stdout, completed.stderr))
         if completed.returncode != 0:
@@ -140,6 +143,7 @@ class Run:
             self.sandboxes[role] = box
             driver = DaytonaDriver(sandbox=box.id)
             self.drivers[role] = driver
+            coordinator.configure_runtime(driver, self.args.remote_abra or self.args.abra)
             home = last_line(driver.check(["sh", "-c", "echo $HOME"]))
             code, _, _ = driver.exec(["sh", "-c", "mkdir -p /workspace && test -w /workspace"])
             workspace = "/workspace" if code == 0 else home + "/workspace"
@@ -184,10 +188,15 @@ class Run:
             driver = self.drivers.get(role)
             if driver is not None:
                 try:
-                    logs = driver.exec(["sh", "-c", "for f in /tmp/abra-start-*.log; do echo \"== $f\"; tail -n 100 \"$f\"; done"], timeout=30)[1]
+                    logs = driver.exec(["sh", "-c", "for f in /tmp/abra-runner-*/start-*.log; do test -e \"$f\" || continue; echo \"== $f\"; tail -n 100 \"$f\"; done"], timeout=30)[1]
                     self.log("sandbox-%s-processes.log" % role, logs.decode("utf-8", "replace"))
                 except Exception:
                     pass
+                try:
+                    driver.close()
+                except Exception as error:
+                    self.report.setdefault("cleanup_errors", []).append(redact(error))
+                    self.report["ok"] = False
             if self.args.keep:
                 continue
             try:
@@ -305,8 +314,10 @@ class Run:
                 if cookie.encode() in data or local_value.encode() in data:
                     leaked.append(str(relative))
         self.check("cookie_outside_bundle", leaked == [], leaked)
-        no_abra = a.exec(["sh", "-c", "command -v abra; find /tmp %s -maxdepth 3 -type f -name abra" % shlex.quote(ws_a)])[1]
-        self.check("no_abra_binary_in_sandbox", no_abra.strip() == b"", no_abra.decode("utf-8", "replace"))
+        found_abra = a.exec(["sh", "-c", "command -v abra; find /tmp %s -maxdepth 3 -type f -name abra" % shlex.quote(ws_a)])[1]
+        managed_abra = a.runtime().encode()
+        self.check("only_managed_abra_in_sandbox", found_abra.splitlines() == [managed_abra],
+                   found_abra.decode("utf-8", "replace"))
         leftovers = a.exec(["sh", "-c", "ls -d /tmp/abra-collector-* /tmp/abra-browser-* 2>/dev/null"])[1]
         self.check("sandbox_temp_dirs_removed", leftovers.strip() == b"", leftovers.decode("utf-8", "replace"))
         self.check("pinned_ledger_removed_remotely", a.exec(["test", "-e", "%s/.abra/observed-%s.json" % (ws_a, captured["observation_barrier"])])[0] != 0)
@@ -369,6 +380,8 @@ def main():
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--abra", type=Path, default=Path(os.environ.get("ABRA_BIN") or REPO / "target/release/abra"),
                         help="local abra binary for the two roots on this machine")
+    parser.add_argument("--remote-abra", type=Path,
+                        help="Linux Abra binary to upload to Daytona (defaults to --abra)")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="sandbox image; empty string means the default snapshot")
     parser.add_argument("--no-browser", action="store_true", help="skip the chromium half")
     parser.add_argument("--keep", action="store_true", help="keep sandboxes and roots for debugging")
@@ -377,6 +390,8 @@ def main():
         parser.error("set DAYTONA_API_KEY in the environment")
     if not args.abra.is_file():
         parser.error("abra binary not found at %s" % args.abra)
+    if args.remote_abra and not args.remote_abra.is_file():
+        parser.error("remote Abra binary not found at %s" % args.remote_abra)
     run = Run(args)
     try:
         run.run()

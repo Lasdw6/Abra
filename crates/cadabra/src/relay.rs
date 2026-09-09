@@ -7,20 +7,27 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    sync::OnceLock,
+    time::Duration,
 };
 
 pub const MAX_RELAY_ENVELOPE: usize = 16 * 1024 * 1024;
+const MAX_RELAY_RESPONSE_BYTES: usize = 80 * 1024 * 1024;
+const MAX_RELAY_POLL_ITEMS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayEndpoint {
     pub url: String,
     #[serde(default)]
     pub secret: String,
+}
+
+impl RelayEndpoint {
+    pub fn validate(&self) -> Result<()> {
+        request_url(self, "/v1/poll").map(|_| ())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,46 +75,94 @@ impl RelayConfig {
     }
 }
 
-fn parse_http(url: &str) -> Result<(String, u16, String)> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or("relay URL must use http:// (put TLS in a reverse proxy)")?;
-    let (authority, base) = rest
-        .split_once('/')
-        .map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
-    let (host, port) = authority
-        .rsplit_once(':')
-        .map_or((authority, 80), |(h, p)| (h, p.parse().unwrap_or(0)));
-    if host.is_empty() || port == 0 {
+fn request_url(endpoint: &RelayEndpoint, path: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| "invalid relay URL")?;
+    let host = url.host_str().ok_or("relay URL must include a host")?;
+    if url.port() == Some(0) {
         return Err("invalid relay URL".into());
     }
-    Ok((host.into(), port, base.trim_end_matches('/').into()))
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(host) => {}
+        "http" => return Err("insecure relay URL is only allowed for loopback hosts".into()),
+        _ => return Err("relay URL must use https:// (http:// is allowed on loopback)".into()),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("relay URL must not contain credentials".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("relay URL must not contain a query or fragment".into());
+    }
+    let base = url.path().trim_end_matches('/');
+    url.set_path(&format!("{base}{path}"));
+    Ok(url)
 }
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn relay_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|error| format!("cannot create relay HTTP client: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| error.clone().into())
+}
+
 async fn request(endpoint: &RelayEndpoint, method: &str, path: &str, body: &[u8]) -> Result<Value> {
-    let (host, port, base) = parse_http(&endpoint.url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port)).await?;
-    let request = format!("{method} {base}{path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", endpoint.secret, body.len());
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(body).await?;
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).await?;
-    let split = bytes
-        .windows(4)
-        .position(|x| x == b"\r\n\r\n")
-        .ok_or("invalid relay HTTP response")?;
-    let header = std::str::from_utf8(&bytes[..split])?;
-    if !header
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
-        return Err(format!(
-            "relay request failed: {}",
-            header.lines().next().unwrap_or("invalid response")
-        )
+    let url = request_url(endpoint, path)?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())?;
+    let mut response = relay_client()?
+        .request(method, url)
+        .bearer_auth(&endpoint.secret)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await?;
+    let status = response.status();
+    let bytes = read_response_bytes(&mut response, MAX_RELAY_RESPONSE_BYTES).await?;
+    if !status.is_success() {
+        let detail = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| value["error"].as_str().map(str::to_owned));
+        return Err(match detail {
+            Some(detail) => format!("relay request failed ({status}): {detail}"),
+            None => format!("relay request failed ({status})"),
+        }
         .into());
     }
-    Ok(serde_json::from_slice(&bytes[split + 4..])?)
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn read_response_bytes(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("relay response exceeds {max_bytes} byte limit").into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(format!("relay response exceeds {max_bytes} byte limit").into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 pub async fn enqueue(
     endpoint: &RelayEndpoint,
@@ -146,7 +201,12 @@ pub async fn poll(
         endpoint,
         "POST",
         "/v1/poll",
-        &serde_json::to_vec(&json!({"tags":tags,"delete_on_fetch":false}))?,
+        &serde_json::to_vec(&json!({
+            "tags": tags,
+            "delete_on_fetch": false,
+            "max_items": MAX_RELAY_POLL_ITEMS,
+            "max_bytes": MAX_RELAY_ENVELOPE,
+        }))?,
     )
     .await?;
     let mut handled = 0;
@@ -207,4 +267,109 @@ fn apply_ack(
         node.outbox.apply_ack(&id, ack, node.peer_id(), now)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn endpoint(url: &str) -> RelayEndpoint {
+        RelayEndpoint {
+            url: url.into(),
+            secret: "never-put-this-in-the-url".into(),
+        }
+    }
+
+    #[test]
+    fn https_relay_url_keeps_base_path() {
+        let url = request_url(&endpoint("https://relay.example/abra/"), "/v1/poll").unwrap();
+        assert_eq!(url.as_str(), "https://relay.example/abra/v1/poll");
+        assert!(!url.as_str().contains("never-put-this-in-the-url"));
+    }
+
+    #[test]
+    fn plain_http_is_limited_to_loopback() {
+        assert!(request_url(&endpoint("http://127.0.0.1:8787"), "/v1/poll").is_ok());
+        assert!(request_url(&endpoint("http://[::1]:8787"), "/v1/poll").is_ok());
+        let error = request_url(&endpoint("http://relay.example"), "/v1/poll").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "insecure relay URL is only allowed for loopback hosts"
+        );
+    }
+
+    #[test]
+    fn relay_url_rejects_credentials_query_and_non_http_schemes() {
+        for url in [
+            "https://user:pass@relay.example",
+            "https://relay.example?secret=bad",
+            "https://relay.example:0",
+            "file:///tmp/relay",
+        ] {
+            assert!(request_url(&endpoint(url), "/v1/poll").is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_request_sends_bearer_auth_and_parses_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let endpoint = RelayEndpoint {
+            url: format!("http://{address}"),
+            secret: "test-secret".into(),
+        };
+        assert_eq!(
+            request(&endpoint, "POST", "/v1/poll", b"{}").await.unwrap(),
+            json!({"ok":true})
+        );
+        let request = server.await.unwrap();
+        assert!(request.contains("authorization: Bearer test-secret\r\n"));
+    }
+
+    #[tokio::test]
+    async fn response_reader_stops_at_its_byte_limit() {
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"
+                .as_slice(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream.write_all(wire).await.unwrap();
+            });
+            let mut response = relay_client()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            let error = read_response_bytes(&mut response, 10).await.unwrap_err();
+            assert_eq!(error.to_string(), "relay response exceeds 10 byte limit");
+            server.await.unwrap();
+        }
+    }
 }

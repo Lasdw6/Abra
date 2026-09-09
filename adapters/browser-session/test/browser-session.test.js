@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } from '../lib/cdp.js';
+import { CDP, attachPage, browserWebSocketFromPort, browserWebSocketFromUrl, evalValue, resolveCdpEndpoint, waitForLoad } from '../lib/cdp.js';
 import { capture, captureTarget, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
@@ -134,10 +134,65 @@ test('failed import cleanup reports a retained profile containing sender cookies
   );
 });
 
+test('http debugging endpoints resolve through /json/version', async () => {
+  const ws = 'ws://127.0.0.1:9/devtools/browser/fake';
+  const hits = [];
+  const server = createServer((req, res) => {
+    hits.push(req.url);
+    if (req.url === '/json/version') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: ws }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const httpUrl = `http://127.0.0.1:${port}`;
+  try {
+    assert.equal(await browserWebSocketFromUrl(httpUrl), ws);
+    assert.equal(await browserWebSocketFromUrl(`${httpUrl}/`), ws);
+    assert.equal(await browserWebSocketFromPort(port), ws);
+    assert.equal(await resolveCdpEndpoint(httpUrl), ws);
+    assert.equal(await resolveCdpEndpoint(`cdp:${httpUrl}`), ws);
+    assert.equal(await resolveCdpEndpoint(ws), ws);
+    assert.equal(await resolveCdpEndpoint(`cdp:${ws}`), ws);
+    assert.equal(hits.filter(url => url === '/json/version').length >= 4, true);
+
+    const root = await mkdtemp(path.join(os.tmpdir(), 'abra-http-cdp-'));
+    const exportBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export', options: {}, staging_dir: path.join(root, 'out') };
+    for (const [index, source] of [`cdp:${httpUrl}`, { type: 'cdp', cdp_url: httpUrl }].entries()) {
+      const before = hits.length;
+      const response = await adapterRequest({ ...exportBase, request_id: `a${index}`, source });
+      assert.notEqual(response.error?.code, 'invalid_request');
+      assert.equal(hits.slice(before).includes('/json/version'), true);
+    }
+    const beforeWs = hits.length;
+    const wsResponse = await adapterRequest({ ...exportBase, request_id: 'ab', source: `cdp:${ws}` });
+    assert.notEqual(wsResponse.error?.code, 'invalid_request');
+    assert.equal(hits.length, beforeWs);
+    const httpsResponse = await adapterRequest({ ...exportBase, request_id: 'ac', source: 'cdp:https://127.0.0.1:1' });
+    assert.notEqual(httpsResponse.error?.code, 'invalid_request');
+
+    const bundle = path.join(root, 'bundle');
+    await saveBundle(bundle, { cookies: [], origins: [], tabs: [] });
+    const importBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'import', payload: {}, materialized_files: bundle, options: {} };
+    for (const [index, destination] of [`cdp:${httpUrl}`, { type: 'cdp', cdp_url: httpUrl }].entries()) {
+      const before = hits.length;
+      const response = await adapterRequest({ ...importBase, request_id: `b${index}`, destination });
+      assert.notEqual(response.error?.code, 'invalid_request');
+      assert.equal(hits.slice(before).includes('/json/version'), true);
+    }
+  } finally {
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
 test('adapter rejects invalid source and destination forms', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-adapter-validation-'));
   const exportBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export', options: {}, staging_dir: path.join(root, 'out') };
-  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', 'bundle:', { type: 'cdp', cdp_url: 'http://127.0.0.1' }, { type: 'local' }, { type: 'bundle' }].entries()) {
+  for (const [index, source] of ['local:', 'cdp:not-a-websocket', '/tmp/profile', 'bundle:', { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }, { type: 'local' }, { type: 'bundle' }].entries()) {
     const response = await adapterRequest({ ...exportBase, request_id: `c${index}`, source });
     assert.equal(response.error.code, 'invalid_request');
   }
@@ -148,7 +203,7 @@ test('adapter rejects invalid source and destination forms', async () => {
   const bundle = path.join(root, 'bundle');
   await saveBundle(bundle, { cookies: [], origins: [], tabs: [] });
   const importBase = { protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'import', payload: {}, materialized_files: bundle, options: {} };
-  for (const [index, destination] of ['/tmp/materialized', 'cdp:http://127.0.0.1', { cdp_url: 'ws://127.0.0.1:1' }, { type: 'cdp', cdp_url: 'http://127.0.0.1' }].entries()) {
+  for (const [index, destination] of ['/tmp/materialized', 'cdp:ftp://127.0.0.1', { cdp_url: 'ws://127.0.0.1:1' }, { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }].entries()) {
     const response = await adapterRequest({ ...importBase, request_id: `d${index}`, destination });
     assert.equal(response.error.code, 'invalid_request');
     assert.match(response.error.message, /requires --destination local or --destination cdp/);

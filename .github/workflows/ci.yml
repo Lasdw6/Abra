@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-quality:
+    name: Rust formatting and clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --workspace --all-features --locked
+
+  rust-musl:
+    name: Static Linux CLI and runtime tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build -p abra-cli --release --locked --target x86_64-unknown-linux-musl
+      - run: cargo test -p abra-runtime --locked --target x86_64-unknown-linux-musl
+
+  rust-features:
+    name: Rust feature combinations
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo check -p abra-net --no-default-features --locked
+      - run: cargo check -p abra-net --no-default-features --features tcp --locked
+      - run: cargo check -p abra-net --no-default-features --features iroh --locked
+      - run: cargo check -p cadabra --no-default-features --locked
+      - run: cargo check -p cadabra --no-default-features --features tcp --locked
+      - run: cargo check -p cadabra --no-default-features --features iroh --locked
+      - run: cargo check -p abra-cli --no-default-features --locked
+      - run: cargo check -p abra-cli --no-default-features --features tcp --locked
+      - run: cargo check -p abra-cli --no-default-features --features iroh --locked
+
+  rust-packages:
+    name: Rust package manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo package --workspace --locked
+
+  adapters:
+    name: Adapter tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm test
+        working-directory: adapters/lib
+      - run: npm test
+        working-directory: adapters/browser-session
+      - run: npm test
+        working-directory: adapters/codex-session
+      - run: npm test
+        working-directory: viewer
+      - run: cargo build --release --locked -p abra-cli
+      - run: python3 -m unittest discover -s adapters/sandbox/tests -p 'test_*.py'
+        env:
+          ABRA_BIN: ${{ github.workspace }}/target/release/abra
+      - run: python3 -m unittest discover -s adapters/sandbox/collector -p 'test_*.py'

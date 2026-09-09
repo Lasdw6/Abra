@@ -24,6 +24,7 @@ def add_common(parser):
     parser.add_argument("--browser-cdp", metavar="WS_URL")
     parser.add_argument("--browser-port", type=int, metavar="PORT")
     parser.add_argument("--abra", default=coordinator.default_abra(), help="abra binary (default: ABRA_BIN, PATH, target/release)")
+    parser.add_argument("--remote-abra", help="architecture-compatible Abra binary to upload to the sandbox (default: --abra)")
     parser.add_argument("--abra-root", default=coordinator.default_root())
     parser.add_argument("--adapter-dir", default=coordinator.ADAPTER_DIR, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true")
@@ -35,7 +36,7 @@ def build_parser():
     capture = commands.add_parser("capture", help="collect once, pull the tree, take a local abra snapshot")
     add_common(capture)
     capture.add_argument("--membership", default="all", help="all | workspace | cgroup:<path> | pgrp:<pid>")
-    capture.add_argument("--collector", default=coordinator.COLLECTOR, help=argparse.SUPPRESS)
+    capture.add_argument("--collector", help=argparse.SUPPRESS)
     restore = commands.add_parser("restore", help="accept a snapshot locally and push its files into a sandbox")
     add_common(restore)
     restore.add_argument("--snapshot", required=True)
@@ -73,10 +74,12 @@ def main(argv=None):
     try:
         if args.command == "capture":
             result = coordinator.capture(driver, args.name, args.remote_workspace, abra, args.membership,
-                                         args.browser_cdp, args.browser_port, args.collector, args.adapter_dir)
+                                         args.browser_cdp, args.browser_port, args.collector, args.adapter_dir,
+                                         args.remote_abra)
         else:
             result = coordinator.restore(driver, args.name, args.snapshot, args.remote_workspace, abra, args.browser,
-                                        args.browser_cdp, args.browser_port, args.start, args.adapter_dir, args.replace_workspace)
+                                        args.browser_cdp, args.browser_port, args.start, args.adapter_dir,
+                                        args.replace_workspace, args.remote_abra)
     except Exception as error:
         print("abra-sandbox: %s" % redact(str(error)), file=sys.stderr)
         return 1

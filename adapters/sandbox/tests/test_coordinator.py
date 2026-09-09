@@ -118,7 +118,15 @@ class CoordinatorTest(unittest.TestCase):
     def sandbox(self, name):
         root = os.path.join(self.temp, "sandbox-" + name)
         os.makedirs(os.path.join(root, "workspace"))
-        return LocalDriver(root=root), os.path.join(root, "workspace")
+        driver = LocalDriver(root=root)
+        self.addCleanup(driver.close)
+        return driver, os.path.join(root, "workspace")
+
+    def assert_no_transient_files(self, driver):
+        entries = os.listdir(driver.tmp_dir())
+        self.assertEqual(1, len(entries))
+        self.assertTrue(entries[0].startswith("abra-runner-"))
+        self.assertEqual(["abra"], os.listdir(os.path.join(driver.tmp_dir(), entries[0])))
 
     def test_capture_send_accept_restore(self):
         driver_a, workspace_a = self.sandbox("a")
@@ -142,7 +150,7 @@ class CoordinatorTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(mirror, ".abra", "capsule_id")))
         self.assertFalse(os.path.exists(os.path.join(mirror, ".abra", "observed-%s.json" % captured["observation_barrier"])))
         self.assertFalse(os.path.exists(os.path.join(workspace_a, ".abra", "observed-%s.json" % captured["observation_barrier"])))
-        self.assertEqual([], os.listdir(driver_a.tmp_dir()), "sandbox temp files were not cleaned up")
+        self.assert_no_transient_files(driver_a)
         manifest_path = os.path.join(self.roots["a"], "capsules", captured["capsule_id"], "snapshots", captured["snapshot_id"] + ".cjson")
         with open(manifest_path) as handle:
             manifest = json.load(handle)
@@ -164,6 +172,8 @@ class CoordinatorTest(unittest.TestCase):
 
         driver_b, workspace_b = self.sandbox("b")
         restored = coordinator.restore(driver_b, "demo", second["snapshot_id"], workspace_b, self.abra_b)
+        self.assertEqual("portable", restored["mode"])
+        self.assertTrue(restored["restore_plan"]["portable"]["available"])
         self.assertEqual([], restored["started"])
         self.assertIsNone(restored["browser"])
         self.assertEqual(1, len(restored["candidates"]))
@@ -176,7 +186,7 @@ class CoordinatorTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(workspace_b, ".abra", "capsule_id")))
         self.assertFalse(os.path.exists(os.path.join(workspace_b, ".abra", "snapshot_id")))
         self.assertFalse(listening(self.port), "restore without --start must not run anything")
-        self.assertEqual([], os.listdir(driver_b.tmp_dir()))
+        self.assert_no_transient_files(driver_b)
 
         with open(os.path.join(workspace_b, "stale.txt"), "w") as handle:
             handle.write("not in the snapshot")

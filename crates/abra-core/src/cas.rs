@@ -7,7 +7,7 @@
 //! stored once and an incremental teleport only needs the hashes the receiver
 //! is missing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -278,6 +278,30 @@ impl BlobStore {
             }
             Err(error) => Err(Error::io(path, error)),
         }
+    }
+
+    /// Verify an object's hash with bounded memory, without changing the store.
+    pub fn verify_object(&self, hash: &Hash) -> Result<u64> {
+        let path = self.path_for(hash);
+        let mut file = self.open_object(hash)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut bytes = 0;
+        loop {
+            let read = file.read(&mut buffer).map_err(|e| Error::io(&path, e))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes += read as u64;
+        }
+        if Hash::from_bytes(*hasher.finalize().as_bytes()) != *hash {
+            return Err(Error::corrupt(
+                "blob",
+                format!("content of {hash} does not hash to its name"),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Move a completed temporary file into the CAS after streaming hash
@@ -560,7 +584,69 @@ pub fn materialize(store: &BlobStore, root: &Hash, dest: impl AsRef<Path>) -> Re
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(Error::io(dest, e)),
     }
+    validate_materialization(store, root)?;
     materialize_inner(store, root, dest, 0, 0)
+}
+
+/// Verify the tree and its objects without writing to the store or destination.
+/// Filesystem permissions, available space and concurrent changes are checked
+/// only when materializing. This check uses the same tree limits as the writer.
+pub fn validate_materialization(store: &BlobStore, root: &Hash) -> Result<()> {
+    let mut lengths = BTreeMap::new();
+    walk_tree(store, root, |entry| {
+        if entry.mode == EntryMode::Tree {
+            return Ok(());
+        }
+        let length = match lengths.get(&entry.hash) {
+            Some(length) => *length,
+            None => {
+                let length = store.verify_object(&entry.hash)?;
+                lengths.insert(entry.hash, length);
+                length
+            }
+        };
+        check_entry_size(entry, length)?;
+        if entry.mode == EntryMode::Link {
+            checked_link_target(&store.get(&entry.hash)?)?;
+        }
+        Ok(())
+    })
+}
+
+fn check_entry_size(entry: &TreeEntry, length: u64) -> Result<()> {
+    if length != entry.size {
+        return Err(Error::corrupt("blob", "tree size mismatch"));
+    }
+    Ok(())
+}
+
+fn checked_link_target(bytes: &[u8]) -> Result<PathBuf> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(Error::corrupt(
+            "symlink target",
+            "target is empty or contains NUL",
+        ));
+    }
+    let target = bytes_to_path(bytes)?;
+    if !cfg!(unix) {
+        return Err(Error::invalid("cannot create symlinks on this platform"));
+    }
+    Ok(target)
+}
+
+fn check_tree_depth(depth: usize) -> Result<()> {
+    if depth > 512 {
+        return Err(Error::invalid("tree depth exceeds 512"));
+    }
+    Ok(())
+}
+
+fn child_path_len(path_len: usize, name: &str) -> Result<usize> {
+    let child_len = path_len + usize::from(path_len > 0) + name.len();
+    if child_len > 4096 {
+        return Err(Error::invalid("reconstructed path exceeds 4096 bytes"));
+    }
+    Ok(child_len)
 }
 
 fn materialize_inner(
@@ -570,17 +656,12 @@ fn materialize_inner(
     depth: usize,
     path_len: usize,
 ) -> Result<()> {
-    if depth > 512 {
-        return Err(Error::invalid("tree depth exceeds 512"));
-    }
+    check_tree_depth(depth)?;
     fs::create_dir_all(dest).map_err(|e| Error::io(dest, e))?;
     let tree = store.get_tree(root)?;
 
     for entry in tree.entries() {
-        let child_len = path_len + usize::from(path_len > 0) + entry.name.len();
-        if child_len > 4096 {
-            return Err(Error::invalid("reconstructed path exceeds 4096 bytes"));
-        }
+        let child_len = child_path_len(path_len, &entry.name)?;
         let path = dest.join(&entry.name);
         match entry.mode {
             EntryMode::Tree => {
@@ -593,18 +674,14 @@ fn materialize_inner(
             }
             EntryMode::Link => {
                 let bytes = store.get(&entry.hash)?;
-                if bytes.len() as u64 != entry.size {
-                    return Err(Error::corrupt("blob", "tree size mismatch"));
-                }
-                let target = bytes_to_path(&bytes)?;
+                check_entry_size(entry, bytes.len() as u64)?;
+                let target = checked_link_target(&bytes)?;
                 remove_existing(&path)?;
                 symlink(&target, &path)?;
             }
             EntryMode::File | EntryMode::Exec => {
                 let bytes = store.get(&entry.hash)?;
-                if bytes.len() as u64 != entry.size {
-                    return Err(Error::corrupt("blob", "tree size mismatch"));
-                }
+                check_entry_size(entry, bytes.len() as u64)?;
                 remove_existing(&path)?;
                 fs::write(&path, &bytes).map_err(|e| Error::io(&path, e))?;
                 set_mode(&path, entry.mode == EntryMode::Exec)?;
@@ -617,21 +694,39 @@ fn materialize_inner(
 /// Every hash reachable from a root tree, the root included: the blobs a
 /// receiver needs to materialize this directory state.
 pub fn collect_tree_hashes(store: &BlobStore, root: &Hash) -> Result<BTreeSet<Hash>> {
-    let mut out = BTreeSet::new();
-    collect_inner(store, root, &mut out)?;
+    let mut out = BTreeSet::from([*root]);
+    walk_tree(store, root, |entry| {
+        out.insert(entry.hash);
+        Ok(())
+    })?;
     Ok(out)
 }
 
-fn collect_inner(store: &BlobStore, root: &Hash, out: &mut BTreeSet<Hash>) -> Result<()> {
-    if !out.insert(*root) {
-        return Ok(());
-    }
-    let tree = store.get_tree(root)?;
-    for entry in tree.entries() {
-        match entry.mode {
-            EntryMode::Tree => collect_inner(store, &entry.hash, out)?,
-            _ => {
-                out.insert(entry.hash);
+fn walk_tree(
+    store: &BlobStore,
+    root: &Hash,
+    mut visit: impl FnMut(&TreeEntry) -> Result<()>,
+) -> Result<()> {
+    let mut pending = vec![(*root, 0, 0)];
+    let mut seen: BTreeMap<Hash, (usize, usize)> = BTreeMap::new();
+    while let Some((hash, depth, path_len)) = pending.pop() {
+        check_tree_depth(depth)?;
+        if let Some((max_depth, max_path)) = seen.get_mut(&hash) {
+            // A shared subtree needs another pass only when reached through a
+            // deeper or longer path. This also avoids expanding a DAG as a tree.
+            if *max_depth >= depth && *max_path >= path_len {
+                continue;
+            }
+            *max_depth = (*max_depth).max(depth);
+            *max_path = (*max_path).max(path_len);
+        } else {
+            seen.insert(hash, (depth, path_len));
+        }
+        for entry in store.get_tree(&hash)?.entries() {
+            let child_len = child_path_len(path_len, &entry.name)?;
+            visit(entry)?;
+            if entry.mode == EntryMode::Tree {
+                pending.push((entry.hash, depth + 1, child_len));
             }
         }
     }

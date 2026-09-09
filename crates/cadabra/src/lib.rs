@@ -228,6 +228,7 @@ impl Daemon {
         Self::new(root, transport, yes)
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn tcp(root: impl AsRef<Path>, yes: bool) -> Result<Self> {
         let root = root.as_ref();
         let node = DeliveryNode::open(root)?;
@@ -867,8 +868,10 @@ impl Daemon {
             "status" => self.status().await,
             "events" => self.events(),
             "control" => self.send_control(&request).await,
-            "pair-ticket" | "pair-add" | "pair-confirm" | "pending-pairs" | "peers"
-            | "enroll-mint" | "enroll-join" | "revoke" => self.handle_pairing(op, &request).await,
+            "pair-ticket" | "pair-add" | "pair-confirm" | "pair-remove" | "pending-pairs"
+            | "peers" | "enroll-mint" | "enroll-join" | "revoke" => {
+                self.handle_pairing(op, &request).await
+            }
             "adapters-list" | "adapters-add" | "adapters-remove" | "inspect" => {
                 self.handle_adapters(op, &request).await
             }
@@ -877,7 +880,9 @@ impl Daemon {
                 self.handle_policy(op, &request).await
             }
             "capsule-create" | "capsules" | "log" | "snapshot" | "native-attach"
-            | "lease-status" | "lease-take" => self.handle_capsules(op, &request).await,
+            | "restore-plan" | "lease-status" | "lease-take" => {
+                self.handle_capsules(op, &request).await
+            }
             "send" | "inbox" | "accept" | "outbox" | "cancel" | "handoffs" => {
                 self.handle_delivery(op, &request).await
             }
@@ -892,6 +897,7 @@ impl Daemon {
             "pair-ticket"
                 | "pair-add"
                 | "pair-confirm"
+                | "pair-remove"
                 | "enroll-mint"
                 | "revoke"
                 | "policy-grant"
@@ -952,6 +958,15 @@ impl Daemon {
                 let peer: PeerId = required_str(request, "id")?.parse()?;
                 self.locked_node().await?.approve_pair(peer)?;
                 Ok(json!({"confirmed":peer}))
+            }
+            "pair-remove" => {
+                let peer: PeerId = required_str(request, "id")?.parse()?;
+                let mut node = self.locked_node().await?;
+                if peer == node.peer_id() {
+                    return Err("cannot remove this device".into());
+                }
+                let removed = node.trust.remove_peer(peer)?;
+                Ok(json!({"peer_id":peer,"removed":removed}))
             }
             "pending-pairs" => {
                 let node = self.locked_node().await?;
@@ -1045,6 +1060,11 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                relay::RelayEndpoint {
+                    url: url.clone(),
+                    secret: secret.clone(),
+                }
+                .validate()?;
                 let mut config = relay::RelayConfig::load(&self.root)?;
                 if let Some(existing) = config.relays.iter_mut().find(|r| r.url == url) {
                     existing.secret = secret;
@@ -1107,6 +1127,7 @@ impl Daemon {
             "log" => self.log(request).await,
             "snapshot" => self.snapshot(request).await,
             "native-attach" => self.native_attach(request).await,
+            "restore-plan" => self.restore_plan(request).await,
             "lease-status" => self.lease_status(request).await,
             "lease-take" => self.lease_take(request).await,
             _ => Err(format!("unknown operation: {op}").into()),
@@ -1361,6 +1382,36 @@ impl Daemon {
             snapshot_id: result.snapshot_id,
             forked: result.forked,
         })
+    }
+
+    async fn restore_plan(&self, request: &Value) -> Result<Value> {
+        let id: Hash = required_str(request, "id")?.parse()?;
+        let target: Option<Fingerprint> = request
+            .get("fingerprint")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .flatten();
+        let roles: Vec<String> = request
+            .get("native_roles")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        let (cas, raw) = {
+            let node = self.locked_node().await?;
+            (
+                node.store.cas.clone(),
+                abra_core::link::find_snapshot(&node.store, id)?,
+            )
+        };
+        // Large native objects are streamed and verified outside the daemon lock.
+        let plan = tokio::task::spawn_blocking(move || {
+            let roles: Vec<_> = roles.iter().map(String::as_str).collect();
+            abra_core::restore::plan_restore(&cas, &raw, target.as_ref(), &roles)
+        })
+        .await??;
+        Ok(serde_json::to_value(plan)?)
     }
 
     async fn native_attach(&self, request: &Value) -> Result<Value> {
@@ -2686,6 +2737,9 @@ impl Daemon {
             .map(str::to_owned);
         let message = {
             let node = self.locked_node().await?;
+            if node.trust.get(&peer).is_none() {
+                return Err("unknown or untrusted control recipient".into());
+            }
             if !node.store.capsules.contains_key(&capsule) {
                 return Err("unknown capsule".into());
             }
@@ -3030,6 +3084,7 @@ fn validate_destination(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "iroh", feature = "tcp"))]
 fn read_port(path: &Path) -> Result<u16> {
     match fs::read_to_string(path) {
         Ok(value) => match value.trim().parse() {
@@ -3047,6 +3102,7 @@ fn read_port(path: &Path) -> Result<u16> {
     }
 }
 
+#[cfg(any(test, feature = "iroh", feature = "tcp"))]
 fn persist_port(path: &Path, port: u16) -> Result<()> {
     abra_core::atomic_write(path, port.to_string().as_bytes())?;
     Ok(())

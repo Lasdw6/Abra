@@ -1,12 +1,13 @@
 # Sandbox observation contract
 
-The collector (`adapters/sandbox/collector/observer.py`) collects OS facts and
+The Rust collector (`abra observe`, in `crates/abra-runtime/src/observe.rs`) collects OS facts and
 derives service candidates. It does not start services, flush databases,
 capture browser sessions, or guarantee that a command will work on another
-machine. Application adapters own those operations.
+machine. Live process memory is captured separately through the optional
+[CRIU backend](PROCESS_CHECKPOINTS.md).
 
 It has two modes. The primary one is one-shot: the
-[sandbox coordinator](../adapters/sandbox/README.md) pushes the script into a
+[sandbox coordinator](../adapters/sandbox/README.md) pushes an architecture-matching Abra binary into a
 sandbox over the provider's exec, runs it once with a barrier id, and pulls the
 pinned ledger out with the workspace files; nothing stays installed. The
 Firecracker guest image also installs it as a periodic systemd service
@@ -28,13 +29,14 @@ One-shot runs never touch `observed.json`.
 A checkpoint gets a separate file:
 
 ```sh
-python3 observer.py --workspace /workspace --all --once --barrier capture_1
+abra observe --workspace /workspace --all --once --barrier capture_1
 abra --json snapshot /workspace --observation-barrier capture_1
 ```
 
 The coordinator runs exactly this inside the sandbox (from a temp dir), then
 takes the snapshot on the mirror outside. In a Firecracker guest the same
-script is `/usr/local/libexec/abra-observer`.
+command is exposed by `/usr/local/libexec/abra-observer`, a shell wrapper for
+`abra observe`. The target does not need Python for observation.
 
 The first command returns `filename: "observed-capture_1.json"`, the barrier,
 observation time, and process/recipe counts. It writes that file inside `.abra`
@@ -61,7 +63,7 @@ from changing files while Abra reads them. `coverage.consistency` is
 `best-effort` and `applications_quiesced` is false. Start and finish timestamps
 bound the guest collection, not the later file walk or native VM capture. A
 coordinator that needs application consistency must arrange flushing or pausing
-through application-specific operations. A matching barrier alone is not proof
+through a separate checkpoint operation. A matching barrier alone is not proof
 of consistency.
 
 ## Fields

@@ -1,9 +1,8 @@
 # Abra — design
 
-Status: settled. This document records the decisions the implementation encodes,
-including the parts later phases build. Phase 1 implements the local primitives
-(identity, CAS, snapshot, store, enroll, link); everything marked _later_ is
-described here so it is designed for, not designed around.
+This document records the core design, including the local primitives,
+encrypted delivery and adapter boundaries. See [README](README.md) for current
+status and [portability](docs/PORTABILITY.md) for the restore contract.
 
 ### v1 transport implementation
 
@@ -134,18 +133,25 @@ Native blobs are opaque acceleration artifacts — the clearest example being
 Firecracker's memory file plus VM state file, carried **unchanged**. Abra does
 not parse, transform, or version them; it moves bytes.
 
-Each ref is keyed by a **host fingerprint** string:
+Each ref carries a structured **host fingerprint**:
 
-```
-linux-kvm-x86_64/fc-snap-v11/cpu-template-none
+```json
+{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":11,"cpu_template":"none","cpu_identity":"host-specific"}
 ```
 
-Restoring from a native blob is only valid on a host whose fingerprint matches.
+Matching every fingerprint field and verifying the required objects makes native
+resume eligible. The adapter must still try loading and validating native state.
 So native blobs are an **evictable cache, never the source of truth**. The file
 tree, ledger and app checkpoints form the portable representation; native blobs
 provide a fast path on compatible hosts. Portable continuation still requires
 compatible dependencies, external data and credentials. State present only in
 native memory or disk cannot be reconstructed from process observations.
+
+`abra_core::restore::plan_restore` and `abra restore-plan` check the local snapshot
+without writing files or running recipes. They report native eligibility,
+portable file availability and the observations the receiving application needs
+to choose a restore path. Tree structure, sizes and hashes are checked before
+materialization; target runtimes and application health remain adapter concerns.
 
 ## 7. Identity and authorization
 
@@ -246,6 +252,9 @@ arrive" rather than "it worked when both were awake".
 
 Direct encrypted connections remain the preferred path. The optional
 `abra-relay` service stores recipient-sealed envelopes under rotating HMAC tags.
+It acknowledges deposits after durable local writes, bounds storage and expires
+old envelopes. Clients require HTTPS except for loopback development. This is
+separate from iroh's connection relay.
 
 ### Adapters are separate executables
 
@@ -259,14 +268,24 @@ adapter's code.
 ### Observer-based recipe capture
 
 A collector run inside a sandbox records platform and runtime facts, mounts,
-and a process tree. It is a single Python file; a coordinator outside the
-sandbox pushes it in over the provider's exec and pulls the result out with the
-files, so no Abra process lives in the sandbox. The Firecracker guest image
-also runs it as a periodic service. It derives unverified service candidates and records missing
+and a process tree. It runs as `abra observe`, using the Rust runtime module.
+A coordinator outside the sandbox uploads a matching Abra binary, runs it
+through the provider's exec API, and retrieves the observations and files.
+These commands do not need an Abra daemon or identity inside the sandbox.
+The Firecracker guest image also runs the observer as a periodic service.
+It derives unverified service candidates and records missing
 requirements, collector failures and capture timing. Unique capture files bind
 one ledger to a snapshot without periodic overwrites. This is best-effort
 capture unless the application is quiesced separately. See §5 and the
 [observation contract](docs/OBSERVATION.md).
+
+Optional `abra process` commands use CRIU to capture a Linux process tree's
+memory and execution state, then copy its workspace while the tree is stopped.
+The bundle travels through Abra's existing signed file transfer. Restore checks
+the recorded architecture, kernel, CRIU version, CPU features and user ID before
+attempting CRIU restore. This needs no application checkpoint adapter, but it
+does require compatible Linux hosts and sufficient checkpoint permissions.
+See [process checkpoints](docs/PROCESS_CHECKPOINTS.md).
 
 ### Flat receiver model
 

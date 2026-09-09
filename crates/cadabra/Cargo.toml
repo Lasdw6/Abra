@@ -14,18 +14,20 @@ tcp = ["abra-net/tcp"]
 
 [dependencies]
 abra-core.workspace = true
-abra-net = { path = "../abra-net", default-features = false }
+abra-adapter.workspace = true
+abra-net.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "process"] }
 rand.workspace = true
 hex.workspace = true
-fs2 = "0.4"
+fs2.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 tempfile.workspace = true
 data-encoding.workspace = true
-abra-relay = { path = "../abra-relay" }
+abra-relay.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

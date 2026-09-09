@@ -118,7 +118,7 @@ await runAdapter({
 });
 ```
 
-The runner is implemented in Cadabra. `abra send <peer> --kind <kind> --source
+The runner is implemented in Cadabra. Programs that are not the daemon can call the same discovery and protocol code through the [`abra-adapter`](../crates/abra-adapter/) crate. `abra send <peer> --kind <kind> --source
 <value> [--adapter-option k=v ...]` exports into daemon-owned staging before
 signing and enqueueing. `abra accept <id> <dir> [--destination <value>]
 [--adapter-option k=v ...]` invokes a registered importer after materialization.

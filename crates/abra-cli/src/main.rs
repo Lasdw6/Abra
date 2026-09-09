@@ -1,15 +1,14 @@
-use cadabra::{
-    adapters::ExtraAdapterDir, background, control_call, relay::RelayConfig, Daemon, DaemonConfig,
-};
+#[cfg(any(feature = "iroh", feature = "tcp"))]
+use cadabra::{adapters::ExtraAdapterDir, Daemon};
+use cadabra::{background, control_call, relay::RelayConfig, DaemonConfig};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
+#[cfg(any(feature = "iroh", feature = "tcp"))]
+use std::{ffi::OsString, process::Stdio, sync::Arc, time::Duration};
 use std::{
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
-    sync::Arc,
-    time::Duration,
+    process::Command as ProcessCommand,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -27,6 +26,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Collect process and environment observations inside a sandbox.
+    Observe(abra_runtime::observe::ObserveArgs),
+    /// Check, capture, and restore live Linux processes with CRIU.
+    Process(abra_runtime::process::ProcessArgs),
+    /// Internal file transfer and process helpers for sandbox coordinators.
+    #[command(hide = true)]
+    SandboxHelper(abra_runtime::sandbox::SandboxArgs),
     Status,
     Daemon {
         #[arg(long)]
@@ -74,6 +80,16 @@ enum Command {
     Send(SendArgs),
     Inbox(InboxArgs),
     Accept(AcceptArgs),
+    /// Verify local snapshot objects and report native or portable restore options.
+    RestorePlan {
+        id: String,
+        /// Receiver fingerprint as JSON; never use the captured host's fingerprint.
+        #[arg(long)]
+        fingerprint: Option<String>,
+        /// Native artifact role required by the receiver's adapter; repeatable.
+        #[arg(long = "native-role", requires = "fingerprint")]
+        native_roles: Vec<String>,
+    },
     /// Per-kind summary of who last had each handoff.
     Handoffs {
         #[arg(long)]
@@ -264,6 +280,7 @@ enum PairCommand {
     Ticket,
     Add { ticket: String },
     Confirm { id: String },
+    Remove { id: String },
     Pending,
 }
 
@@ -432,6 +449,16 @@ fn default_root() -> PathBuf {
 #[tokio::main]
 async fn main() -> cadabra::Result<()> {
     let cli = Cli::parse();
+    // These commands operate inside a sandbox and do not need a daemon or identity.
+    if let Command::Observe(args) = cli.command {
+        return print_runtime_result(abra_runtime::observe::run(args), true);
+    }
+    if let Command::Process(args) = cli.command {
+        return print_runtime_result(abra_runtime::process::run(args), cli.json);
+    }
+    if let Command::SandboxHelper(args) = cli.command {
+        return print_runtime_result(abra_runtime::sandbox::run(args), true);
+    }
     let root = cli.root.unwrap_or_else(default_root);
     if let Command::Link { command } = cli.command {
         return run_link(&root, command, cli.json).await;
@@ -456,30 +483,38 @@ async fn main() -> cadabra::Result<()> {
         adapters,
     } = cli.command
     {
-        if detached {
-            return start_background_daemon(&root, cli.json).await;
+        #[cfg(not(any(feature = "iroh", feature = "tcp")))]
+        {
+            let _ = (yes, transport, token, detached, adapters);
+            return Err("binary built without a network transport".into());
         }
-        background::detach_from_terminal();
-        let mut daemon = match transport {
-            #[cfg(feature = "iroh")]
-            TransportKind::Iroh => Daemon::iroh(&root, yes).await?,
-            #[cfg(not(feature = "iroh"))]
-            TransportKind::Iroh => return Err("binary built without iroh transport".into()),
-            #[cfg(feature = "tcp")]
-            TransportKind::Tcp => Daemon::tcp(&root, yes).await?,
-            #[cfg(not(feature = "tcp"))]
-            TransportKind::Tcp => return Err("binary built without TCP transport".into()),
-        };
-        daemon.set_adapter_sources(adapter_sources(adapters)?);
-        let daemon = Arc::new(daemon);
-        if let Some(token) = token {
-            daemon.join(&token).await?;
+        #[cfg(any(feature = "iroh", feature = "tcp"))]
+        {
+            if detached {
+                return start_background_daemon(&root, cli.json).await;
+            }
+            background::detach_from_terminal();
+            let mut daemon = match transport {
+                #[cfg(feature = "iroh")]
+                TransportKind::Iroh => Daemon::iroh(&root, yes).await?,
+                #[cfg(not(feature = "iroh"))]
+                TransportKind::Iroh => return Err("binary built without iroh transport".into()),
+                #[cfg(feature = "tcp")]
+                TransportKind::Tcp => Daemon::tcp(&root, yes).await?,
+                #[cfg(not(feature = "tcp"))]
+                TransportKind::Tcp => return Err("binary built without TCP transport".into()),
+            };
+            daemon.set_adapter_sources(adapter_sources(adapters)?);
+            let daemon = Arc::new(daemon);
+            if let Some(token) = token {
+                daemon.join(&token).await?;
+            }
+            let running = daemon.start().await?;
+            wait_for_shutdown().await?;
+            running.shutdown().await;
+            background::release_pid_file(&root);
+            return Ok(());
         }
-        let running = daemon.start().await?;
-        wait_for_shutdown().await?;
-        running.shutdown().await;
-        background::release_pid_file(&root);
-        return Ok(());
     }
     if matches!(cli.command, Command::Watch) {
         let stream = UnixStream::connect(root.join("cadabra.sock")).await?;
@@ -497,9 +532,20 @@ async fn main() -> cadabra::Result<()> {
             PairCommand::Ticket => json!({"op":"pair-ticket"}),
             PairCommand::Add { ticket } => json!({"op":"pair-add","ticket":ticket}),
             PairCommand::Confirm { id } => json!({"op":"pair-confirm","id":id}),
+            PairCommand::Remove { id } => json!({"op":"pair-remove","id":id}),
             PairCommand::Pending => json!({"op":"pending-pairs"}),
         },
         Command::Peers => json!({"op":"peers"}),
+        Command::RestorePlan {
+            id,
+            fingerprint,
+            native_roles,
+        } => {
+            let fingerprint = fingerprint
+                .map(|value| serde_json::from_str::<Value>(&value))
+                .transpose()?;
+            json!({"op":"restore-plan","id":id,"fingerprint":fingerprint,"native_roles":native_roles})
+        }
         Command::Init { path } => {
             std::fs::create_dir_all(&path)?;
             json!({"op":"capsule-create","path":std::fs::canonicalize(path)?})
@@ -622,6 +668,7 @@ async fn main() -> cadabra::Result<()> {
         Command::Link { .. } => unreachable!(),
         Command::Daemon { .. } | Command::Stop => unreachable!(),
         Command::Config { .. } => unreachable!(),
+        Command::Observe(_) | Command::Process(_) | Command::SandboxHelper(_) => unreachable!(),
     };
     let result = call_with_pairing_hint(&root, &request, !cli.json).await?;
     if cli.json {
@@ -670,7 +717,24 @@ async fn main() -> cadabra::Result<()> {
     Ok(())
 }
 
+fn print_runtime_result(
+    result: Result<Value, Box<dyn std::error::Error>>,
+    json_output: bool,
+) -> cadabra::Result<()> {
+    let result = result.map_err(|error| error.to_string())?;
+    if json_output {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        print_human(&result);
+    }
+    if result.get("ok") == Some(&Value::Bool(false)) {
+        return Err("runtime check reported blockers; see the result above".into());
+    }
+    Ok(())
+}
+
 /// `--adapters` first, then `ABRA_ADAPTERS`, so an explicit flag wins.
+#[cfg(any(feature = "iroh", feature = "tcp"))]
 fn adapter_sources(flags: Vec<PathBuf>) -> cadabra::Result<Vec<ExtraAdapterDir>> {
     let mut sources = Vec::new();
     for path in flags {
@@ -680,6 +744,7 @@ fn adapter_sources(flags: Vec<PathBuf>) -> cadabra::Result<Vec<ExtraAdapterDir>>
     Ok(sources)
 }
 
+#[cfg(any(feature = "iroh", feature = "tcp"))]
 fn absolute(path: PathBuf) -> cadabra::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path)
@@ -690,6 +755,7 @@ fn absolute(path: PathBuf) -> cadabra::Result<PathBuf> {
 
 /// Re-execute this binary without `--background`, detached, and wait for the
 /// child to answer on the control socket.
+#[cfg(any(feature = "iroh", feature = "tcp"))]
 async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -780,6 +846,7 @@ async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Res
     }
 }
 
+#[cfg(any(feature = "iroh", feature = "tcp"))]
 fn remove_pid_file_if_matches(root: &Path, pid: i32) {
     if background::PidFile::load(root)
         .is_ok_and(|record| record.is_some_and(|record| record.pid == pid))
@@ -862,8 +929,16 @@ fn apply_config(root: &Path, key: &str, value: Option<&str>) -> cadabra::Result<
             let default = DaemonConfig::default();
             match (key, value) {
                 ("iroh_relay", Some(value)) => {
-                    value.parse::<abra_net::IrohRelayMode>()?;
-                    config.iroh_relay = value.to_owned();
+                    #[cfg(feature = "iroh")]
+                    {
+                        value.parse::<abra_net::IrohRelayMode>()?;
+                        config.iroh_relay = value.to_owned();
+                    }
+                    #[cfg(not(feature = "iroh"))]
+                    {
+                        let _ = value;
+                        return Err("binary built without iroh transport".into());
+                    }
                 }
                 ("iroh_relay", None) => config.iroh_relay = default.iroh_relay,
                 ("skip_native", Some(value)) => {
@@ -1263,6 +1338,7 @@ async fn resolve_served_path(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+#[cfg(any(feature = "iroh", feature = "tcp"))]
 async fn wait_for_shutdown() -> std::io::Result<()> {
     #[cfg(unix)]
     {

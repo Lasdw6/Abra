@@ -20,6 +20,14 @@ export async function set(cdp, url, cookies, locals) {
   const session = await attachPage(cdp, targetId);
   try {
     await waitForLoad(cdp, session);
+    // A slow origin is still about:blank when the target attaches; wait until the page is really there.
+    const origin = new URL(url).origin;
+    const end = Date.now() + 20000;
+    while (!(await evalValue(cdp, session, 'location.origin')).startsWith(origin)) {
+      if (Date.now() > end) throw new Error(`page did not navigate to ${origin}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    await waitForLoad(cdp, session);
     for (const cookie of cookies) await cdp.send('Network.setCookie', { url, ...cookie }, session);
     for (const item of locals) await evalValue(cdp, session, `(localStorage.setItem(${JSON.stringify(item.name)}, ${JSON.stringify(item.value)}), true)`);
   } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }

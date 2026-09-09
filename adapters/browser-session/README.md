@@ -68,12 +68,11 @@ to materialize the bundle. That path never authorizes a browser launch.
 
 ## Through Abra
 
-On Mac A, start a separate Chrome profile with remote debugging. Sign into the demo site in that Chrome window, then fetch its CDP WebSocket URL and send the session:
+On Mac A, start a separate Chrome profile with remote debugging. Sign into the demo site in that Chrome window, then send the session. `cdp:http://127.0.0.1:9222` is enough; the adapter looks up `/json/version` itself. `cdp:ws://…` still works if you already have the WebSocket URL.
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$HOME/.abra-demo-chrome"
-CDP_URL="$(curl -fsS http://127.0.0.1:9222/json/version | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).webSocketDebuggerUrl))')"
-abra send <peer> --kind dev.abra.browser.session.v1 --source "cdp:$CDP_URL"
+abra send <peer> --kind dev.abra.browser.session.v1 --source cdp:http://127.0.0.1:9222
 ```
 
 On Mac B, accept the transfer into a fresh detached local Chrome:

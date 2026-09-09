@@ -364,7 +364,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn build_and_start_relay(port: u16, secret: &str) -> Child {
+fn build_and_start_relay(port: u16, secret: &str, data_dir: &Path) -> Child {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let build = Command::new(env!("CARGO"))
         .args(["build", "-p", "abra-relay"])
@@ -381,6 +381,8 @@ fn build_and_start_relay(port: u16, secret: &str) -> Child {
         .unwrap_or_else(|| workspace.join("target"));
     let child = Command::new(target.join("debug/abra-relay"))
         .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--data-dir")
+        .arg(data_dir)
         .env("ABRA_RELAY_SECRET", secret)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -401,7 +403,11 @@ fn relay_delivers_to_restarted_offline_daemon_and_returns_ack() {
     let b = temp.path().join("b");
     let secret = "two-process-relay-secret";
     let port = free_port();
-    let mut processes = Daemons(vec![build_and_start_relay(port, secret)]);
+    let mut processes = Daemons(vec![build_and_start_relay(
+        port,
+        secret,
+        &temp.path().join("relay"),
+    )]);
     for root in [&a, &b] {
         processes.0.push(start_daemon(root, "tcp").unwrap());
     }

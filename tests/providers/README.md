@@ -14,10 +14,15 @@ python3.11 -m venv /tmp/abra-daytona-venv
 cargo build --release -p abra-cli
 export DAYTONA_API_KEY  # Set this through your shell or secret manager.
 /tmp/abra-daytona-venv/bin/python tests/providers/daytona_sandbox_e2e.py \
+  --remote-abra /path/to/linux-abra \
   --report-dir /tmp/abra-daytona-results
 ```
 
-The `abra` binary is the one for this machine; it never goes into a sandbox.
+`--abra` selects the binary for the local roots. `--remote-abra` selects the
+Linux binary temporarily uploaded to Daytona. Its architecture must match the
+sandbox. The test fails before upload when the binary format, OS, or CPU does
+not match. You can omit `--remote-abra` only when `--abra` already matches the
+sandbox.
 
 The runner creates two sandboxes from `mcr.microsoft.com/playwright:v1.49.1-noble`
 (python3, node 22, chromium; `--image` changes it). If image creation fails it
@@ -34,8 +39,10 @@ checks: ledger barrier matches the snapshot, host facts name the sandbox,
 `effective_cpu_millicores` and `effective_memory_bytes` match the sandbox's
 cpu and memory, a service candidate for 8123 is `unverified`, the mirror holds
 the files, the cookie and localStorage values appear in no file under root A
-outside the browser bundle, no `abra` binary and no coordinator temp dirs
-remain in the sandbox.
+outside the browser bundle, and no completed coordinator temp dirs remain in
+the sandbox. One runner-owned Abra directory exists while the test's direct
+driver is open, and its path is checked. Cleanup closes that driver and removes
+the directory before deleting or preserving the sandbox.
 
 Root A sends the snapshot and the browser bundle (`--source bundle:<dir>`) to
 root B with `--wait`. Root B materializes the bundle with `accept --no-import`

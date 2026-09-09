@@ -44,8 +44,22 @@ export async function evalValue(cdp, sessionId, expression, awaitPromise = true)
   return result.result.value;
 }
 
-export async function browserWebSocketFromPort(port) {
-  const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+export async function browserWebSocketFromUrl(baseUrl) {
+  const response = await fetch(`${String(baseUrl).replace(/\/$/, '')}/json/version`);
   if (!response.ok) throw new Error(`Chrome debugging endpoint returned ${response.status}`);
-  return (await response.json()).webSocketDebuggerUrl;
+  const url = (await response.json()).webSocketDebuggerUrl;
+  if (typeof url !== 'string' || !url) throw new Error('Chrome debugging endpoint omitted webSocketDebuggerUrl');
+  return url;
+}
+
+export async function browserWebSocketFromPort(port) {
+  return browserWebSocketFromUrl(`http://127.0.0.1:${port}`);
+}
+
+export async function resolveCdpEndpoint(value) {
+  if (typeof value !== 'string' || !value) throw new Error('CDP endpoint is required');
+  const raw = value.startsWith('cdp:') ? value.slice(4) : value;
+  if (/^wss?:\/\//.test(raw)) return raw;
+  if (/^https?:\/\//.test(raw)) return browserWebSocketFromUrl(raw);
+  throw new Error('CDP endpoint must be a ws(s) or http(s) URL');
 }

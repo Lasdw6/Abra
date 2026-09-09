@@ -277,6 +277,12 @@ struct TrustDisk {
     #[serde(default)]
     local_role: LocalRole,
     peers: BTreeMap<PeerId, TrustedPeer>,
+    #[serde(default)]
+    peer_versions: BTreeMap<PeerId, u64>,
+    #[serde(default)]
+    peer_pair_tickets: BTreeMap<PeerId, String>,
+    #[serde(default)]
+    cancelled_pairs: BTreeSet<String>,
     pending_tickets: BTreeMap<String, PairTicket>,
     awaiting_pair_confirm: BTreeMap<String, TrustedPeer>,
     used_tickets: BTreeSet<String>,
@@ -317,6 +323,9 @@ impl TrustStore {
 
     fn operation_lock(&self, name: &str) -> Result<fs::File> {
         let path = self.path.with_extension(format!("{name}.lock"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -389,7 +398,37 @@ impl TrustStore {
         merged
             .control_nonces
             .extend(self.disk.control_nonces.clone());
-        merged.peers.extend(self.disk.peers.clone());
+        merged
+            .cancelled_pairs
+            .extend(self.disk.cancelled_pairs.clone());
+        // A removal is a versioned absence. Detached sessions with an older
+        // trust snapshot must not restore a removed peer when saving hints.
+        for peer in self.disk.peers.keys().chain(self.disk.peer_versions.keys()) {
+            let version = self.disk.peer_versions.get(peer).copied().unwrap_or(0);
+            if version < merged.peer_versions.get(peer).copied().unwrap_or(0) {
+                continue;
+            }
+            if let Some(trusted) = self.disk.peers.get(peer) {
+                merged.peers.insert(*peer, trusted.clone());
+            } else if version > 0 {
+                merged.peers.remove(peer);
+            }
+            if let Some(ticket) = self.disk.peer_pair_tickets.get(peer) {
+                merged.peer_pair_tickets.insert(*peer, ticket.clone());
+            } else if version > 0 {
+                merged.peer_pair_tickets.remove(peer);
+            }
+            if version > 0 {
+                merged.peer_versions.insert(*peer, version);
+            }
+        }
+        merged
+            .pending_tickets
+            .retain(|ticket, _| !merged.used_tickets.contains(ticket));
+        merged.awaiting_pair_confirm.retain(|ticket, peer| {
+            !merged.cancelled_pairs.contains(ticket)
+                && merged.peer_pair_tickets.get(&peer.peer_id) != Some(ticket)
+        });
         Ok(merged)
     }
     pub fn get(&self, p: &PeerId) -> Option<&TrustedPeer> {
@@ -483,6 +522,8 @@ impl TrustStore {
         if certificate.record_type != "bind-cert" {
             return Err(Error::protocol("invalid bind certificate type"));
         }
+        let _operation_lock = self.operation_lock("bind-op")?;
+        self.reload()?;
         let issuer_peer = self
             .get(&issuer)
             .ok_or_else(|| Error::authz("untrusted bind certificate issuer"))?;
@@ -544,8 +585,59 @@ impl TrustStore {
         self.save()
     }
     pub fn insert(&mut self, p: TrustedPeer) -> Result<()> {
+        if self.disk.peer_versions.contains_key(&p.peer_id)
+            && !self.disk.peers.contains_key(&p.peer_id)
+        {
+            return Err(Error::authz(
+                "peer was removed; pair again with a new ticket",
+            ));
+        }
         self.disk.peers.insert(p.peer_id, p);
         self.save()
+    }
+    fn advance_peer_version(&mut self, peer: PeerId) {
+        let version = self.disk.peer_versions.entry(peer).or_default();
+        *version += 1;
+    }
+    pub fn remove_peer(&mut self, peer: PeerId) -> Result<bool> {
+        let _pair_lock = self.operation_lock("pair-op")?;
+        let _bind_lock = self.operation_lock("bind-op")?;
+        self.reload()?;
+        let Some(removed) = self.disk.peers.remove(&peer) else {
+            return Ok(false);
+        };
+        self.advance_peer_version(peer);
+        if let Some(ticket) = self.disk.peer_pair_tickets.remove(&peer) {
+            self.disk.cancelled_pairs.insert(ticket);
+        }
+        if let Some(token) = removed.token_id {
+            self.disk.revoked.insert(token);
+        }
+        for stored in self.disk.bind_certificates.values() {
+            if stored.issuer == peer {
+                self.disk
+                    .revoked
+                    .insert(stored.certificate.token_id.clone());
+            }
+        }
+        // Tickets minted before removal cannot put this peer back. Pairing
+        // again requires a ticket registered after this operation.
+        self.disk
+            .used_tickets
+            .extend(self.disk.pending_tickets.keys().cloned());
+        self.disk.cancelled_pairs.extend(
+            self.disk
+                .awaiting_pair_confirm
+                .iter()
+                .filter(|(_, pending)| pending.peer_id == peer)
+                .map(|(ticket, _)| ticket.clone()),
+        );
+        self.disk
+            .awaiting_pair_confirm
+            .retain(|_, pending| pending.peer_id != peer);
+        self.save()?;
+        self.reload()?;
+        Ok(true)
     }
     pub fn update_addresses(&mut self, peer: PeerId, addresses: Vec<String>) -> Result<()> {
         if addresses.is_empty() {
@@ -574,6 +666,8 @@ impl TrustStore {
         self.save()
     }
     pub fn register_ticket(&mut self, ticket: PairTicket) -> Result<()> {
+        let _operation_lock = self.operation_lock("pair-op")?;
+        self.reload()?;
         self.disk
             .pending_tickets
             .insert(ticket.ticket_id.clone(), ticket);
@@ -635,6 +729,10 @@ impl TrustStore {
             addresses,
         };
         if confirm_immediately {
+            self.advance_peer_version(peer.peer_id);
+            self.disk
+                .peer_pair_tickets
+                .insert(peer.peer_id, request.ticket_id.clone());
             self.disk.peers.insert(peer.peer_id, peer);
         } else {
             self.disk
@@ -652,6 +750,9 @@ impl TrustStore {
     pub fn confirm_pair(&mut self, confirm: &PairConfirm, authenticated: PeerId) -> Result<()> {
         let _operation_lock = self.operation_lock("pair-op")?;
         self.reload()?;
+        if self.disk.cancelled_pairs.contains(&confirm.ticket_id) {
+            return Err(Error::authz("pair confirmation was revoked"));
+        }
         let Some(peer) = self.disk.awaiting_pair_confirm.remove(&confirm.ticket_id) else {
             return if self.disk.peers.contains_key(&authenticated) {
                 Ok(())
@@ -664,6 +765,10 @@ impl TrustStore {
                 "pair confirmation differs from transport".into(),
             ));
         }
+        self.advance_peer_version(peer.peer_id);
+        self.disk
+            .peer_pair_tickets
+            .insert(peer.peer_id, confirm.ticket_id.clone());
         self.disk.peers.insert(peer.peer_id, peer);
         self.save()
     }
@@ -676,6 +781,15 @@ impl TrustStore {
         if accept.peer_id != ticket.peer_id || accept.nonce != expected_nonce {
             return Err(Error::Authentication("pair accept issuer mismatch".into()));
         }
+        let _operation_lock = self.operation_lock("pair-op")?;
+        self.reload()?;
+        if self.disk.cancelled_pairs.contains(&ticket.ticket_id) {
+            return Err(Error::authz("pair ticket was revoked"));
+        }
+        self.advance_peer_version(ticket.peer_id);
+        self.disk
+            .peer_pair_tickets
+            .insert(ticket.peer_id, ticket.ticket_id.clone());
         self.disk.peers.insert(
             ticket.peer_id,
             TrustedPeer {
@@ -1984,6 +2098,253 @@ mod tests {
         let records = trust.current_revocations(TEST_NOW);
         assert_eq!(records.len(), MAX_REVOCATIONS_PER_MESSAGE);
         assert_eq!(records[0].revoked_at, format_time(TEST_NOW + 128));
+    }
+
+    #[test]
+    fn removing_peer_revokes_its_trust_and_delegated_guests() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let other = Identity::generate();
+        let token_id = "42".repeat(16);
+        let mut trust = TrustStore::open(root.path()).unwrap();
+        trust.insert(full_peer(&issuer)).unwrap();
+        let certificate = BindCertificate::sign(
+            token_id.clone(),
+            guest.peer_id(),
+            TEST_NOW,
+            "guest".into(),
+            [4; 32],
+            scopes(),
+            format_time(TEST_NOW + 60_000),
+            &issuer,
+        )
+        .unwrap();
+        trust
+            .install_bind_certificate(issuer.peer_id(), certificate, TEST_NOW)
+            .unwrap();
+
+        assert!(trust.remove_peer(issuer.peer_id()).unwrap());
+        assert!(!trust.remove_peer(issuer.peer_id()).unwrap());
+
+        let reopened = TrustStore::open(root.path()).unwrap();
+        assert!(reopened.get(&issuer.peer_id()).is_none());
+        assert!(reopened.get(&guest.peer_id()).is_none());
+        assert!(reopened.bind_certificate(&guest.peer_id()).is_none());
+        assert!(reopened.is_revoked(&token_id));
+        assert!(reopened
+            .authorize_offer(
+                issuer.peer_id(),
+                other.peer_id(),
+                None,
+                "dev.abra.bundle",
+                Direction::Send,
+                TEST_NOW,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn stale_save_cannot_restore_removed_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = Identity::generate();
+        let unrelated = Identity::generate();
+        let mut current = TrustStore::open(root.path()).unwrap();
+        current.insert(full_peer(&removed)).unwrap();
+        let mut stale = TrustStore::open(root.path()).unwrap();
+
+        current.remove_peer(removed.peer_id()).unwrap();
+        stale.insert(full_peer(&unrelated)).unwrap();
+
+        let reopened = TrustStore::open(root.path()).unwrap();
+        assert!(reopened.get(&removed.peer_id()).is_none());
+        assert!(reopened.get(&unrelated.peer_id()).is_some());
+    }
+
+    #[test]
+    fn stale_bind_certificate_cannot_outlive_removed_issuer() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer = Identity::generate();
+        let guest = Identity::generate();
+        let mut current = TrustStore::open(root.path()).unwrap();
+        current.insert(full_peer(&issuer)).unwrap();
+        let mut stale = TrustStore::open(root.path()).unwrap();
+        let certificate = BindCertificate::sign(
+            "42".repeat(16),
+            guest.peer_id(),
+            TEST_NOW,
+            "guest".into(),
+            [4; 32],
+            scopes(),
+            format_time(TEST_NOW + 60_000),
+            &issuer,
+        )
+        .unwrap();
+
+        current.remove_peer(issuer.peer_id()).unwrap();
+        assert!(stale
+            .install_bind_certificate(issuer.peer_id(), certificate, TEST_NOW)
+            .is_err());
+
+        let reopened = TrustStore::open(root.path()).unwrap();
+        assert!(reopened.get(&guest.peer_id()).is_none());
+        assert!(reopened.bind_certificate(&guest.peer_id()).is_none());
+    }
+
+    #[test]
+    fn removed_peer_needs_a_fresh_pairing_ticket() {
+        let host_root = tempfile::tempdir().unwrap();
+        let joiner_root = tempfile::tempdir().unwrap();
+        let host = Identity::generate();
+        let joiner = Identity::generate();
+        let mut host_trust = TrustStore::open(host_root.path()).unwrap();
+        let mut joiner_trust = TrustStore::open(joiner_root.path()).unwrap();
+
+        let initial = PairTicket::mint(
+            "host".into(),
+            [1; 32],
+            None,
+            Vec::new(),
+            TEST_NOW,
+            60_000,
+            &host,
+        )
+        .unwrap();
+        host_trust.register_ticket(initial.clone()).unwrap();
+        let initial_request = PairRequest::sign(
+            initial.ticket_id.clone(),
+            "joiner".into(),
+            [2; 32],
+            None,
+            Vec::new(),
+            [3; 16],
+            &joiner,
+        )
+        .unwrap();
+        let initial_accept = host_trust
+            .accept_pair_request(
+                &initial_request,
+                joiner.peer_id(),
+                TEST_NOW,
+                true,
+                |_, _| true,
+            )
+            .unwrap();
+        joiner_trust
+            .complete_pair_as_joiner(&initial, &initial_accept, &initial_request.nonce)
+            .unwrap();
+
+        let unused = PairTicket::mint(
+            "host".into(),
+            [1; 32],
+            None,
+            Vec::new(),
+            TEST_NOW + 1,
+            60_000,
+            &host,
+        )
+        .unwrap();
+        host_trust.register_ticket(unused.clone()).unwrap();
+        let unused_request = PairRequest::sign(
+            unused.ticket_id.clone(),
+            "joiner".into(),
+            [2; 32],
+            None,
+            Vec::new(),
+            [4; 16],
+            &joiner,
+        )
+        .unwrap();
+        let pending = PairTicket::mint(
+            "host".into(),
+            [1; 32],
+            None,
+            Vec::new(),
+            TEST_NOW + 2,
+            60_000,
+            &host,
+        )
+        .unwrap();
+        host_trust.register_ticket(pending.clone()).unwrap();
+        let pending_request = PairRequest::sign(
+            pending.ticket_id.clone(),
+            "joiner".into(),
+            [2; 32],
+            None,
+            Vec::new(),
+            [5; 16],
+            &joiner,
+        )
+        .unwrap();
+        host_trust
+            .accept_pair_request(
+                &pending_request,
+                joiner.peer_id(),
+                TEST_NOW + 2,
+                false,
+                |_, _| true,
+            )
+            .unwrap();
+
+        host_trust.remove_peer(joiner.peer_id()).unwrap();
+        joiner_trust.remove_peer(host.peer_id()).unwrap();
+        assert!(host_trust
+            .accept_pair_request(
+                &unused_request,
+                joiner.peer_id(),
+                TEST_NOW + 3,
+                true,
+                |_, _| true,
+            )
+            .is_err());
+        assert!(host_trust
+            .confirm_pair(
+                &PairConfirm {
+                    message_type: "pair-confirm".into(),
+                    ticket_id: pending.ticket_id,
+                },
+                joiner.peer_id(),
+            )
+            .is_err());
+        assert!(joiner_trust
+            .complete_pair_as_joiner(&initial, &initial_accept, &initial_request.nonce)
+            .is_err());
+
+        let fresh = PairTicket::mint(
+            "host".into(),
+            [1; 32],
+            None,
+            Vec::new(),
+            TEST_NOW + 4,
+            60_000,
+            &host,
+        )
+        .unwrap();
+        host_trust.register_ticket(fresh.clone()).unwrap();
+        let fresh_request = PairRequest::sign(
+            fresh.ticket_id.clone(),
+            "joiner".into(),
+            [2; 32],
+            None,
+            Vec::new(),
+            [6; 16],
+            &joiner,
+        )
+        .unwrap();
+        let fresh_accept = host_trust
+            .accept_pair_request(
+                &fresh_request,
+                joiner.peer_id(),
+                TEST_NOW + 4,
+                true,
+                |_, _| true,
+            )
+            .unwrap();
+        joiner_trust
+            .complete_pair_as_joiner(&fresh, &fresh_accept, &fresh_request.nonce)
+            .unwrap();
+        assert!(host_trust.get(&joiner.peer_id()).is_some());
+        assert!(joiner_trust.get(&host.peer_id()).is_some());
     }
 
     #[cfg(feature = "iroh")]

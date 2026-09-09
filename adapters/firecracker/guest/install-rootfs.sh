@@ -68,9 +68,11 @@ for dest in usr/local/bin/abra usr/local/libexec/abra-observer \
   safe_dest "$MOUNT_DIR/$dest"
 done
 install -D -m 0755 "$ABRA_BIN" "$MOUNT_DIR/usr/local/bin/abra"
-# The collector is shared with adapters/sandbox; here it is installed as the
-# Firecracker guest's periodic observer service.
-install -D -m 0755 "$SCRIPT_DIR/../../sandbox/collector/observer.py" "$MOUNT_DIR/usr/local/libexec/abra-observer"
+# Keep the service entry point while sharing the Rust collector in the CLI.
+install -D -m 0755 /dev/stdin "$MOUNT_DIR/usr/local/libexec/abra-observer" <<'EOF'
+#!/bin/sh
+exec /usr/local/bin/abra observe "$@"
+EOF
 install -D -m 0755 "$SCRIPT_DIR/start-guest.sh" "$MOUNT_DIR/usr/local/libexec/abra-start-guest"
 install -D -m 0755 "$SCRIPT_DIR/os-desktop-init.sh" "$MOUNT_DIR/usr/local/bin/os-desktop-init.sh"
 mkdir -p "$MOUNT_DIR/var/lib/abra" "$MOUNT_DIR/workspace" "$MOUNT_DIR/etc/abra"

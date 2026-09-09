@@ -1,6 +1,7 @@
 import io
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -11,6 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from abra_sandbox.drivers.base import CommandError, pack_tree
 from abra_sandbox.drivers.local import LocalDriver
 from abra_sandbox.tree import unpack_tree
+
+REPO = Path(__file__).resolve().parents[3]
+ABRA = os.environ.get("ABRA_BIN") or str(REPO / "target/debug/abra")
 
 
 class TreeTest(unittest.TestCase):
@@ -23,6 +27,20 @@ class TreeTest(unittest.TestCase):
         self.outside = self.root / "outside"
         self.outside.mkdir()
         (self.outside / "marker").write_text("keep")
+
+    def driver(self):
+        if not os.path.isfile(ABRA):
+            self.skipTest("build abra first: cargo build -p abra-cli")
+        driver = LocalDriver(root=str(self.root / "driver"))
+        driver.configure_runtime(ABRA)
+        self.addCleanup(driver.close)
+        return driver
+
+    def assert_no_transient_files(self, driver):
+        entries = list(Path(driver.tmp_dir()).iterdir())
+        self.assertEqual(1, len(entries))
+        self.assertTrue(entries[0].name.startswith("abra-runner-"))
+        self.assertEqual(["abra"], os.listdir(entries[0]))
 
     def archive_entries(self, entries):
         with tarfile.open(self.archive, "w") as tar:
@@ -57,6 +75,30 @@ class TreeTest(unittest.TestCase):
                     unpack_tree(self.archive, self.destination)
                 self.assertEqual("keep", (self.outside / "marker").read_text())
                 self.assertEqual([], list(self.destination.iterdir()))
+
+    def test_rust_restore_rejects_hostile_archive_before_replacing_workspace(self):
+        if not os.path.isfile(ABRA):
+            self.skipTest("build abra first: cargo build -p abra-cli")
+        self.destination.mkdir()
+        (self.destination / "old").write_text("keep")
+        for entries in [
+            [("../outside/marker", tarfile.REGTYPE, "bad")],
+            [("link", tarfile.SYMTYPE, str(self.outside)), ("link/marker", tarfile.REGTYPE, "bad")],
+            [("marker", tarfile.LNKTYPE, "../outside/marker")],
+            [("same", tarfile.REGTYPE, "first"), ("same", tarfile.REGTYPE, "second")],
+            [("pipe", tarfile.FIFOTYPE, "")],
+        ]:
+            with self.subTest(entries=entries):
+                self.archive_entries(entries)
+                completed = subprocess.run(
+                    [ABRA, "sandbox-helper", "restore", "--archive", str(self.archive),
+                     "--workspace", str(self.destination), "--replace"],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(0, completed.returncode)
+                self.assertEqual(["old"], os.listdir(self.destination))
+                self.assertEqual("keep", (self.destination / "old").read_text())
+                self.assertEqual("keep", (self.outside / "marker").read_text())
 
     def test_regular_files_empty_dirs_and_internal_links_round_trip(self):
         source = self.root / "source"
@@ -94,7 +136,7 @@ class TreeTest(unittest.TestCase):
         self.destination.mkdir()
         (self.destination / "old").write_text("stale")
         (self.destination / "link").symlink_to(self.outside)
-        driver = LocalDriver(root=str(self.root / "driver"))
+        driver = self.driver()
         with self.assertRaisesRegex(CommandError, "--replace-workspace"):
             driver.restore_tree(str(source), str(self.destination))
         self.assertEqual("stale", (self.destination / "old").read_text())
@@ -102,7 +144,7 @@ class TreeTest(unittest.TestCase):
         driver.restore_tree(str(source), str(self.destination), replace=True)
         self.assertEqual(["current"], os.listdir(self.destination))
         self.assertEqual("keep", (self.outside / "marker").read_text())
-        self.assertEqual([], os.listdir(driver.tmp_dir()))
+        self.assert_no_transient_files(driver)
 
     def test_invalid_archive_preserves_workspace_and_cleans_remote_temps(self):
         source = self.root / "source"
@@ -110,18 +152,18 @@ class TreeTest(unittest.TestCase):
         (source / "escape").symlink_to(self.outside)
         self.destination.mkdir()
         (self.destination / "old").write_text("keep")
-        driver = LocalDriver(root=str(self.root / "driver"))
+        driver = self.driver()
         with self.assertRaisesRegex(CommandError, "absolute target"):
             driver.restore_tree(str(source), str(self.destination), replace=True)
         self.assertEqual(["old"], os.listdir(self.destination))
         self.assertEqual("keep", (self.destination / "old").read_text())
-        self.assertEqual([], os.listdir(driver.tmp_dir()))
+        self.assert_no_transient_files(driver)
 
     def test_restore_rejects_symlink_and_root_destinations(self):
         source = self.root / "source"
         source.mkdir()
         self.destination.symlink_to(self.outside)
-        driver = LocalDriver(root=str(self.root / "driver"))
+        driver = self.driver()
         for destination in (str(self.destination), "/"):
             with self.assertRaisesRegex(CommandError, "non-root directory"):
                 driver.restore_tree(str(source), destination, replace=True)

@@ -1,0 +1,50 @@
+name: File checkpoints across CPUs
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - run: cargo run --locked -p abra-core --example portable_checkpoint -- capture fixture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-${{ matrix.arch }}
+          path: fixture/
+          if-no-files-found: error
+          retention-days: 3
+
+  restore:
+    needs: capture
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            source: x86_64
+          - runner: ubuntu-24.04
+            source: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkpoint-${{ matrix.source }}
+          path: fixture/
+      - run: cargo run --locked -p abra-core --example portable_checkpoint -- restore fixture restored --require-arch-change
+      - name: Continue the application from its captured state
+        run: |
+          python3 restored/resume.py
+          python3 -c 'import json; assert json.load(open("restored/checkpoint.json"))["completed_steps"] == 8'

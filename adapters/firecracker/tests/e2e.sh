@@ -239,8 +239,7 @@ guest "test -f /workspace/native-marker.txt; test -r /proc/$MARKER_PID/stat; tes
 curl -sf --noproxy '*' http://172.30.0.2:8123/native-marker.txt | grep -qx native-marker
 
 "$ABRA_FC" --root "$RUN_ROOT" down --slot 0
-FAKE='{"os":"linux","arch":"x86_64","hypervisor":"firecracker","snapshot_format_major":999,"cpu_template":"-","cpu_identity":"fake"}'
-FALLBACK_RESULT="$(ABRA_FC_FAKE_FINGERPRINT="$FAKE" "$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" restore --slot 1 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT")"
+FALLBACK_RESULT="$(ABRA_FC_SNAPSHOT_FORMAT_MAJOR=999 "$ABRA_FC" --root "$RUN_ROOT" --firecracker "$FC" --ssh-key "$KEY" restore --slot 1 --capsule "$CAPSULE" --snapshot "$NATIVE_SNAPSHOT")"
 [[ "$(jq -r .mode <<<"$FALLBACK_RESULT")" == portable-fallback ]]
 ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 test -f /workspace/native-marker.txt
 ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" root@172.30.1.2 "! pgrep -f '[p]ython3 -m http.server 8123' >/dev/null"

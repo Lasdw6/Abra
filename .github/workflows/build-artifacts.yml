@@ -1,0 +1,63 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            firecracker: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            firecracker: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            firecracker: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            firecracker: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build binaries
+        run: >-
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p abra-cli -p abra-relay
+      - name: Build Firecracker adapter
+        if: matrix.firecracker
+        run: cargo build --release --locked --target ${{ matrix.target }} -p abra-fc
+      - name: Create archive and checksum
+        shell: bash
+        run: |
+          mkdir -p dist/stage
+          cp target/${{ matrix.target }}/release/abra dist/stage/
+          cp target/${{ matrix.target }}/release/abra-relay dist/stage/
+          if [[ "${{ matrix.firecracker }}" == "true" ]]; then
+            cp target/${{ matrix.target }}/release/abra-fc dist/stage/
+          fi
+          cp -R adapters dist/stage/
+          cp -R docs dist/stage/
+          cp LICENSE-APACHE LICENSE-MIT README.md DESIGN.md SPEC.md dist/stage/
+          tar -C dist/stage -czf dist/abra-${{ matrix.target }}.tar.gz .
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum abra-${{ matrix.target }}.tar.gz > abra-${{ matrix.target }}.tar.gz.sha256)
+          else
+            (cd dist && shasum -a 256 abra-${{ matrix.target }}.tar.gz > abra-${{ matrix.target }}.tar.gz.sha256)
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: abra-${{ matrix.target }}
+          path: |
+            dist/abra-${{ matrix.target }}.tar.gz
+            dist/abra-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error

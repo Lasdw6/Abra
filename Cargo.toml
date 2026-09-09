@@ -1,16 +1,21 @@
 [workspace]
 resolver = "2"
-members = ["crates/abra-core", "crates/abra-net", "crates/abra-relay", "crates/cadabra", "crates/abra-cli", "adapters/firecracker"]
+members = ["crates/abra-core", "crates/abra-adapter", "crates/abra-net", "crates/abra-relay", "crates/abra-runtime", "crates/cadabra", "crates/abra-cli", "adapters/firecracker"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/abra-p2p/abra"
+repository = "https://github.com/Lasdw6/Abra"
 rust-version = "1.91"
 
 [workspace.dependencies]
 abra-core = { path = "crates/abra-core", version = "0.1.0" }
+abra-adapter = { path = "crates/abra-adapter", version = "0.1.0" }
+abra-net = { path = "crates/abra-net", version = "0.1.0", default-features = false }
+abra-relay = { path = "crates/abra-relay", version = "0.1.0" }
+abra-runtime = { path = "crates/abra-runtime", version = "0.1.0" }
+cadabra = { path = "crates/cadabra", version = "0.1.0", default-features = false }
 blake3 = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
@@ -27,3 +32,5 @@ tempfile = "3"
 async-trait = "=0.1.89"
 tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

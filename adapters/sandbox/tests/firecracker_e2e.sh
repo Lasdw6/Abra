@@ -169,7 +169,7 @@ grep -qx fc-marker "$MIRROR/marker.txt"
 test -f "$MIRROR/src/app.py"
 test -f "$MIRROR/.abra/capsule_id"
 test ! -e "$MIRROR/.abra/observed-$BARRIER.json"
-guest "$GUEST_A" "test ! -e /workspace/.abra/observed-$BARRIER.json; test -z \"\$(ls -d /tmp/abra-collector-* /tmp/abra-browser-* 2>/dev/null)\"; test -z \"\$(find /tmp /workspace -maxdepth 3 -type f -name abra)\""
+guest "$GUEST_A" "test ! -e /workspace/.abra/observed-$BARRIER.json; test -z \"\$(ls -d /tmp/abra-collector-* /tmp/abra-browser-* /tmp/abra-runner-* 2>/dev/null)\"; test -z \"\$(find /tmp /workspace -maxdepth 3 -type f -name abra)\""
 if [[ "$RICH" == 1 ]]; then
   jq -e '.browser.fingerprint != null and (.browser.domains | index("127.0.0.1"))' <<<"$CAPTURED" >/dev/null
   BUNDLE_A="$(jq -r .browser.bundle <<<"$CAPTURED")"

@@ -1,32 +1,14 @@
-"""Driver interface plus tar-based tree transfer shared by every driver."""
+"""Driver interface plus tree transfer through a temporary remote Abra."""
 
 import json
 import os
+import posixpath
 import secrets
 import shlex
 import tarfile
 import tempfile
 
-from .. import tree
 from ..tree import unpack_tree
-
-# Runs inside the sandbox. Reads a JSON spec, starts the command in its own
-# session with output in a log file, prints the pid and exits.
-LAUNCHER = r'''
-import json, os, subprocess, sys
-with open(sys.argv[1]) as handle:
-    spec = json.load(handle)
-os.unlink(sys.argv[1])
-env = spec.get("env")
-if env is not None:
-    for key in ("HOME", "USER", "LANG"):
-        if key in os.environ:
-            env.setdefault(key, os.environ[key])
-log = open(spec["log"], "ab")
-child = subprocess.Popen(spec["argv"], cwd=spec.get("cwd"), env=env, stdin=subprocess.DEVNULL,
-                         stdout=log, stderr=log, start_new_session=True)
-print(child.pid)
-'''.strip()
 
 
 class CommandError(RuntimeError):
@@ -37,6 +19,43 @@ class Driver:
     """One sandbox. Paths are sandbox paths; bytes move through put/get only."""
 
     name = "base"
+
+    def configure_runtime(self, local_binary):
+        """Choose the architecture-compatible Abra binary uploaded on first use."""
+        binary = os.path.realpath(local_binary)
+        if not os.path.isfile(binary):
+            raise FileNotFoundError("remote Abra binary does not exist: %s" % binary)
+        configured = getattr(self, "_runtime_local", None)
+        if configured and configured != binary:
+            raise RuntimeError("sandbox driver is already configured with another Abra binary")
+        self._runtime_local = binary
+
+    def runtime(self):
+        """Return the remote Abra path, uploading it into an owned directory once."""
+        existing = getattr(self, "_runtime_remote", None)
+        if existing:
+            return existing
+        local = getattr(self, "_runtime_local", None)
+        if not local:
+            raise RuntimeError("sandbox driver needs configure_runtime() before tree or detached operations")
+        parent = self.tmp_dir().rstrip("/") or "/"
+        marker = posixpath.join(parent, "abra-runner-")
+        prefix = marker + "XXXXXXXXXXXX"
+        owned = _last_line(self.check(["mktemp", "-d", prefix]))
+        suffix = owned[len(marker):] if owned.startswith(marker) else ""
+        if (len(suffix) != 12 or not suffix.isascii() or not suffix.isalnum()
+                or posixpath.normpath(owned) != owned):
+            raise RuntimeError("mktemp returned an invalid remote Abra directory: %r" % owned)
+        remote = owned + "/abra"
+        self._runtime_dir = owned
+        try:
+            self.put(local, remote, 0o700)
+        except Exception:
+            self.run(["rm", "-rf", owned], 30, None, None)
+            self._runtime_dir = None
+            raise
+        self._runtime_remote = remote
+        return remote
 
     def exec(self, argv, timeout=60, env=None, cwd=None, detach=False):
         """Run argv in the sandbox. Returns (exit_code, stdout_bytes, stderr_bytes).
@@ -70,7 +89,11 @@ class Driver:
         return None
 
     def close(self):
-        pass
+        owned = getattr(self, "_runtime_dir", None)
+        self._runtime_remote = None
+        self._runtime_dir = None
+        if owned:
+            self.run(["rm", "-rf", owned], 30, None, None)
 
     def check(self, argv, timeout=60, env=None, cwd=None):
         code, out, err = self.exec(argv, timeout=timeout, env=env, cwd=cwd)
@@ -81,28 +104,41 @@ class Driver:
 
     def start_detached(self, argv, env, cwd):
         token = secrets.token_hex(6)
-        spec = "%s/abra-start-%s.json" % (self.tmp_dir(), token)
-        log = "%s/abra-start-%s.log" % (self.tmp_dir(), token)
+        runtime = self.runtime()
+        owned = os.path.dirname(runtime)
+        spec = "%s/start-%s.json" % (owned, token)
+        log = "%s/start-%s.log" % (owned, token)
         with tempfile.NamedTemporaryFile("w", suffix=".json") as local:
             json.dump({"argv": list(argv), "cwd": cwd, "env": env, "log": log}, local)
             local.flush()
             self.put(local.name, spec)
-        code, out, err = self.run(["python3", "-c", LAUNCHER, spec], 30, None, None)
+        code, out, err = self.run([runtime, "sandbox-helper", "start-detached", "--spec", spec], 30, None, None)
+        if code == 0:
+            try:
+                out = (str(json.loads(_last_line(out))["pid"]) + "\n").encode()
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                return 1, b"", ("invalid sandbox-helper output: %s" % error).encode()
         return code, out, err
 
     def put_tree(self, local_dir, remote_dir, exclude=()):
         """Copy a local directory into the sandbox. exclude lists relative paths to skip."""
-        archive = "%s/abra-tree-%s.tar" % (self.tmp_dir(), secrets.token_hex(6))
+        runtime = self.runtime()
+        archive = "%s/tree-%s.tar" % (os.path.dirname(runtime), secrets.token_hex(6))
         with tempfile.NamedTemporaryFile(suffix=".tar") as local:
             pack_tree(local_dir, local.name, exclude)
             self.put(local.name, archive)
-        self.check(["sh", "-c", 'mkdir -p "$1" && tar -C "$1" -xf "$2" && rm -f "$2"', "sh", remote_dir, archive], timeout=600)
+        try:
+            self.check([runtime, "sandbox-helper", "extract", "--archive", archive,
+                        "--destination", remote_dir], timeout=600)
+        finally:
+            self.exec(["rm", "-f", archive])
 
     def get_tree(self, remote_dir, local_dir):
         """Copy a sandbox directory to local_dir, which is created if missing."""
-        archive = "%s/abra-tree-%s.tar" % (self.tmp_dir(), secrets.token_hex(6))
-        # COPYFILE_DISABLE keeps macOS tar (local driver) from adding ._ entries.
-        self.check(["tar", "-C", remote_dir, "-cf", archive, "."], timeout=600, env={"COPYFILE_DISABLE": "1"})
+        runtime = self.runtime()
+        archive = "%s/tree-%s.tar" % (os.path.dirname(runtime), secrets.token_hex(6))
+        self.check([runtime, "sandbox-helper", "pack", "--source", remote_dir,
+                    "--archive", archive], timeout=600)
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar") as local:
                 self.get(archive, local.name)
@@ -112,16 +148,24 @@ class Driver:
 
     def restore_tree(self, local_dir, remote_dir, exclude=(), replace=False):
         """Restore exactly this tree; nonempty destinations require explicit replacement."""
-        remote = "%s/abra-restore-%s" % (self.tmp_dir(), secrets.token_hex(6))
+        runtime = self.runtime()
+        remote = "%s/restore-%s.tar" % (os.path.dirname(runtime), secrets.token_hex(6))
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar") as local:
                 pack_tree(local_dir, local.name, exclude)
-                self.put(local.name, remote + ".tar")
-            self.put(tree.__file__, remote + ".py")
-            self.check(["python3", remote + ".py", remote + ".tar", remote_dir,
-                        "replace" if replace else "empty"], timeout=600)
+                self.put(local.name, remote)
+            command = [runtime, "sandbox-helper", "restore", "--archive", remote,
+                       "--workspace", remote_dir]
+            if replace:
+                command.append("--replace")
+            self.check(command, timeout=600)
         finally:
-            self.exec(["rm", "-f", remote + ".tar", remote + ".py"])
+            self.exec(["rm", "-f", remote])
+
+
+def _last_line(output):
+    lines = [line for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def shell_command(argv, env=None, cwd=None):

@@ -3,7 +3,8 @@
 `abra-fc` is the host-side lifecycle shim for running portable Abra capsules in
 Firecracker microVMs. Native VM state is an optional cache attached to a signed
 child snapshot; the capsule file tree and observed recipes remain the source of
-truth.
+truth. See the [portable restore contract](../../docs/PORTABILITY.md) for what can
+continue across CPU architectures and what needs an application checkpoint.
 
 ## Build and prepare an image
 
@@ -18,7 +19,7 @@ sudo adapters/firecracker/guest/install-rootfs.sh rootfs.ext4 \
 ```
 
 The installer adds `abra-daemon.service` (which execs `abra --root /var/lib/abra
-daemon`), the collector from `adapters/sandbox/collector/observer.py` as the
+daemon`), the Rust `abra observe` collector as the
 periodic `abra-observer.service`, `/workspace`, the `abra` binary, and the
 `os-desktop-init.sh` PID 1 handoff named in the boot arguments.
 It does not install network packages.
@@ -187,11 +188,34 @@ abra-fc --root /var/lib/abra-new --firecracker /usr/local/bin/firecracker \
 
 The matching environment variables are `ABRA_FC_BINARY`, `ABRA_FC_SSH_KEY`,
 `ABRA_FC_KERNEL`, `ABRA_FC_ROOTFS`, `ABRA_FC_MEM`, and `ABRA_FC_VCPUS`.
+Native restore needs the SSH key for its readiness check; it can use the captured
+disk without a local kernel or base image. Portable fallback requires both images.
+
+Before changing a running slot, restore verifies its plan with the core's
+`plan_restore` API. It requires a live target fingerprint, exactly one of each
+required native role, matching content hashes and matching sizes. An unavailable
+native cache falls back to the verified portable tree. A snapshot with neither
+usable path fails before replacing the running slot.
+
+The native status is `eligible`; Firecracker's load and readiness checks decide
+whether resume works. The adapter uses no CPU template and reports `-` for that
+field. `ABRA_FC_SNAPSHOT_FORMAT_MAJOR` overrides the format probe for tests or a
+deployment with a known format. Production binaries ignore the old fake-host
+fingerprint variable.
+
+The JSON result includes `restore_plan`; a portable result also includes
+`fallback_reason`. You can inspect a snapshot separately with
+`abra --json restore-plan <id>` and optionally supply the receiving host's
+`abra-fc fingerprint` output and the native roles `vmstate`, `memory`, and `disk`.
 
 On mismatch, missing native roles, snapshot-load error, resume error, or guest
 readiness timeout, the partial VM is torn down and a fresh base image is booted, the selected
 snapshot's file tree is materialized into `/workspace`, and recipes are printed
 without execution. Native blobs are never treated as source of truth.
+The portable transfer preserves symlinks in a tar archive, extracts into a new
+guest directory, and replaces `/workspace` instead of overlaying stale files.
+The adapter recreates reserved `.abra` metadata from the signed manifest before
+copying. It does not follow snapshot links when writing host metadata.
 
 A guest can also be driven without its daemon: the
 [sandbox coordinator](../sandbox/README.md) ssh driver captures and restores a

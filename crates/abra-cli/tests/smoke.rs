@@ -85,7 +85,7 @@ fn real_cli_round_trips_status_over_uds() {
 }
 
 #[test]
-fn python_checkpoint_round_trips_through_cli_and_signed_manifest() {
+fn rust_observation_round_trips_through_cli_and_signed_manifest() {
     let root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let fake_proc = tempfile::tempdir().unwrap();
@@ -125,10 +125,8 @@ fn python_checkpoint_round_trips_through_cli_and_signed_manifest() {
         "{}",
         String::from_utf8_lossy(&initialized.stderr)
     );
-    let observer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../adapters/sandbox/collector/observer.py");
-    let capture = Command::new("python3")
-        .arg(observer)
+    let capture = Command::new(binary)
+        .arg("observe")
         .args([
             "--workspace",
             path,
@@ -180,6 +178,62 @@ fn python_checkpoint_round_trips_through_cli_and_signed_manifest() {
     assert_eq!(observed["schema"], "dev.abra.observed/3");
     assert_eq!(observed["observer"]["barrier"], "proof");
     assert_eq!(observed["host"]["facts"]["configured_resources"]["cpus"], 2);
+    let planned = call(&["restore-plan", id]);
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["snapshot_id"], id);
+    assert_eq!(plan["mode"], "portable");
+    assert_eq!(plan["portable"]["available"], true);
+    assert_eq!(plan["observation"]["observer"]["barrier"], "proof");
+    assert!(!call(&["restore-plan", id, "--fingerprint", "not-json"])
+        .status
+        .success());
+
+    let tree = manifest["files"].as_str().unwrap();
+    let tree_path = root
+        .path()
+        .join("objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    std::fs::write(&tree_path, b"corrupt tree").unwrap();
+    let planned = call(&["restore-plan", id]);
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["mode"], "unavailable");
+    assert_eq!(plan["portable"]["available"], false);
+    assert_eq!(
+        std::fs::read(tree_path).unwrap(),
+        b"corrupt tree",
+        "planning preserves corrupt objects for diagnosis"
+    );
     let missing = call(&["snapshot", path, "--observation-barrier", "missing"]);
     assert!(!missing.status.success());
+}
+
+#[test]
+fn unavailable_process_backend_exits_nonzero_without_starting_daemon() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("unused-identity");
+    let output = Command::new(env!("CARGO_BIN_EXE_abra"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--json", "process", "check", "--criu"])
+        .arg(temporary.path().join("missing-criu"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ok"], false);
+    assert!(
+        !root.exists(),
+        "a runtime check must not create an identity"
+    );
 }

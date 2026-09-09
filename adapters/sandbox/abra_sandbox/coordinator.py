@@ -1,7 +1,7 @@
 """Capture a sandbox into a local Abra snapshot, or push a snapshot back into one.
 
-Nothing Abra-specific stays in the sandbox: the collector and, when asked, the
-browser-session adapter are pushed to a temp dir, run once, and removed.
+An architecture-compatible Abra binary and, when asked, the browser-session
+adapter run from owned temporary directories that the driver removes on close.
 """
 
 import json
@@ -9,6 +9,7 @@ import os
 import posixpath
 import secrets
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -21,8 +22,9 @@ ADAPTER_DIR = os.path.join(REPO, "adapters", "browser-session")
 ADAPTER_SKIP = ("test", "facade", "README.md", "node_modules")
 LOCAL_ONLY = (".abra/capsule_id", ".abra/snapshot_id")
 MINIMAL_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-CDP_PROBE = ("import json, sys, urllib.request\n"
-             "print(json.load(urllib.request.urlopen('http://127.0.0.1:%s/json/version', timeout=10))['webSocketDebuggerUrl'])")
+CDP_PROBE = ("fetch('http://127.0.0.1:%s/json/version').then(r=>r.json())"
+             ".then(v=>console.log(v.webSocketDebuggerUrl))"
+             ".catch(e=>{console.error(e);process.exit(1)})")
 
 
 class Abra:
@@ -76,6 +78,74 @@ def membership_flags(membership):
     raise ValueError("membership must be all, workspace, cgroup:<path> or pgrp:<pid>")
 
 
+def _machine(value):
+    value = value.strip().lower()
+    if value in ("x86_64", "amd64"):
+        return "x86_64"
+    if value in ("aarch64", "arm64"):
+        return "aarch64"
+    return value
+
+
+def binary_platforms(binary):
+    """Return the OS and machine pairs encoded in an ELF or Mach-O binary."""
+    with open(binary, "rb") as handle:
+        header = handle.read(4096)
+    if header.startswith(b"\x7fELF") and len(header) >= 20:
+        byte_order = "<" if header[5] == 1 else ">" if header[5] == 2 else None
+        if byte_order is None:
+            raise RuntimeError("remote Abra ELF binary has an invalid byte order")
+        machine = struct.unpack(byte_order + "H", header[18:20])[0]
+        names = {62: "x86_64", 183: "aarch64"}
+        if machine not in names:
+            raise RuntimeError("remote Abra ELF architecture %d is unsupported" % machine)
+        return {("linux", names[machine])}
+
+    magics = {
+        b"\xce\xfa\xed\xfe": ("<", 4), b"\xcf\xfa\xed\xfe": ("<", 8),
+        b"\xfe\xed\xfa\xce": (">", 4), b"\xfe\xed\xfa\xcf": (">", 8),
+    }
+    if header[:4] in magics and len(header) >= 8:
+        byte_order, _ = magics[header[:4]]
+        cpu = struct.unpack(byte_order + "I", header[4:8])[0]
+        names = {0x01000007: "x86_64", 0x0100000c: "aarch64"}
+        if cpu not in names:
+            raise RuntimeError("remote Abra Mach-O architecture %#x is unsupported" % cpu)
+        return {("darwin", names[cpu])}
+
+    if header[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf") and len(header) >= 8:
+        is_64 = header[:4] == b"\xca\xfe\xba\xbf"
+        count = struct.unpack(">I", header[4:8])[0]
+        stride = 32 if is_64 else 20
+        names = {0x01000007: "x86_64", 0x0100000c: "aarch64"}
+        result = set()
+        for index in range(count):
+            offset = 8 + index * stride
+            if offset + 4 > len(header):
+                raise RuntimeError("remote Abra universal Mach-O header is truncated")
+            cpu = struct.unpack(">I", header[offset:offset + 4])[0]
+            if cpu in names:
+                result.add(("darwin", names[cpu]))
+        if result:
+            return result
+    raise RuntimeError("remote Abra must be an ELF or Mach-O executable: %s" % binary)
+
+
+def configure_runtime(driver, local_binary):
+    """Reject a wrong-platform binary before putting any executable in the sandbox."""
+    system = last_line(driver.check(["uname", "-s"])).lower()
+    machine = _machine(last_line(driver.check(["uname", "-m"])))
+    remote = ({"linux": "linux", "darwin": "darwin"}.get(system), machine)
+    if remote[0] is None:
+        raise RuntimeError("sandbox OS %r is unsupported by the uploaded Abra runner" % system)
+    platforms = binary_platforms(local_binary)
+    if remote not in platforms:
+        available = ", ".join("%s/%s" % item for item in sorted(platforms))
+        raise RuntimeError("remote Abra architecture mismatch: sandbox is %s/%s, binary is %s" %
+                           (remote[0], remote[1], available))
+    driver.configure_runtime(local_binary)
+
+
 def sync_tree(driver, remote_dir, mirror):
     """Make mirror match the remote tree, keeping local-only files in .abra."""
     parent = os.path.dirname(mirror)
@@ -112,7 +182,7 @@ def resolve_cdp(driver, cdp, port):
         return cdp
     if not port:
         raise ValueError("browser needs --browser-cdp or --browser-port")
-    return last_line(driver.check(["python3", "-c", CDP_PROBE % int(port)], timeout=30))
+    return last_line(driver.check(["node", "-e", CDP_PROBE % int(port)], timeout=30))
 
 
 def push_adapter(driver, adapter_dir, remote):
@@ -140,13 +210,18 @@ def capture_browser(driver, barrier, adapter_dir, cdp, port, out_dir):
 
 
 def capture(driver, name, remote_workspace, abra, membership="all", browser_cdp=None, browser_port=None,
-            collector=None, adapter_dir=None):
+            collector=None, adapter_dir=None, remote_abra=None):
+    configure_runtime(driver, remote_abra or abra.binary)
     barrier = secrets.token_hex(6)
     mirror = mirror_path(abra.root, name)
     remote = "%s/abra-collector-%s" % (driver.tmp_dir(), barrier)
     try:
-        driver.put(collector or COLLECTOR, remote + "/observer.py", 0o700)
-        argv = ["python3", remote + "/observer.py", "--workspace", remote_workspace] + membership_flags(membership)
+        if collector:
+            driver.put(collector, remote + "/observer.py", 0o700)
+            argv = ["python3", remote + "/observer.py", "--workspace", remote_workspace]
+        else:
+            argv = [driver.runtime(), "observe", "--workspace", remote_workspace]
+        argv += membership_flags(membership)
         summary = json.loads(last_line(driver.check(argv + ["--once", "--barrier", barrier], timeout=180)))
     finally:
         driver.exec(["rm", "-rf", remote])
@@ -239,7 +314,11 @@ def restore_browser(driver, bundle, adapter_dir, cdp, port, receipts_dir):
 
 
 def restore(driver, name, snapshot_id, remote_workspace, abra, browser=None, browser_cdp=None,
-            browser_port=None, start=(), adapter_dir=None, replace_workspace=False):
+            browser_port=None, start=(), adapter_dir=None, replace_workspace=False, remote_abra=None):
+    configure_runtime(driver, remote_abra or abra.binary)
+    plan = abra.call("restore-plan", snapshot_id)
+    if not plan["portable"]["available"]:
+        raise RuntimeError("portable restore is unavailable: %s" % plan["portable"]["error"])
     mirror = mirror_path(abra.root, name)
     os.makedirs(os.path.dirname(mirror), mode=0o700, exist_ok=True)
     if os.path.isfile(os.path.join(mirror, ".abra", "capsule_id")):
@@ -261,5 +340,6 @@ def restore(driver, name, snapshot_id, remote_workspace, abra, browser=None, bro
         browser_result = restore_browser(driver, browser, adapter_dir or ADAPTER_DIR, browser_cdp, browser_port,
                                          os.path.join(os.path.dirname(mirror), "receipts"))
     return {"snapshot_id": snapshot_id, "mirror": mirror, "remote_workspace": remote_workspace,
+            "mode": "portable", "restore_plan": plan,
             "pushed_files": pushed, "candidates": [describe(i, c) for i, c in enumerate(candidates)],
             "started": started, "browser": browser_result}

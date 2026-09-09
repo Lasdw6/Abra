@@ -1,6 +1,7 @@
 import { chmod, copyFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { capture, revoke, stopChrome, withLocalChrome } from './browser.js';
+import { resolveCdpEndpoint } from './cdp.js';
 import { installBundle, processIdentity, registryFile, safeContainedDelete } from './import.js';
 import { dataDir, loadBundle, loadManifest, parseList, readJson, RECEIPT_KIND, saveBundle, signingIdentity, verifyObject, writeJson } from './util.js';
 
@@ -25,7 +26,7 @@ export async function run(argv,io=console){
   const {positionals,flags}=parseArgs(argv), command=positionals[0];
   if(command==='export'){
     const from=need(flags,'from'),out=path.resolve(flags.out||`browser-session-${Date.now()}`),policy={includes:parseList(flags['include-domains']),excludes:parseList(flags['exclude-domains'])};
-    const state=from==='cdp'?await capture(positionals[1]||need(flags,'cdp'),policy,{browserContextId:flags['browser-context-id']}):from==='local'?await withLocalChrome(flags.profile,ws=>capture(ws,policy)):(()=>{throw new Error('--from must be local or cdp');})();
+    const state=from==='cdp'?await capture(await resolveCdpEndpoint(positionals[1]||need(flags,'cdp')),policy,{browserContextId:flags['browser-context-id']}):from==='local'?await withLocalChrome(flags.profile,ws=>capture(ws,policy)):(()=>{throw new Error('--from must be local or cdp');})();
     const manifest=await saveBundle(out,state,{source:from,sourceBrowser:'Google Chrome via CDP',policy:{include_domains:policy.includes,exclude_domains:policy.excludes}});io.log(out);return{out,manifest};
   }
   if(command==='inspect'){const dir=path.resolve(positionals[1]||'.'),manifest=await loadManifest(dir);io.log(summary(manifest));return manifest;}
@@ -33,7 +34,7 @@ export async function run(argv,io=console){
     const dir=path.resolve(positionals[1]||'.'),to=need(flags,'to');
     if(to==='local'&&!flags.detach)throw new Error('--to local requires explicit --detach because Chrome remains running until revoke');
     if(to!=='local'&&to!=='cdp')throw new Error('--to must be local or cdp');
-    const destination=to==='cdp'?{type:'cdp',cdpUrl:positionals[2]||need(flags,'cdp')}:{type:'local'};
+    const destination=to==='cdp'?{type:'cdp',cdpUrl:await resolveCdpEndpoint(positionals[2]||need(flags,'cdp'))}:{type:'local'};
     const {receipt,receiptPath}=await installBundle(dir,destination,{policy:{allows:parseList(flags['allow-domains']),denies:parseList(flags['deny-domains'])},watchMs:Number(flags['watch-ms']||0),trustSender:flags['trust-sender'],requireLocalTrust:true,receiptPath:flags.receipt});
     io.log(receiptPath);return receipt;
   }

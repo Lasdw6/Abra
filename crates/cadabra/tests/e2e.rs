@@ -584,6 +584,81 @@ async fn auto_confirm_pairing_persists_both_trust_stores() {
 }
 
 #[tokio::test]
+async fn removed_peer_is_rejected_until_fresh_pairing() {
+    let network = LoopbackNetwork::default();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a = Arc::new(Daemon::loopback(a_root.path(), &network, true).unwrap());
+    let b = Arc::new(Daemon::loopback(b_root.path(), &network, true).unwrap());
+    let a_id = a.peer_id().await;
+    let b_id = b.peer_id().await;
+    let a_run = a.start().await.unwrap();
+    let b_run = b.start().await.unwrap();
+    let workspace = a_root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let capsule = a
+        .handle(json!({"op":"capsule-create","path":workspace}))
+        .await
+        .unwrap()["capsule_id"]
+        .clone();
+
+    let ticket = b.handle(json!({"op":"pair-ticket"})).await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handle(json!({"op":"pair-add","ticket":ticket}))
+        .await
+        .unwrap();
+    assert_eq!(
+        a.handle(json!({"op":"pair-remove","id":b_id}))
+            .await
+            .unwrap(),
+        json!({"peer_id":b_id,"removed":true})
+    );
+    assert!(a
+        .handle(json!({
+            "op":"send",
+            "peer":b_id,
+            "link":"https://example.test/removed"
+        }))
+        .await
+        .is_err());
+    let control_error = a
+        .handle(json!({
+            "op":"control",
+            "peer":b_id,
+            "capsule":capsule,
+            "control_op":"instruct",
+            "text":"must be rejected"
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        control_error.to_string(),
+        "unknown or untrusted control recipient"
+    );
+
+    let fresh = b.handle(json!({"op":"pair-ticket"})).await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handle(json!({"op":"pair-add","ticket":fresh}))
+        .await
+        .unwrap();
+    assert!(abra_net::TrustStore::open(a_root.path())
+        .unwrap()
+        .get(&b_id)
+        .is_some());
+    assert!(abra_net::TrustStore::open(b_root.path())
+        .unwrap()
+        .get(&a_id)
+        .is_some());
+
+    b_run.shutdown().await;
+    a_run.shutdown().await;
+}
+
+#[tokio::test]
 async fn control_inbox_reads_partial_committed_by_inbound_session() {
     let network = LoopbackNetwork::default();
     let a_root = tempfile::tempdir().unwrap();
@@ -996,7 +1071,7 @@ async fn guest_lease_take_uses_the_local_enrollment_scope() {
                 "op":"enroll-mint",
                 "capsules":["*"],
                 "kinds":["*"],
-                "ttl_ms":60_000,
+                "ttl_ms":3_600_000,
                 "send":true,
                 "receive":true,
                 "lease_takeover":takeover

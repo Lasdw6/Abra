@@ -64,5 +64,6 @@ class DaytonaDriver(Driver):
         return None
 
     def close(self):
+        super().close()
         if self.delete_on_close:
             self.client.delete(self.sandbox, timeout=120, wait=True)

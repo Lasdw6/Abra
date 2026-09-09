@@ -10,7 +10,7 @@ rust-version.workspace = true
 [features]
 default = ["iroh", "tcp"]
 iroh = ["dep:iroh"]
-tcp = []
+tcp = ["tokio/net"]
 
 [dependencies]
 abra-core.workspace = true
@@ -21,7 +21,7 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-fs2 = "0.4"
+fs2.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true

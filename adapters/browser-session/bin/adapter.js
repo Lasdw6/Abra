@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runAdapter } from '../../lib/adapter.js';
 import { capture, captureTarget, withLocalChrome } from '../lib/browser.js';
+import { browserWebSocketFromUrl } from '../lib/cdp.js';
 import { installBundle } from '../lib/import.js';
 import { KIND, LEGACY_KIND, filterState, loadBundle, parseList, saveBundle, secureTree, writePrivate } from '../lib/util.js';
 
@@ -15,7 +16,7 @@ await runAdapter({
 });
 
 async function exportRequest(r) {
-  const options = requestOptions(r), source = parseSource(r.source, options);
+  const options = requestOptions(r), source = await parseSource(r.source, options);
   if (source.type === 'bundle') return exported(await copyBundle(source.path, r.staging_dir), r.staging_dir);
   const policy = { includes: parseList(options.include_domains), excludes: parseList(options.exclude_domains) };
   let state = source.type === 'local'
@@ -45,7 +46,7 @@ async function importRequest(r) {
   const bundle = r.materialized_files;
   if (!bundle) throw coded('invalid_request', 'materialized_files is required');
   const options = requestOptions(r);
-  const destination = parseDestination(r.destination);
+  const destination = await parseDestination(r.destination);
   const bundleDir = path.resolve(bundle);
   await secureTree(bundleDir);
   const { receipt, receiptPath } = await installBundle(bundleDir, destination, {
@@ -71,35 +72,43 @@ function selectedCookieKeys(value) {
   } catch { throw coded('invalid_request', 'selected_cookie_keys must be a base64url JSON string array'); }
 }
 
-function parseSource(source, options) {
+async function parseSource(source, options) {
   if (typeof source === 'string') {
     if (source.startsWith('local:') && (source.slice(6) || options.profile)) return { type: 'local', profile: source.slice(6) || options.profile };
-    if (source.startsWith('cdp:') && /^wss?:\/\//.test(source.slice(4))) return { type: 'cdp', cdp_url: source.slice(4), browser_context_id: options.browser_context_id };
+    if (source.startsWith('cdp:') && isCdpEndpoint(source.slice(4))) return { type: 'cdp', cdp_url: await resolveCdpUrl(source.slice(4)), browser_context_id: options.browser_context_id };
     if (/^wss?:\/\//.test(source)) return { type: 'cdp', cdp_url: source, browser_context_id: options.browser_context_id };
     if (source.startsWith('bundle:') && source.slice(7)) return { type: 'bundle', path: path.resolve(source.slice(7)) };
-    throw coded('invalid_request', 'source must be local:<profile>, cdp:<ws-url>, bundle:<dir>, or a ws(s) URL');
+    throw coded('invalid_request', 'source must be local:<profile>, cdp:<ws-or-http-url>, bundle:<dir>, or a ws(s) URL');
   }
   if (!source || typeof source !== 'object' || Array.isArray(source)) throw coded('invalid_request', 'source must be a string or object');
   if (source.type === 'bundle' && typeof source.path === 'string' && source.path) return { type: 'bundle', path: path.resolve(source.path) };
   if (source.type === 'local' && (source.profile || options.profile)) return { type: 'local', profile: source.profile || options.profile };
-  if (source.type === 'cdp' && typeof source.cdp_url === 'string' && /^wss?:\/\//.test(source.cdp_url)) {
+  if (source.type === 'cdp' && typeof source.cdp_url === 'string' && isCdpEndpoint(source.cdp_url)) {
     if (source.target_id !== undefined && (typeof source.target_id !== 'string' || !source.target_id || typeof source.expected_url !== 'string')) throw coded('invalid_request', 'selected CDP source requires target_id and expected_url');
-    return { ...source, browser_context_id: source.browser_context_id || options.browser_context_id };
+    return { ...source, cdp_url: await resolveCdpUrl(source.cdp_url), browser_context_id: source.browser_context_id || options.browser_context_id };
   }
   throw coded('invalid_request', 'invalid browser-session source object');
 }
 
-function parseDestination(destination) {
+async function parseDestination(destination) {
   if (typeof destination === 'string') {
     if (destination === 'local') return { type: 'local' };
-    if (destination.startsWith('cdp:') && /^wss?:\/\//.test(destination.slice(4))) return { type: 'cdp', cdpUrl: destination.slice(4) };
+    if (destination.startsWith('cdp:') && isCdpEndpoint(destination.slice(4))) return { type: 'cdp', cdpUrl: await resolveCdpUrl(destination.slice(4)) };
     if (/^wss?:\/\//.test(destination)) return { type: 'cdp', cdpUrl: destination };
   }
   if (destination && typeof destination === 'object' && !Array.isArray(destination)) {
     if (destination.type === 'local') return { type: 'local' };
-    if (destination.type === 'cdp' && typeof destination.cdp_url === 'string' && /^wss?:\/\//.test(destination.cdp_url)) return { type: 'cdp', cdpUrl: destination.cdp_url };
+    if (destination.type === 'cdp' && typeof destination.cdp_url === 'string' && isCdpEndpoint(destination.cdp_url)) return { type: 'cdp', cdpUrl: await resolveCdpUrl(destination.cdp_url) };
   }
-  throw coded('invalid_request', 'browser-session import requires --destination local or --destination cdp:<ws-url>');
+  throw coded('invalid_request', 'browser-session import requires --destination local or --destination cdp:<ws-or-http-url>');
+}
+
+function isCdpEndpoint(value) {
+  return /^wss?:\/\//.test(value) || /^https?:\/\//.test(value);
+}
+
+async function resolveCdpUrl(value) {
+  return /^https?:\/\//.test(value) ? browserWebSocketFromUrl(value) : value;
 }
 
 function parseWatchMs(value) {

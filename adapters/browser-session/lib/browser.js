@@ -1,4 +1,4 @@
-import { cp, lstat, mkdtemp, mkdir, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { crc32, deflateSync } from 'node:zlib';
@@ -6,12 +6,24 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, evalValue, waitForLoad } from './cdp.js';
-import { chromeBinary, exists, managedBrowserStatus, stopChrome } from './managed.js';
+import { chromeBinary, desktopEnvironment, exists, managedBrowserStatus, stopChrome } from './managed.js';
 import { filterState } from './util.js';
+import { normalBrowserRequest } from './normal-browser.js';
+import { readSavedCookies } from './saved-cookies.js';
 
 export { stopChrome } from './managed.js';
 
 const execFileAsync = promisify(execFile);
+function displayLabel(value) {
+  const normalized = String(value || '').replace(/\p{Cc}/gu, ' ').trim() || 'Untitled tab';
+  let text = '', bytes = 0;
+  for (const char of normalized) {
+    const length = Buffer.byteLength(char);
+    if (bytes + length > 200) break;
+    text += char; bytes += length;
+  }
+  return text;
+}
 const REMOVE_OPTIONS = { recursive: true, force: true, maxRetries: 10, retryDelay: 200 };
 const PROFILE_STATE_ENTRIES = [
   'Cookies', 'Cookies-journal', 'Cookies-wal',
@@ -19,12 +31,12 @@ const PROFILE_STATE_ENTRIES = [
   'Local Storage', 'Session Storage', 'IndexedDB', 'WebStorage', 'Storage',
   'Network'
 ];
-const CHROME_TABS_SCRIPT = `
+export const CHROME_TABS_SCRIPT = `
 const chrome = Application('Google Chrome');
 if (!chrome.running()) JSON.stringify([]);
 else JSON.stringify(chrome.windows().flatMap((window, windowIndex) =>
-  window.tabs().map((tab, tabIndex) => ({
-    id: String(window.id()) + ':' + String(tabIndex + 1),
+  window.mode() !== "normal" ? [] : window.tabs().map((tab, tabIndex) => ({
+    id: String(tab.id()),
     windowId: String(window.id()),
     windowIndex: windowIndex + 1,
     tabIndex: tabIndex + 1,
@@ -67,7 +79,7 @@ const IDB_CAPTURE_SCRIPT = `(() => new Promise(async resolve => {
   resolve(out);
 }))()`;
 
-function cookieForCdp(cookie) {
+export function cookieForCdp(cookie) {
   const allowed = ['name','value','url','domain','path','secure','httpOnly','sameSite','expires','priority','sameParty','sourceScheme','sourcePort','partitionKey'];
   return Object.fromEntries(allowed.filter(k => cookie[k] !== undefined).map(k => [k, cookie[k]]));
 }
@@ -141,11 +153,17 @@ export async function captureAllContexts(wsUrl, policy = {}) {
 export async function captureTarget(wsUrl, targetId, expectedUrl, options = {}) {
   const expected = new URL(expectedUrl);
   if (!['http:', 'https:'].includes(expected.protocol)) throw new Error('selected target must use HTTP or HTTPS');
-  const cdp = await new CDP(wsUrl).connect();
+  const ownsConnection = !options.connection;
+  const cdp = options.connection || await new CDP(wsUrl).connect();
   let session;
   try {
-    const { targetInfo } = await cdp.send('Target.getTargetInfo', { targetId: String(targetId || '') });
-    if (targetInfo.type !== 'page' || new URL(targetInfo.url).href !== expected.href) throw new Error('selected target changed before capture');
+    let targetInfo;
+    try {
+      ({ targetInfo } = await cdp.send('Target.getTargetInfo', { targetId: String(targetId || '') }));
+    } catch {
+      throw Object.assign(new Error('selected target is closed'), { code: 'not_found' });
+    }
+    if (targetInfo.type !== 'page' || new URL(targetInfo.url).href !== expected.href) throw Object.assign(new Error('selected target changed before capture'), { code: 'not_found' });
     session = await attachPage(cdp, targetInfo.targetId);
     await waitForLoad(cdp, session);
     const tab = {
@@ -166,11 +184,11 @@ export async function captureTarget(wsUrl, targetId, expectedUrl, options = {}) 
       origins.push({ ...basic, indexedDB });
     }
     const finalUrl = await evalValue(cdp, session, 'location.href');
-    if (tab.url !== expected.href || finalUrl !== expected.href) throw new Error('selected target navigated during capture');
+    if (tab.url !== expected.href || finalUrl !== expected.href) throw Object.assign(new Error('selected target navigated during capture'), { code: 'not_found' });
     return { cookies: cookies.map(cookie => options.metadataOnly ? { ...cookie, value: '' } : cookie), origins, tabs: [tab] };
   } finally {
     if (session) await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {});
-    cdp.close();
+    if (ownsConnection) cdp.close();
   }
 }
 
@@ -183,11 +201,11 @@ function storageRestoreScript(originState) {
   return `(() => { const local=${JSON.stringify(originState.localStorage || [])}; const session=${JSON.stringify(originState.sessionStorage || [])}; localStorage.clear(); sessionStorage.clear(); for(const x of local)localStorage.setItem(x.name,x.value); for(const x of session)sessionStorage.setItem(x.name,x.value); return true })()`;
 }
 
-function idbRestoreScript(indexedDBState) {
+export function idbRestoreScript(indexedDBState) {
   return `(() => new Promise(async (resolve,reject) => { try { for(const d of ${JSON.stringify(indexedDBState?.databases || [])}) { const create=db=>{for(const s of d.stores)if(!db.objectStoreNames.contains(s.name))db.createObjectStore(s.name,{keyPath:s.keyPath??null,autoIncrement:!!s.autoIncrement})};const open=version=>new Promise((ok,bad)=>{const r=version===undefined?indexedDB.open(d.name):indexedDB.open(d.name,version);r.onupgradeneeded=()=>create(r.result);r.onsuccess=()=>ok(r.result);r.onerror=()=>bad(r.error)});let db;try{db=await open(d.version||1)}catch(e){if(e?.name!=='VersionError')throw e;db=await open(undefined)}if(d.stores.some(s=>!db.objectStoreNames.contains(s.name))){const next=db.version+1;db.close();db=await open(next)}try{for(const s of d.stores){if(!db.objectStoreNames.contains(s.name))continue;const tx=db.transaction(s.name,'readwrite'),store=tx.objectStore(s.name);for(const row of s.records||[]){if(store.keyPath==null)store.put(row.value,row.key);else store.put(row.value)}await new Promise((a,b)=>{tx.oncomplete=a;tx.onerror=()=>b(tx.error)})}}finally{db.close()} } resolve(true) } catch(e){reject(e)} }))()`;
 }
 
-async function openBlankOrigin(cdp, sessionId, origin) {
+export async function openBlankOrigin(cdp, sessionId, origin) {
   const body = Buffer.from('<!doctype html><title>Abra import</title>').toString('base64');
   let resolvePaused, rejectPaused;
   const paused = new Promise((resolve, reject) => { resolvePaused = resolve; rejectPaused = reject; });
@@ -213,7 +231,7 @@ async function openBlankOrigin(cdp, sessionId, origin) {
 }
 
 export async function install(wsUrl, state, policy = {}, options = {}) {
-  const filtered = filterState(state, policy.allows || [], policy.denies || [], { allowNonPortable: policy.allowNonPortable === true });
+  const filtered = filterState(state, policy.allows || [], policy.denies || []);
   const cdp = await new CDP(wsUrl).connect();
   const browserContextId = (await cdp.send('Target.createBrowserContext', { disposeOnDetach: false })).browserContextId;
   try {
@@ -250,15 +268,7 @@ export async function install(wsUrl, state, policy = {}, options = {}) {
         }
       } finally { await cdp.send('Target.detachFromTarget', { sessionId: session }).catch(() => {}); }
     }
-    // Re-apply the filtered cookie set to targets/contexts created during this live import operation.
-    await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
-    const off = cdp.on('Target.attachedToTarget', async params => {
-      if (params.targetInfo?.browserContextId !== browserContextId) return;
-      if (filtered.cookies.length) await cdp.send('Storage.setCookies', { cookies: filtered.cookies.map(cookieForCdp), browserContextId }).catch(() => {});
-    });
     if (options.watchMs) await delay(options.watchMs);
-    off();
-    await cdp.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     return {
       kind: 'dev.abra.browser-session.receipt.v1',
       installed_at: new Date().toISOString(),
@@ -313,15 +323,25 @@ async function httpTabs(tabs) {
   });
 }
 
-async function listChromeTabs() {
+export async function listChromeTabs() {
   if (process.env.ABRA_BROWSER_TABS_JSON) {
     try { return JSON.parse(process.env.ABRA_BROWSER_TABS_JSON); }
     catch { throw new Error('ABRA_BROWSER_TABS_JSON must be a JSON array'); }
   }
   try {
-    const { stdout } = await execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', CHROME_TABS_SCRIPT]);
+    const { stdout } = await execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', CHROME_TABS_SCRIPT], { timeout: 8000, killSignal: 'SIGKILL' });
     return JSON.parse(stdout);
-  } catch { return []; }
+  } catch (error) {
+    throw chromeTabsUnavailable(error);
+  }
+}
+
+export function chromeTabsUnavailable(error) {
+  const stderr = String(error?.stderr || '').trim();
+  const cause = error?.killed || error?.signal === 'SIGKILL'
+    ? 'Chrome tab access timed out, possibly because macOS denied Apple Events access.'
+    : stderr || (error instanceof SyntaxError ? `Chrome returned invalid tab data: ${error.message}` : `Chrome tab access failed${error?.code ? ` (${error.code})` : ''}.`);
+  return Object.assign(new Error(cause), { code: 'unavailable' });
 }
 
 async function resolveProfile(name) {
@@ -350,6 +370,7 @@ async function copyProfileState(source, destination) {
 }
 
 async function withHeadlessProfile(profile, fn) {
+  assertSavedProfileCaptureEnabled();
   const sourceRoot = chromeRoot();
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-profile-'));
   let child;
@@ -440,6 +461,56 @@ export async function captureLocalProfile(source = {}, policy = {}) {
   return filterState(captured, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
 }
 
+export async function captureLocalTab(source, policy = {}) {
+  const profile = await resolveProfile(source.profile);
+  const tab = (await httpTabs(await listChromeTabs())).find(item => String(item.id) === source.tab_id);
+  if (!tab || new URL(tab.url).href !== new URL(source.expected_url).href) {
+    throw Object.assign(new Error('selected Chrome tab is closed or changed'), { code: 'not_found' });
+  }
+  const state = await withHeadlessProfile(profile, wsUrl => captureCopiedTab(wsUrl, tab.url));
+  state.tabs = state.tabs.slice(0, 1);
+  return filterState(state, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+}
+
+async function savedCookieDatabase(profilePath) {
+  for (const candidate of [path.join(profilePath, 'Cookies'), path.join(profilePath, 'Network', 'Cookies')]) {
+    if (!await exists(candidate)) continue;
+    if (path.basename(path.dirname(candidate)) === 'Network') {
+      const parent = await lstat(path.dirname(candidate));
+      if (parent.isSymbolicLink() || !parent.isDirectory()) throw Object.assign(new Error('refusing Chrome Cookies database under a non-regular Network directory'), { code: 'invalid_request' });
+    }
+    const info = await lstat(candidate);
+    if (info.isSymbolicLink() || !info.isFile()) throw Object.assign(new Error('refusing non-regular Chrome Cookies database'), { code: 'invalid_request' });
+    const canonical = await realpath(candidate);
+    const allowed = new Set([path.join(profilePath, 'Cookies'), path.join(profilePath, 'Network', 'Cookies')]);
+    if (!allowed.has(canonical)) throw Object.assign(new Error('selected Chrome Cookies database resolves outside the profile'), { code: 'invalid_request' });
+    return canonical;
+  }
+  throw Object.assign(new Error('Chrome Cookies database does not exist in the selected profile'), { code: 'not_found' });
+}
+
+export async function captureSavedCookieTab(source, policy = {}, dependencies = {}) {
+  if (process.platform !== 'darwin' && !process.env.ABRA_BROWSER_CHROME_ROOT) throw Object.assign(new Error('saved-cookie-tab capture is only supported for macOS Chrome profiles'), { code: 'unsupported' });
+  if (!source.profile || source.profile !== path.basename(source.profile) || ['.', '..'].includes(source.profile)) throw Object.assign(new Error('saved-cookie-tab profile must be a Chrome profile directory name'), { code: 'invalid_request' });
+  const expected = new URL(source.expected_url);
+  if (!['http:', 'https:'].includes(expected.protocol)) throw Object.assign(new Error('saved-cookie-tab expected_url must use HTTP or HTTPS'), { code: 'invalid_request' });
+  const root = dependencies.root || chromeRoot();
+  const [canonicalRoot, canonicalProfile] = await Promise.all([realpath(root), realpath(path.join(root, source.profile))]);
+  if (path.dirname(canonicalProfile) !== canonicalRoot) throw Object.assign(new Error('selected Chrome profile resolves outside the Chrome root'), { code: 'invalid_request' });
+  const isSelected = tab => {
+    try { return String(tab.id) === source.tab_id && new URL(tab.url).href === expected.href; }
+    catch { return false; }
+  };
+  const tabs = dependencies.listTabs ? await dependencies.listTabs() : await listChromeTabs();
+  const selected = (tabs || []).find(isSelected);
+  if (!selected) throw Object.assign(new Error('selected Chrome tab is closed or changed'), { code: 'not_found' });
+  const databasePath = await savedCookieDatabase(canonicalProfile);
+  const cookies = await (dependencies.readCookies || readSavedCookies)({ databasePath, expectedUrl: expected.href, ...(dependencies.keyProvider ? { keyProvider: dependencies.keyProvider } : {}) });
+  const freshTabs = dependencies.listTabs ? await dependencies.listTabs() : await listChromeTabs();
+  if (!(freshTabs || []).some(isSelected)) throw Object.assign(new Error('selected Chrome tab is closed or changed during capture'), { code: 'not_found' });
+  return filterState({ cookies, origins: [], tabs: [{ url: expected.href, title: selected.title || expected.href }] }, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+}
+
 export async function captureManaged(policy = {}) {
   const chrome = await managedBrowserStatus();
   if (!chrome) {
@@ -449,9 +520,56 @@ export async function captureManaged(policy = {}) {
 }
 
 export async function captureFrom(source, policy = {}) {
-  if (source.type === 'managed' || (source.type === 'local' && !await hasDesktopChromeRoot())) return captureManaged(policy);
+  if (source.type === 'normal') {
+    const state = await normalBrowserRequest('export', { source });
+    return filterState(state, policy.includes || [], policy.excludes || [], { allowNonPortable: true });
+  }
+  if (source.type === 'managed') return captureManaged(policy);
+  if (source.type === 'local' && !await hasDesktopChromeRoot()) {
+    if (!(await desktopEnvironment()).available) return captureManaged(policy);
+    throw Object.assign(new Error('Select a tab from live inventory to export from your normal Chrome. No separate browser was opened.'), { code: 'unavailable' });
+  }
   if (source.type === 'local') return captureLocalProfile(source, policy);
+  if (source.type === 'local-tab') return captureLocalTab(source, policy);
+  if (source.type === 'saved-cookie-tab') throw Object.assign(new Error('Saved-cookie capture is disabled after a second reported source sign-out. No cookies were read.'), { code: 'unavailable' });
   throw new Error('unsupported browser-session source');
+}
+
+export async function browserInventory() {
+  const items = [];
+  const desktopChrome = await hasDesktopChromeRoot();
+  let normalReported = false;
+  try {
+    const report = await normalBrowserRequest('inventory', {}, { timeoutMs: 1500 });
+    for (const item of (report?.items || []).slice(0, 256)) items.push(item);
+    normalReported = true;
+  } catch (error) {
+    if (!['unavailable', 'timeout', 'setup_required'].includes(error.code)) throw error;
+  }
+  if (!normalReported && desktopChrome) {
+    const profile = await resolveProfile();
+    for (const tab of (await httpTabs(await listChromeTabs())).slice(0, 256)) {
+      const url = new URL(tab.url).href;
+      items.push({ id: `chrome:${tab.id}`, kind: 'dev.abra.browser.session.v1',
+        label: displayLabel(tab.title || url), detail: url.slice(0, 2000),
+        source: { type: 'local-tab', tab_id: String(tab.id), expected_url: url, profile },
+        options: {}, transferable: false });
+    }
+  }
+  const managed = await managedBrowserStatus();
+  if (managed && items.length < 256) {
+    const cdp = await new CDP(managed.wsUrl).connect();
+    try {
+      const pages = httpPageTargets((await cdp.send('Target.getTargets')).targetInfos);
+      for (const tab of pages.slice(0, 256 - items.length)) {
+        items.push({ id: `managed:${tab.targetId}`, kind: 'dev.abra.browser.session.v1',
+          label: displayLabel(tab.title || tab.url), detail: tab.url.slice(0, 2000),
+          source: { type: 'cdp', cdp_url: managed.wsUrl, target_id: tab.targetId, expected_url: new URL(tab.url).href },
+          options: {}, transferable: true });
+      }
+    } finally { cdp.close(); }
+  }
+  return items;
 }
 
 const PREVIEW_MS = 5000;
@@ -628,12 +746,37 @@ async function previewLocalTabs() {
 }
 
 async function previewResolved(source, holder) {
-  if (source.type === 'managed' || (source.type === 'local' && !await hasDesktopChromeRoot())) {
+  if (source.type === 'managed') {
     const chrome = await managedBrowserStatus();
     if (!chrome) throw Object.assign(new Error('no managed browser is running'), { code: 'not_found' });
     return previewCdp(chrome.wsUrl, {}, holder);
   }
+  if (source.type === 'local' && !await hasDesktopChromeRoot()) {
+    if (!(await desktopEnvironment()).available) {
+      const chrome = await managedBrowserStatus();
+      if (!chrome) throw Object.assign(new Error('no managed browser is running'), { code: 'not_found' });
+      return previewCdp(chrome.wsUrl, {}, holder);
+    }
+    throw Object.assign(new Error('Enable Chrome remote debugging and select a live tab to preview your normal browser.'), { code: 'setup_required' });
+  }
   if (source.type === 'local') return previewLocalTabs();
+  if (source.type === 'local-tab') {
+    const tab = (await httpTabs(await listChromeTabs())).find(item => String(item.id) === source.tab_id);
+    if (!tab || new URL(tab.url).href !== new URL(source.expected_url).href) throw Object.assign(new Error('selected Chrome tab is closed or changed'), { code: 'not_found' });
+    return { media_type: 'image/png', data: PLACEHOLDER_PNG.toString('base64'), width: PLACEHOLDER_WIDTH,
+      height: PLACEHOLDER_HEIGHT, title: tab.title || tab.url,
+      items: [{ label: tab.title || tab.url, detail: tab.url, active: true }] };
+  }
+  if (source.type === 'saved-cookie-tab') {
+    const tab = (await httpTabs(await listChromeTabs())).find(item => String(item.id) === source.tab_id);
+    if (!tab || new URL(tab.url).href !== new URL(source.expected_url).href) throw Object.assign(new Error('selected Chrome tab is closed or changed'), { code: 'not_found' });
+    return { media_type: 'image/png', data: PLACEHOLDER_PNG.toString('base64'), width: PLACEHOLDER_WIDTH,
+      height: PLACEHOLDER_HEIGHT, title: tab.title || tab.url,
+      items: [{ label: tab.title || tab.url, detail: tab.url, active: true }] };
+  }
+  if (source.type === 'normal') {
+    throw Object.assign(new Error('Preview is not available for a selected normal Chrome tab. Its live inventory metadata is still available.'), { code: 'unavailable' });
+  }
   if (source.type === 'cdp') {
     return previewCdp(source.cdp_url, { browserContextId: source.browser_context_id, targetId: source.target_id }, holder);
   }
@@ -670,7 +813,7 @@ export async function previewFrom(source, options = {}) {
 // impossible (real macOS Chrome with no debug port) or when it fails.
 export async function captureExportThumbnail(source) {
   try {
-    if (source.type === 'local' && await hasDesktopChromeRoot()) return null;
+    if (source.type === 'normal' || source.type === 'local-tab' || source.type === 'saved-cookie-tab' || (source.type === 'local' && await hasDesktopChromeRoot())) return null;
     const wsUrl = source.type === 'cdp' ? source.cdp_url : (await managedBrowserStatus())?.wsUrl;
     if (!wsUrl) return null;
     const cdp = await new CDP(wsUrl).connect();
@@ -705,6 +848,7 @@ export async function writeExportThumbnail(source) {
 }
 
 export async function launchLocalChrome(profile, { fresh = false, root } = {}) {
+  if (!fresh) assertSavedProfileCaptureEnabled();
   const sourceRoot = chromeRoot();
   const profileName = profile || 'Default';
   const tempRoot = root || await mkdtemp(path.join(os.tmpdir(), fresh ? 'abra-browser-import-' : 'abra-browser-export-'));
@@ -744,4 +888,8 @@ export async function withLocalChrome(profile, fn) {
 
 export async function stopLocalChrome(local) {
   await stopChrome(local.child.pid, local.tempRoot); await rm(local.tempRoot, REMOVE_OPTIONS);
+}
+
+function assertSavedProfileCaptureEnabled() {
+  throw Object.assign(new Error('Capture from a saved Chrome profile is temporarily disabled while a reported sign-out is investigated. No copied browser was started.'), { code: 'unavailable' });
 }

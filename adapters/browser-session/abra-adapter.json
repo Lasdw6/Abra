@@ -3,26 +3,21 @@
   "name": "dev.abra.browser-session",
   "version": "0.1.0",
   "kinds": ["dev.abra.browser.session.v1", "dev.abra.browser-session.v1"],
-  "verbs": ["export", "import", "preview"],
+  "verbs": ["export", "import", "preview", "inventory"],
   "executable": "bin/adapter.js",
   "presets": {
     "source": [
       {
-        "label": "Your browser",
+        "label": "Browser",
         "value": "local",
-        "description": "Open tabs and their sign-ins from your own Chrome. Where there is no desktop, the Abra browser."
-      },
-      {
-        "label": "Abra browser",
-        "value": "managed",
-        "description": "Sessions already imported into the browser Abra opened on this machine."
+        "description": "Use this device\u2019s browser for its live preview."
       }
     ],
     "destination": [
       {
-        "label": "Abra browser",
+        "label": "Browser",
         "value": "local",
-        "description": "A browser Abra opens or reuses here. Headless where there is no desktop."
+        "description": "Open the transferred tabs on this device. User Chrome gets the URL only; a sandbox browser also receives portable cookies."
       }
     ]
   }

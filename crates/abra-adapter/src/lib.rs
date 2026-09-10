@@ -343,6 +343,26 @@ impl AdapterRegistry {
         export.staging = Some(staging);
         Ok(export)
     }
+    /// Enumerate current transferable items without changing or launching the source.
+    pub async fn inventory(&self, adapter_name: &str) -> Result<InventoryReport> {
+        let adapter = self
+            .by_name
+            .get(adapter_name)
+            .ok_or_else(|| format!("no adapter registered with name {adapter_name}"))?;
+        require_verb(adapter, "inventory")?;
+        let kind = adapter
+            .manifest
+            .kinds
+            .first()
+            .ok_or("adapter manifest has no kinds")?;
+        let value = invoke(
+            adapter,
+            json!({"verb":"inventory","kind":kind,"options":{}}),
+            Some(Duration::from_secs(10)),
+        )
+        .await?;
+        Ok(serde_json::from_value(value)?)
+    }
     pub async fn import(
         &self,
         kind: &str,
@@ -458,6 +478,56 @@ pub struct InspectResult {
     pub warnings: Vec<Value>,
     #[serde(default)]
     pub blocked: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InventoryReport {
+    pub label: String,
+    pub items: Vec<InventoryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryItem {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub source: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Value>,
+    pub transferable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for InventoryReport {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            label: String,
+            items: Vec<InventoryItem>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.items.len() > 256 {
+            return Err(serde::de::Error::custom(
+                "inventory report exceeds 256 items",
+            ));
+        }
+        Ok(Self {
+            label: raw.label,
+            items: raw.items,
+            error: raw.error,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1092,13 +1162,11 @@ mod tests {
         ));
         let (manifest, _) = load_registration(dir).unwrap();
         let presets = manifest.presets.expect("browser-session presets");
-        assert_eq!(presets.source.len(), 2);
+        assert_eq!(presets.source.len(), 1);
         assert_eq!(presets.destination.len(), 1);
-        assert_eq!(presets.source[0].label, "Your browser");
+        assert_eq!(presets.source[0].label, "Browser");
         assert_eq!(presets.source[0].value, json!("local"));
-        assert_eq!(presets.source[1].label, "Abra browser");
-        assert_eq!(presets.source[1].value, json!("managed"));
-        assert_eq!(presets.destination[0].label, "Abra browser");
+        assert_eq!(presets.destination[0].label, "Browser");
         assert_eq!(presets.destination[0].value, json!("local"));
         presets.validate().unwrap();
     }

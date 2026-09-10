@@ -2,13 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import vm from 'node:vm';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, browserWebSocketFromUrl, evalValue, resolveCdpEndpoint, waitForLoad } from '../lib/cdp.js';
-import { capture, captureTarget, install, revoke, stopLocalChrome } from '../lib/browser.js';
+import { browserInventory, capture, captureLocalTab, captureTarget, chromeTabsUnavailable, CHROME_TABS_SCRIPT, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { chromeBinary, ensureManagedBrowser, stopChrome, stopManagedBrowser } from '../lib/managed.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
@@ -115,6 +116,55 @@ test('adapter dispatches string and object export sources over NDJSON', async ()
   assert.equal(objectResponse.error.code, 'internal');
 });
 
+test('inventory reports normal Chrome tabs once using the canonical kind', async () => {
+  const previousTabs = process.env.ABRA_BROWSER_TABS_JSON;
+  await mkdir(path.join(process.env.ABRA_BROWSER_CHROME_ROOT, 'Default'), { recursive: true });
+  process.env.ABRA_BROWSER_TABS_JSON = JSON.stringify([{ id: '91', title: 'Alpha', url: 'https://example.com/a' }, { id: '92', title: 'Beta', url: 'https://example.org/b' }]);
+  try {
+    const items = await browserInventory();
+    assert.deepEqual(items.map(item => item.id), ['chrome:91', 'chrome:92']);
+    assert.deepEqual(new Set(items.map(item => item.kind)), new Set(['dev.abra.browser.session.v1']));
+    assert.deepEqual(items[0].source, { type: 'local-tab', tab_id: '91', expected_url: 'https://example.com/a', profile: 'Default' });
+    assert.ok(items.every(item => item.transferable === false));
+  } finally {
+    if (previousTabs === undefined) delete process.env.ABRA_BROWSER_TABS_JSON; else process.env.ABRA_BROWSER_TABS_JSON = previousTabs;
+    await rm(process.env.ABRA_BROWSER_CHROME_ROOT, { recursive: true, force: true });
+  }
+});
+
+test('macOS Chrome inventory script excludes private windows', () => {
+  const tab = (id, title) => ({ id: () => id, title: () => title, url: () => `https://${title}.example/` });
+  const window = (mode, id, tabs) => ({ mode: () => mode, id: () => id, tabs: () => tabs, activeTabIndex: () => 1 });
+  const windows = [window('normal', 1, [tab(11, 'normal')]), window('incognito', 2, [tab(22, 'private')])];
+  const output = vm.runInNewContext(CHROME_TABS_SCRIPT, { Application: () => ({ running: () => true, windows: () => windows }), JSON });
+  const listed = JSON.parse(output);
+  assert.deepEqual(listed.map(item => item.id), ['11']);
+  assert.doesNotMatch(output, /private/);
+});
+
+test('macOS Chrome inventory reports AppleScript permission and timeout failures', () => {
+  const denied = chromeTabsUnavailable({ stderr: 'Not authorized to send Apple events. (-1743)', code: 1 });
+  assert.equal(denied.code, 'unavailable');
+  assert.match(denied.message, /Not authorized.*-1743/);
+  const timedOut = chromeTabsUnavailable({ killed: true, signal: 'SIGKILL' });
+  assert.equal(timedOut.code, 'unavailable');
+  assert.match(timedOut.message, /timed out.*Apple Events/i);
+});
+
+test('selected normal Chrome export fails when the tab closed or changed', async () => {
+  const previousTabs = process.env.ABRA_BROWSER_TABS_JSON;
+  await mkdir(path.join(process.env.ABRA_BROWSER_CHROME_ROOT, 'Default'), { recursive: true });
+  process.env.ABRA_BROWSER_TABS_JSON = JSON.stringify([{ id: '91', title: 'Moved', url: 'https://example.com/new' }]);
+  try {
+    await assert.rejects(captureLocalTab({ tab_id: '91', expected_url: 'https://example.com/old', profile: 'Default' }), error => error.code === 'not_found');
+    await assert.rejects(captureLocalTab({ tab_id: 'closed', expected_url: 'https://example.com/old', profile: 'Default' }), error => error.code === 'not_found');
+    await assert.rejects(captureLocalTab({ tab_id: '91', expected_url: 'https://example.com/new', profile: 'Default' }), error => error.code === 'unavailable' && /temporarily disabled/.test(error.message));
+  } finally {
+    if (previousTabs === undefined) delete process.env.ABRA_BROWSER_TABS_JSON; else process.env.ABRA_BROWSER_TABS_JSON = previousTabs;
+    await rm(process.env.ABRA_BROWSER_CHROME_ROOT, { recursive: true, force: true });
+  }
+});
+
 test('failed import cleanup reports a retained profile containing sender cookies', async () => {
   const profile = path.join(process.env.ABRA_BROWSER_DATA_DIR, 'profiles', 'leftover-profile');
   let stopped = false;
@@ -207,7 +257,7 @@ test('adapter rejects invalid source and destination forms', async () => {
   for (const [index, destination] of ['/tmp/materialized', 'cdp:ftp://127.0.0.1', { cdp_url: 'ws://127.0.0.1:1' }, { type: 'cdp', cdp_url: 'ftp://127.0.0.1' }].entries()) {
     const response = await adapterRequest({ ...importBase, request_id: `d${index}`, destination });
     assert.equal(response.error.code, 'invalid_request');
-    assert.match(response.error.message, /requires --destination local, managed, or cdp/);
+    assert.match(response.error.message, /requires --destination local, normal, managed, or cdp/);
   }
   const missing = await adapterRequest({ ...exportBase, request_id: 'c9', source: 'managed' });
   assert.equal(missing.error.code, 'not_found');
@@ -331,8 +381,14 @@ test('CDP export/import, receiver deny, inspect secrecy, and revoke', { timeout:
     options: { exclude_domains: 'localhost' } });
   assert.equal(selectedExport.ok, true);
   assert.deepEqual((await loadBundle(selectedDir)).state, { cookies: [], origins: [], tabs: [] });
-
   const state = await capture(a.ws);
+  const closer = await new CDP(a.ws).connect();
+  await closer.send('Target.closeTarget', { targetId: pa.targetId });
+  closer.close();
+  const staleExport = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'e2', verb: 'export', kind: 'dev.abra.browser.session.v1',
+    source: { type: 'cdp', cdp_url: a.ws, target_id: pa.targetId, expected_url: originA }, staging_dir: await mkdtemp(path.join(os.tmpdir(), 'abra-stale-export-')), options: {} });
+  assert.equal(staleExport.error.code, 'not_found');
+
   const dir = await mkdtemp(path.join(os.tmpdir(), 'abra-bundle-'));
   const manifest = await saveBundle(dir, state, { sourceBrowser: 'test Chrome' });
   assert.equal(manifest.domains.find(d => d.domain === 'localhost').cookie_count, 1);
@@ -369,7 +425,7 @@ test('adapter rejects the daemon filesystem destination without changing bundle 
   const destinationPath = path.join(bundle, 'daemon-default-destination');
   const imported = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'b2', verb: 'import', kind: 'dev.abra.browser.session.v1', payload: {}, materialized_files: bundle, destination: destinationPath, options: {} });
   assert.equal(imported.error.code, 'invalid_request');
-  assert.match(imported.error.message, /requires --destination local, managed, or cdp/);
+  assert.match(imported.error.message, /requires --destination local, normal, managed, or cdp/);
   assert.equal((await stat(bundle)).mode & 0o777, 0o755);
   for (const name of ['state.json', 'storage_state.json', 'manifest.json']) assert.equal((await stat(path.join(bundle, name))).mode & 0o777, 0o644);
 });
@@ -585,22 +641,36 @@ test('cdp-fixture seeds Chrome A and the CLI import from a fresh data dir lands 
   assert.deepEqual((await fixture(['get', '--cdp', b.ws, '--url', 'http://other.test/'])).cookies, []);
 });
 
-test('manual cookie override is explicit and still respects domain policy', async () => {
+test('device-bound cookies stay omitted even if a caller asks to override', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'abra-override-'));
   const state = { cookies: [{ name: 'device_bound_session', value: 'fixture', domain: 'example.com', secure: true, httpOnly: true }], origins: [], tabs: [] };
   try {
-    await saveBundle(dir, state, { allowNonPortable: 'true' });
-    assert.equal((await loadBundle(dir)).state.cookies.length, 0);
     const manifest = await saveBundle(dir, state, { allowNonPortable: true });
-    assert.equal((await loadBundle(dir)).state.cookies.length, 1);
-    assert.ok(!manifest.non_teleportable.some(item => item.action === 'omitted'));
-    assert.equal(filterState(state, [], [], { allowNonPortable: true }).cookies.length, 1);
+    assert.equal((await loadBundle(dir)).state.cookies.length, 0);
+    assert.equal(manifest.non_teleportable[0].action, 'omitted');
     assert.equal(filterState(state, [], ['example.com'], { allowNonPortable: true }).cookies.length, 0);
-    assert.equal(filterState(state, [], [], { allowNonPortable: 'true' }).cookies.length, 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test('managed browser import reuses one Chrome and recapture sees the session', { timeout: 60000 }, async t => {
+test('a user Chrome root makes local import ask for the normal-browser connection instead of launching isolated Chrome', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-user-dest-'));
+  await mkdir(path.join(root, 'Default'), { recursive: true });
+  const bundle = path.join(root, 'bundle');
+  await saveBundle(bundle, {
+    cookies: [{ name: 'user_session', value: 'gh', domain: 'github.com', path: '/' }],
+    origins: [{ origin: 'https://github.com', localStorage: [{ name: 'k', value: 'v' }] }],
+    tabs: [{ url: 'https://github.com/Lasdw6/morse', title: 'morse' }]
+  });
+  const response = await adapterRequest({
+    protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'import',
+    request_id: 'ae', payload: {}, materialized_files: bundle, destination: 'local', options: {}
+  }, { ...process.env, ABRA_BROWSER_CHROME_ROOT: root });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, 'setup_required');
+  assert.match(response.error.message, /native-browser-host --connect/);
+});
+
+test('local and omitted imports reuse isolated Chrome and inventory includes it beside desktop tabs', { timeout: 60000 }, async t => {
   if (skipChromeTest(t)) return;
   let started;
   try { started = await ensureManagedBrowser({ headless: true }); }
@@ -619,9 +689,10 @@ test('managed browser import reuses one Chrome and recapture sees the session', 
   const first = await adapterRequest({ ...importBase, request_id: '11', destination: 'local' });
   assert.equal(first.ok, true, JSON.stringify(first));
   assert.equal(first.result.receipt.managed, true);
+  assert.equal(first.result.receipt.auth_applied, true);
   const reused = await ensureManagedBrowser({ headless: true });
   assert.equal(reused.pid, started.pid);
-  const second = await adapterRequest({ ...importBase, request_id: '12', destination: { type: 'local' } });
+  const second = await adapterRequest({ ...importBase, request_id: '12' });
   assert.equal(second.ok, true, JSON.stringify(second));
   assert.equal((await ensureManagedBrowser({ headless: true })).pid, started.pid);
   const staging = await mkdtemp(path.join(os.tmpdir(), 'abra-managed-export-'));
@@ -633,6 +704,17 @@ test('managed browser import reuses one Chrome and recapture sees the session', 
   const state = (await loadBundle(staging)).state;
   assert.equal(state.cookies.some(cookie => cookie.name === 'sid' && cookie.value === 'alpha' && cookie.domain === '127.0.0.1'), true);
   assert.equal(state.tabs.some(tab => tab.url.startsWith(origin)), true);
+  const previousTabs = process.env.ABRA_BROWSER_TABS_JSON;
+  await mkdir(path.join(process.env.ABRA_BROWSER_CHROME_ROOT, 'Default'), { recursive: true });
+  process.env.ABRA_BROWSER_TABS_JSON = JSON.stringify([{ id: 'desktop-1', title: 'Desktop', url: 'https://example.com/desktop' }]);
+  try {
+    const items = await browserInventory();
+    assert.equal(items.some(item => item.id === 'chrome:desktop-1'), true);
+    assert.equal(items.some(item => item.id.startsWith('managed:') && item.detail.startsWith(origin)), true);
+  } finally {
+    if (previousTabs === undefined) delete process.env.ABRA_BROWSER_TABS_JSON; else process.env.ABRA_BROWSER_TABS_JSON = previousTabs;
+    await rm(process.env.ABRA_BROWSER_CHROME_ROOT, { recursive: true, force: true });
+  }
 });
 
 test('adapter preview of a managed browser returns a jpeg and tab items', { timeout: 60000 }, async t => {
@@ -699,7 +781,7 @@ test('adapter export from a cdp source includes a png thumbnail', { timeout: 600
   assert.ok(bytes.length <= 512 * 1024);
 });
 
-test('local macOS profile export captures cookies, storage, and open tabs', { timeout: 60000 }, async t => {
+test('legacy local profile export stays disabled even with a valid saved session', { timeout: 60000 }, async t => {
   if (process.platform !== 'darwin') { t.skip('local Chrome profile capture is macOS-only'); return; }
   if (skipChromeTest(t)) return;
   let binary;
@@ -739,11 +821,7 @@ test('local macOS profile export captures cookies, storage, and open tabs', { ti
     protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'export',
     request_id: '21', source: 'local', staging_dir: staging, options: {}
   }, { ...process.env, ABRA_BROWSER_CHROME_ROOT: root, ABRA_BROWSER_TABS_JSON: JSON.stringify([tab]) });
-  assert.equal(exported.ok, true, JSON.stringify(exported));
-  const state = (await loadBundle(staging)).state;
-  assert.equal(state.cookies.some(cookie => cookie.name === 'server_cookie' && cookie.value === 'beta'), true);
-  const originState = state.origins.find(item => item.origin === origin);
-  assert.ok(originState);
-  assert.equal(originState.localStorage.some(item => item.name === 'local-secret' && item.value === '127.0.0.1-local'), true);
-  assert.equal(state.tabs.some(item => item.url === tab.url && item.title === tab.title), true);
+  assert.equal(exported.error.code, 'unavailable');
+  assert.match(exported.error.message, /temporarily disabled/);
+  await assert.rejects(stat(path.join(staging, 'state.json')));
 });

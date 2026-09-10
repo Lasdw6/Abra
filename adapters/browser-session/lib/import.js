@@ -6,6 +6,8 @@ import path from 'node:path';
 import { install } from './browser.js';
 import { ensureManagedBrowser, stopChrome } from './managed.js';
 import { dataDir, loadBundle, signObject, signingIdentity, writeJson } from './util.js';
+import { applyTransferPolicy } from './transfer-policy.js';
+import { normalBrowserRequest } from './normal-browser.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -52,14 +54,32 @@ export async function installBundle(bundleDir, destination, options = {}) {
     }
   }
 
+  if (manifest.source === 'saved-cookie-db-read-only') {
+    throw Object.assign(new Error('Restoring saved-cookie captures is disabled after a reported source sign-out.'), { code: 'unavailable' });
+  }
+
   const installId = randomUUID();
+  const filtered = applyTransferPolicy(state, destination, options.policy || {});
+  const authApplied = Boolean(filtered.cookies.length || filtered.origins.length);
+  if (destination.type === 'normal') {
+    const receipt = await normalBrowserRequest('import', { state: filtered });
+    receipt.install_id = installId;
+    receipt.source_bundle_sha256 = manifest.state_sha256;
+    receipt.reexportable = false;
+    receipt.auth_applied = authApplied;
+    receipt.signature = signObject(receipt, await signingIdentity(), 'browser-session-install-receipt');
+    const output = options.receiptPath ? path.resolve(options.receiptPath) : receiptFile(installId);
+    await writeJson(output, receipt);
+    return { receipt, receiptPath: output };
+  }
   const managed = destination.type !== 'cdp';
   const wsUrl = managed ? (await ensureManagedBrowser()).wsUrl : destination.cdpUrl;
 
-  const receipt = await install(wsUrl, state, options.policy || {}, { watchMs: options.watchMs || 0 });
+  const receipt = await install(wsUrl, filtered, { allows: options.policy?.allows, denies: options.policy?.denies }, { watchMs: options.watchMs || 0 });
   receipt.install_id = installId;
   receipt.source_bundle_sha256 = manifest.state_sha256;
   receipt.reexportable = false;
+  receipt.auth_applied = authApplied;
   if (managed) receipt.managed = true;
   await writeJson(registryFile(installId), {
     cdp_url: wsUrl,

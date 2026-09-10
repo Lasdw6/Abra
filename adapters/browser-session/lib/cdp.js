@@ -1,26 +1,33 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 export class CDP {
-  constructor(url) { this.url = url; this.id = 0; this.pending = new Map(); this.listeners = new Map(); }
+  constructor(url, { commandTimeout = 10000 } = {}) { this.url = url; this.id = 0; this.pending = new Map(); this.listeners = new Map(); this.commandTimeout = commandTimeout; }
   async connect() {
     this.ws = new WebSocket(this.url);
     await new Promise((resolve, reject) => { this.ws.onopen = resolve; this.ws.onerror = () => reject(new Error('cannot connect to CDP destination')); });
     this.ws.onmessage = event => {
       const msg = JSON.parse(String(event.data));
       if (msg.id) {
-        const pending = this.pending.get(msg.id); this.pending.delete(msg.id);
+        const pending = this.pending.get(msg.id); this.pending.delete(msg.id); clearTimeout(pending?.timer);
         if (msg.error) pending?.reject(new Error(msg.error.message || 'CDP command failed')); else pending?.resolve(msg.result);
       } else {
         for (const fn of this.listeners.get(msg.method) || []) fn(msg.params || {}, msg.sessionId);
       }
     };
-    this.ws.onclose = () => { for (const p of this.pending.values()) p.reject(new Error('CDP connection closed')); this.pending.clear(); };
+    this.ws.onclose = () => { for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('CDP connection closed')); } this.pending.clear(); };
     return this;
   }
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeout = this.commandTimeout) {
     const id = ++this.id;
-    this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(Object.assign(new Error(`CDP command timed out: ${method}`), { code: 'timeout', method }));
+      }, timeout);
+      this.pending.set(id, { resolve, reject, timer });
+      try { this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+    });
   }
   on(method, fn) { if (!this.listeners.has(method)) this.listeners.set(method, new Set()); this.listeners.get(method).add(fn); return () => this.listeners.get(method).delete(fn); }
   close() { this.ws?.close(); }

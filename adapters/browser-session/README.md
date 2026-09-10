@@ -3,6 +3,51 @@
 A Node 22 tool for moving isolated browser sessions between CDP browsers. It has
 no dependencies. Inspect and adapter export do not expose credential values.
 
+**Current limitation:** capture by launching a copied personal Chrome profile is disabled
+while a reported sign-out is investigated. Those fallback inventory entries are
+not transferable. The old implementation launched a network-enabled copy of
+account settings and cookies; reading a copy did not prevent server-side effects.
+The offline helper is experimental and is not connected to adapter capture.
+See [the investigation](../../docs/reviews/browser-session-investigation.md).
+
+The `saved-cookie-tab` adapter source and restores of its bundles are now
+blocked after a second reported source logout. The implementation below is
+experimental and is not an available transfer path. It requires `profile` (a Chrome profile directory name), `tab_id`, and
+`expected_url`. The caller must establish which profile owns the tab; AppleScript
+cannot prove that association. This source copies only the Cookies database and
+its journal into a temporary directory, queries that copy, and decrypts eligible
+cookies for the selected URL through macOS Keychain. It does not start Chrome.
+The bundle includes the selected tab URL, but excludes page storage, partitioned
+cookies, and expired cookies. Unknown formats fail. Keychain may require user
+permission; prompt persistence is not yet verified. General inventory capture
+remains disabled until profile association is reliable.
+
+The optional `inventory` verb lists current HTTP(S) tabs from normal Chrome and
+an already-running Abra browser without launching either. Each item carries an
+opaque selector. Export checks the browser session, tab identity, and URL again
+at capture time and returns `not_found` after a close, restart, or navigation.
+The canonical and legacy bundle kind aliases produce one inventory entry.
+Normal Chrome connects through Chrome 144+'s built-in, permission-gated remote
+debugging support. No extension is required. In your running Chrome, open
+`chrome://inspect/#remote-debugging`, enable remote debugging, and allow Abra's
+connection when Chrome asks. Abra never changes this setting or restarts Chrome.
+Run `node bin/native-browser-host.js --connect` once to start the user-only local
+broker and request Chrome's approval. Inventory, export, and import only reuse
+that live connection; they never open or reopen it. After Chrome or the broker
+restarts, run the explicit connect command again. Chrome's approval covers the
+connection, not a permanent grant.
+
+On a machine with the user’s Chrome, omitted and `local` imports open new tabs
+in that profile and never write cookies or site storage. Existing tabs are never
+navigated, reloaded, or closed. The user already has their own sign-in.
+
+On a sandbox, or when `--to managed` / `--destination cdp` is explicit, portable
+cookies are installed into an isolated browser context. Device-bound cookies are
+omitted and cannot be overridden.
+
+Chrome documents this connection method at
+https://developer.chrome.com/docs/devtools/agents/get-started/configuration#connect-to-an-existing-browser-session.
+
 ```sh
 node bin/abra-browser.js export --from cdp 'ws://…' --out ./session
 node bin/abra-browser.js inspect ./session
@@ -31,16 +76,22 @@ It also rejects a parent-domain cookie when it could reach a denied child host.
 
 ## Your browser
 
-`export --from local` on macOS copies open tabs and their cookies and origin
+The disabled legacy `export --from local` path on macOS copied open tabs and their cookies and origin
 storage from your Chrome. It copies profile state into a temporary directory,
 reads it through a headless Chrome, then deletes the copy, including on errors
 and interrupts. `--profile` selects a directory under the Chrome root (`Default`
 if omitted, or the last-used profile from Local State). `local:<profile>` is the
 same choice. Symlinked source profiles are refused.
 
-On Linux, and when Chrome's profile root is missing, `local` is the managed
-browser this tool opens under the data directory. `export --from managed` always
-reads that browser. It errors if none is running.
+The AppleScript fallback cannot identify which Chrome profile owns a window. It
+uses Chrome's last-used profile for the copied-profile capture, so tabs open in
+another profile may capture no session or the wrong account for that site. The
+native Chrome connection reads the selected target directly and should be used
+when more than one normal profile is open.
+
+On Linux, `local` never falls back to a separate profile. Choose a normal Chrome
+tab from live inventory through the native connection. `export --from managed` is an
+explicit headless or sandbox operation and errors if none is running.
 
 `preview --from local|managed|cdp` prints JSON metadata (`media_type`, `width`,
 `height`, `title`, `items`) and writes the image when `--out` is set. A
@@ -53,9 +104,10 @@ the bundle. The adapter process exits after the response; leftover thumbnails
 are left for the OS temp cleaner. A 60s timer deletes the file if the process
 is still running.
 
-`import --to local --detach` installs into the managed browser, creating a fresh
-isolated context. Chrome stays running until you revoke that context. Debugging
-binds to loopback. `--to managed --detach` is the same destination.
+`import --to local` on a user machine opens tabs in the existing Chrome profile
+and does not install cookies. `--to managed --detach` is the sandbox path: an
+isolated Abra-owned profile that does receive portable cookies. `--to normal`
+names the user Chrome path explicitly.
 
 Chrome is found at `CHROME_BIN`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, or `google-chrome` / `google-chrome-stable` / `chromium` / `chromium-browser` on PATH. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
 
@@ -78,9 +130,11 @@ only chosen cookies. A key is base64url JSON of `[domain,path,name,partitionKey]
 
 `bin/adapter.js` implements `abra-adapter/1`. Export puts the real bundle in `files_path`; its `payload` field contains manifest metadata only. Imports mark receipts non-re-exportable and never return a CDP URL.
 
-Import destinations `local`, `managed`, `{type:"local"}`, and an omitted value
-all reuse the managed browser. Use `--destination cdp:<ws-url>` for a CDP
-browser you already started. A filesystem path, including Abra's default
+Import destinations omitted or `local` follow the machine: user Chrome when a
+desktop profile exists, otherwise the isolated sandbox browser. `normal` is
+always the user’s Chrome (tabs only). `managed` is always the isolated browser
+(portable cookies).
+Use `--destination cdp:<ws-url>` for a CDP browser you already started. A filesystem path, including Abra's default
 materialization directory, is rejected. That path never authorizes a browser
 launch.
 
@@ -92,8 +146,8 @@ On Mac A, send the tabs and sign-ins from your own Chrome:
 abra send <peer> --kind dev.abra.browser.session.v1 --source local
 ```
 
-On Mac B, accept them into a browser Abra opens or reuses there. It is headless
-when there is no desktop:
+On Mac B, accept them as new tabs in the existing Chrome. Cookies are not
+written; that machine already has its own sign-in:
 
 ```sh
 abra accept <id> <dir> --destination local
@@ -103,8 +157,8 @@ abra accept <id> <dir> --destination local
 remote debugging. The adapter looks up `/json/version` itself. `cdp:ws://…`
 works when you already have the WebSocket URL.
 
-`--source managed` captures sessions already imported into the Abra browser on
-that machine.
+Live inventory selects one tab from normal Chrome. `--source managed` explicitly
+captures sessions in Abra's sandbox browser on that machine.
 
 A bundle captured elsewhere (for example by the sandbox coordinator, which runs
 `export --from cdp` inside a sandbox with an ephemeral key) is sent as-is with
@@ -129,6 +183,7 @@ ABRA_BROWSER_FACADE_SECRET='a-long-random-secret' node facade/server.js --root .
 
 It rejects cross-origin requests and accepts `bundlePath` only below its private `staging/` directory. Non-loopback bind requires `--allow-network`. Errors are generic.
 
-DBSC is not bypassed. Its report is heuristic and may be wrong. Flagged cookies remain in STATE unless policy removes them.
+Device-bound cookies are omitted from STATE. The report is heuristic and may be
+wrong. There is no override that puts them back.
 
 IndexedDB restore is best effort. Passwords, extensions, Cache Storage, OPFS, client certificates, autofill, browser settings, and full history are not captured.

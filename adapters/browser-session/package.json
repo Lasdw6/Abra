@@ -7,6 +7,7 @@
   "bin": {
     "abra-browser": "./bin/abra-browser.js",
     "abra-browser-adapter": "./bin/adapter.js",
+    "abra-native-browser-host": "./bin/native-browser-host.js",
     "profile-use": "./facade/profile-use.js"
   },
   "scripts": {

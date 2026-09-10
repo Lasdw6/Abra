@@ -11,7 +11,7 @@ one object on stdout, and each line is at most 1 MiB.
 
 **Registry.** `AdapterRegistry::discover` and `discover_with` find
 `abra-adapter.json` under a store root, a persisted `registry.json`, and extra
-directories. `export`, `import`, `inspect`, and `control` spawn the matching
+directories. `export`, `import`, `inspect`, `inventory`, and `control` spawn the matching
 adapter. Export staging is created next to the store and checked so the adapter
 cannot write outside it.
 
@@ -31,3 +31,7 @@ let result = abra_adapter::protocol::parse_response("export", &request_id, &line
 `build_request` rejects a non-object body. `parse_response` requires an object
 `payload` for `export`, turns `import` into `{result, deep_link?}`, returns
 `control`'s `result`, and parses `inspect` as `InspectResult`.
+
+`AdapterRegistry::inventory` calls an adapter once by name with its first
+declared kind, empty options, no source, and a 10-second timeout. Reports are
+limited to 256 items and remain subject to the protocol's 1 MiB response cap.

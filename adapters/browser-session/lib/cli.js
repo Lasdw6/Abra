@@ -1,8 +1,9 @@
 import { chmod, copyFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { capture, captureFrom, previewFrom, revoke, stopChrome } from './browser.js';
+import { capture, captureFrom, hasDesktopChromeRoot, previewFrom, revoke, stopChrome } from './browser.js';
 import { resolveCdpEndpoint } from './cdp.js';
 import { installBundle, processIdentity, registryFile, safeContainedDelete } from './import.js';
+import { resolveNamedDestination } from './transfer-policy.js';
 import { dataDir, loadBundle, loadManifest, parseList, readJson, RECEIPT_KIND, saveBundle, signingIdentity, verifyObject, writeJson } from './util.js';
 
 export function parseArgs(argv) { const positionals=[],flags={}; for(let i=0;i<argv.length;i++){const arg=argv[i];if(!arg.startsWith('--'))positionals.push(arg);else{const key=arg.slice(2);flags[key]=i+1<argv.length&&!argv[i+1].startsWith('--')?argv[++i]:true;}} return {positionals,flags}; }
@@ -32,9 +33,9 @@ export async function run(argv,io=console){
   if(command==='inspect'){const dir=path.resolve(positionals[1]||'.'),manifest=await loadManifest(dir);io.log(summary(manifest));return manifest;}
   if(command==='import'){
     const dir=path.resolve(positionals[1]||'.'),to=need(flags,'to');
-    if((to==='local'||to==='managed')&&!flags.detach)throw new Error(`--to ${to} requires explicit --detach because Chrome remains running until revoke`);
-    if(to!=='local'&&to!=='managed'&&to!=='cdp')throw new Error('--to must be local, managed, or cdp');
-    const destination=to==='cdp'?{type:'cdp',cdpUrl:await resolveCdpEndpoint(positionals[2]||need(flags,'cdp'))}:{type:'managed'};
+    if(to!=='local'&&to!=='normal'&&to!=='managed'&&to!=='cdp')throw new Error('--to must be local, normal, managed, or cdp');
+    const destination=to==='cdp'?{type:'cdp',cdpUrl:await resolveCdpEndpoint(positionals[2]||need(flags,'cdp'))}:resolveNamedDestination(to,{userBrowser:await hasDesktopChromeRoot()});
+    if(destination.type==='managed'&&!flags.detach)throw new Error(`--to ${to} requires explicit --detach because Chrome remains running until revoke`);
     const {receipt,receiptPath}=await installBundle(dir,destination,{policy:{allows:parseList(flags['allow-domains']),denies:parseList(flags['deny-domains'])},watchMs:Number(flags['watch-ms']||0),trustSender:flags['trust-sender'],requireLocalTrust:true,receiptPath:flags.receipt});
     io.log(receiptPath);return receipt;
   }

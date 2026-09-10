@@ -93,7 +93,7 @@ function cookieAllowed(cookie, includes, excludes) {
   if (cookie.domain && excludes.some(denied => domainMatches(denied, host))) return false;
   return true;
 }
-export const supportsManualCookieOverride = true;
+export const supportsManualCookieOverride = false;
 const BOUND_SESSION_DOMAINS = ['accounts.google.com','google.com','googleapis.com','workspace.google.com','youtube.com'];
 export function nonPortableCookieReasons(cookie) {
   const domain = cookieDomain(cookie);
@@ -126,9 +126,8 @@ export async function loadManifest(dir, options = {}) {
 }
 export async function saveBundle(dir, state, metadata = {}) {
   await privateDir(dir);
-  const allowNonPortable = metadata.allowNonPortable === true;
-  const blockedCookies = allowNonPortable ? [] : (state.cookies || []).filter(cookie => nonPortableCookieReasons(cookie).length);
-  const portableState = { ...state, cookies: (state.cookies || []).filter(cookie => allowNonPortable || !nonPortableCookieReasons(cookie).length) };
+  const blockedCookies = (state.cookies || []).filter(cookie => nonPortableCookieReasons(cookie).length);
+  const portableState = { ...state, cookies: (state.cookies || []).filter(cookie => !nonPortableCookieReasons(cookie).length) };
   const storageState = blockedCookies.length ? toStorageState(portableState) : metadata.storageState || toStorageState(portableState);
   const storageStateRaw = blockedCookies.length || metadata.storageStateRaw === undefined
     ? `${JSON.stringify(storageState, null, 2)}\n`
@@ -159,6 +158,6 @@ function safeTabUrl(value) { try { const u=new URL(value); u.search=''; u.hash='
 export function buildManifest(state, metadata={}) {
   const groups=new Map(); for(const c of state.cookies||[]){const d=cookieDomain(c);if(!groups.has(d))groups.set(d,[]);groups.get(d).push(c);}
   const domains=[...groups].sort(([a],[b])=>a.localeCompare(b)).map(([domain,cookies])=>({domain,cookie_count:cookies.length,http_only_count:cookies.filter(c=>c.httpOnly).length,secure_count:cookies.filter(c=>c.secure).length}));
-  return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...blockedCookieGroups(metadata.blockedCookies),...[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]})],cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
+  return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',...(metadata.dataScope?{data_scope:metadata.dataScope}:{}),policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...blockedCookieGroups(metadata.blockedCookies),...[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]})],cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
 }
 export async function assertPrivateFile(file) { const mode=(await stat(file)).mode & 0o777; return mode === 0o600; }

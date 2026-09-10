@@ -79,28 +79,34 @@ The inner manifest signature remains verifiable after transport encryption is re
 
 ## Install, receipts, and revocation
 
-Import MUST create a fresh isolated browser context and MUST NOT install into the user's default profile. Cookies are installed with CDP `Storage.setCookies` for that browser-context id. Storage is restored in an origin-bound page; tabs are then opened. Cookies SHOULD be reapplied when new targets/contexts appear during the live import operation, because providers may create pages lazily.
+The same bundle is used everywhere. The destination decides whether cookies are installed.
 
-Accepted destinations are omitted, `local`, `managed`, `{type:"local"}`, `{type:"managed"}`, `cdp:<ws-url>`, a bare `ws://` or `wss://` URL, and the equivalent typed CDP object. Omitted, `local`, and `managed` install into the adapter-owned browser. Any other string, including the materialization directory supplied as Abra's default destination, MUST fail without launching a browser. The adapter MUST read bundle files only from `materialized_files`; sender payload metadata MUST NOT select a local path.
+A user-owned browser (`normal`, or omitted/`local` when this machine has the user’s Chrome) MUST open new tabs only. It MUST NOT write cookies or origin storage into that profile. The user already has their own sign-in.
 
-An importer writes a receipt signed by the pinned local installation key containing: receipt kind, install time, opaque install id, isolated context id, cookie identifiers (never values), installed origins, effective policy, source-bundle digest, and `reexportable: false`. It MUST NOT contain a PID, path, or CDP URL. The capability mapping lives in a private `0600` registry. Revocation MUST verify kind, signature domain, fingerprint, pinned key, and registry/context match before action. It MUST never kill a PID or delete a path supplied by a receipt; registered processes require command-line verification and tool paths require `realpath` containment.
+A non-user browser (`managed`, `cdp`, or omitted/`local` when there is no user Chrome, such as a sandbox) MUST create a fresh isolated browser context. Portable cookies are installed with CDP `Storage.setCookies` for that browser-context id. Storage is restored in an origin-bound page; tabs are then opened.
 
-Revocation is scoped to what the receipt installed. On `revoke`, the importer MUST clear installed cookies and origin storage in that isolated context. Disposing the dedicated browser context satisfies this atomically and is preferred. Revocation is local cleanup, not global credential invalidation: it cannot revoke server-side sessions, copies, prior recaptures, or sessions installed elsewhere. A missing/already-disposed context is reported, not silently treated as proof of remote revocation.
+Accepted destinations are omitted, `local`, `normal`, `managed`, `{type:"local"}`, `{type:"normal"}`, `{type:"managed"}`, `cdp:<ws-url>`, a bare `ws://` or `wss://` URL, and the equivalent typed CDP object. Any other string, including the materialization directory supplied as Abra's default destination, MUST fail without launching a browser. The adapter MUST read bundle files only from `materialized_files`; sender payload metadata MUST NOT select a local path.
+
+An importer writes a receipt signed by the pinned local installation key containing: receipt kind, install time, opaque install id, `auth_applied`, cookie identifiers (never values), installed origins, effective policy, source-bundle digest, and `reexportable: false`. Isolated restores also record a context id. It MUST NOT contain a PID, path, or CDP URL. The capability mapping lives in a private `0600` registry. Revocation MUST verify kind, signature domain, fingerprint, pinned key, and registry/context match before action. It MUST never kill a PID or delete a path supplied by a receipt; registered processes require command-line verification and tool paths require `realpath` containment.
+
+Revocation is scoped to what the receipt installed. On `revoke` of an isolated context, the importer MUST clear installed cookies and origin storage in that context. Disposing the dedicated browser context satisfies this atomically and is preferred. Tab-only imports into a user browser are not reversible. Revocation is local cleanup, not global credential invalidation: it cannot revoke server-side sessions, copies, prior recaptures, or sessions installed elsewhere. A missing/already-disposed context is reported, not silently treated as proof of remote revocation.
 
 ## DBSC and non-teleportability
 
 Device Bound Session Credentials can bind authentication to a device-held key. Copying the visible cookies therefore may not transfer the authenticated session. Browsers do not expose a reliable universal “this cookie is DBSC-bound” bit over CDP.
 
-V1 uses an honest heuristic:
+V1 refuses those cookies. It MUST omit them from STATE and `storage_state.json`. A caller MUST NOT override that omission. The tab URL still transfers.
 
-1. flag a maintained list of known DBSC-capable domains (`accounts.google.com`, `google.com`, `googleapis.com`, `workspace.google.com`, including subdomains); and
-2. add an attribute hint when a Secure + HttpOnly cookie has a session-like name (`__Host-`, `session`, `sid`, `bound`, or `device`).
+The omit list is a heuristic:
 
-These signals can produce false positives and false negatives. The manifest marks every result `heuristic: true`. It MUST say “may not teleport,” never “is DBSC,” and MUST preserve the cookies and their HttpOnly/Secure flags unless domain policy removes them.
+1. known DBSC-capable domains (`accounts.google.com`, `google.com`, `googleapis.com`, `workspace.google.com`, `youtube.com`, including subdomains); and
+2. a Secure + HttpOnly cookie whose name matches `dbsc`, `device-bound`, or `bound-session`.
+
+Omitted cookies are recorded in `non_teleportable` with `action: "omitted"` and `heuristic: true`. Remaining cookies may still be flagged with the broader session-name hint (`__Host-`, `session`, `sid`, `bound`, or `device`). The manifest MUST say “may not teleport,” never “is DBSC.”
 
 ## Security notes
 
-STATE is equivalent to a bag of bearer credentials. Payloads, receipts, and registries MUST be `0600`; containing directories and temporary profiles MUST be `0700`. Export copies MUST be removed in `finally` and on interrupts. Imports MUST use a fresh tool-owned profile, never a clone of the user's real profile. Keep it encrypted in transit and at rest, minimize retention, avoid logs/backups, and verify integrity before use. Consent MUST be explicit and legible; a shell installer or generic browser permission is not sufficient consent to export authentication state. Secure/HttpOnly flags constrain browser script access, not possession of an exported bundle.
+STATE is equivalent to a bag of bearer credentials. Payloads, receipts, and registries MUST be `0600`; containing directories and temporary profiles MUST be `0700`. Export copies MUST be removed in `finally` and on interrupts. Isolated imports MUST use a fresh tool-owned profile, never a clone of the user's real profile. User-owned imports MUST NOT write cookies into that profile. Keep it encrypted in transit and at rest, minimize retention, avoid logs/backups, and verify integrity before use. Consent MUST be explicit and legible; a shell installer or generic browser permission is not sufficient consent to export authentication state. Secure/HttpOnly flags constrain browser script access, not possession of an exported bundle.
 
 The external adapter MUST reset a materialized bundle to these private modes before reading it. Cadabra may materialize files as `0644` and directories as `0755`.
 

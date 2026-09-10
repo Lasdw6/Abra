@@ -1,4 +1,4 @@
-use crate::{AdapterError, InspectResult, Result};
+use crate::{AdapterError, InspectResult, InventoryReport, Result};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -119,6 +119,9 @@ pub fn parse_response(verb: &str, request_id: &str, line: &str) -> Result<Value>
             }
             Ok(value)
         }
+        "inventory" => Ok(serde_json::to_value(serde_json::from_value::<
+            InventoryReport,
+        >(value)?)?),
         _ => Err(format!("unsupported adapter response verb: {verb}").into()),
     }
 }
@@ -226,6 +229,18 @@ mod tests {
         assert_eq!(value, json!({"op": "stop"}));
         let error = parse_response("control", "ab", &ok_line("ab", r#""other":true"#)).unwrap_err();
         assert!(error.to_string().contains("requires result"));
+    }
+
+    #[test]
+    fn parse_response_inventory_validates_items_and_limit() {
+        let value = parse_response("inventory", "ab", &ok_line("ab", r#""label":"Browser","items":[{"id":"tab-1","kind":"com.test","label":"Example","source":{"tab":"1"},"transferable":true}]"#)).unwrap();
+        assert_eq!(value["items"][0]["id"], "tab-1");
+        let items = (0..257).map(|i| json!({"id":i.to_string(),"kind":"com.test","label":"x","source":{},"transferable":true})).collect::<Vec<_>>();
+        let line = json!({"request_id":"ab","ok":true,"label":"x","items":items}).to_string();
+        assert!(parse_response("inventory", "ab", &line)
+            .unwrap_err()
+            .to_string()
+            .contains("256"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { cp, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, unlink, wri
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { crc32, deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -535,8 +536,9 @@ export async function captureFrom(source, policy = {}) {
   throw new Error('unsupported browser-session source');
 }
 
-export async function browserInventory() {
+export async function browserInventory({ cdpUrls = [] } = {}) {
   const items = [];
+  const seen = new Set();
   const desktopChrome = await hasDesktopChromeRoot();
   let normalReported = false;
   try {
@@ -562,9 +564,29 @@ export async function browserInventory() {
     try {
       const pages = httpPageTargets((await cdp.send('Target.getTargets')).targetInfos);
       for (const tab of pages.slice(0, 256 - items.length)) {
+        seen.add(tab.targetId);
         items.push({ id: `managed:${tab.targetId}`, kind: 'dev.abra.browser.session.v1',
           label: displayLabel(tab.title || tab.url), detail: tab.url.slice(0, 2000),
           source: { type: 'cdp', cdp_url: managed.wsUrl, target_id: tab.targetId, expected_url: new URL(tab.url).href },
+          options: {}, transferable: true });
+      }
+    } finally { cdp.close(); }
+  }
+  // Browsers the caller already found, such as a sandbox agent's own Chrome.
+  for (const cdpUrl of cdpUrls) {
+    if (items.length >= 256 || (managed && cdpUrl === managed.wsUrl)) continue;
+    let cdp;
+    try { cdp = await new CDP(cdpUrl).connect(); } catch { continue; }
+    try {
+      const endpoint = createHash('sha256').update(cdpUrl).digest('hex').slice(0, 8);
+      const pages = httpPageTargets((await cdp.send('Target.getTargets')).targetInfos);
+      for (const tab of pages) {
+        if (items.length >= 256) break;
+        if (seen.has(tab.targetId)) continue;
+        seen.add(tab.targetId);
+        items.push({ id: `cdp:${endpoint}:${tab.targetId}`, kind: 'dev.abra.browser.session.v1',
+          label: displayLabel(tab.title || tab.url), detail: tab.url.slice(0, 2000),
+          source: { type: 'cdp', cdp_url: cdpUrl, target_id: tab.targetId, expected_url: new URL(tab.url).href },
           options: {}, transferable: true });
       }
     } finally { cdp.close(); }

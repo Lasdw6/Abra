@@ -27,6 +27,12 @@ an already-running Abra browser without launching either. Each item carries an
 opaque selector. Export checks the browser session, tab identity, and URL again
 at capture time and returns `not_found` after a close, restart, or navigation.
 The canonical and legacy bundle kind aliases produce one inventory entry.
+The inventory request accepts an optional `cdp_urls` option: a JSON array of up
+to eight ws(s) or http(s) DevTools endpoints the caller already found, such as a
+sandbox agent's own Chrome. Their HTTP(S) page targets are listed as
+transferable `cdp` items with ids `cdp:<endpoint>:<target>`. Endpoints that do
+not answer are skipped, and targets already listed from the Abra browser are not
+repeated.
 Normal Chrome connects through Chrome 144+'s built-in, permission-gated remote
 debugging support. No extension is required. In your running Chrome, open
 `chrome://inspect/#remote-debugging`, enable remote debugging, and allow Abra's

@@ -711,9 +711,19 @@ test('local and omitted imports reuse isolated Chrome and inventory includes it 
     const items = await browserInventory();
     assert.equal(items.some(item => item.id === 'chrome:desktop-1'), true);
     assert.equal(items.some(item => item.id.startsWith('managed:') && item.detail.startsWith(origin)), true);
+    const withOwn = await browserInventory({ cdpUrls: [started.wsUrl, 'ws://127.0.0.1:1/devtools/browser/gone'] });
+    assert.deepEqual(withOwn.map(item => item.id), items.map(item => item.id), 'a caller endpoint for the Abra browser adds no duplicate and a dead endpoint is skipped');
   } finally {
     if (previousTabs === undefined) delete process.env.ABRA_BROWSER_TABS_JSON; else process.env.ABRA_BROWSER_TABS_JSON = previousTabs;
     await rm(process.env.ABRA_BROWSER_CHROME_ROOT, { recursive: true, force: true });
+  }
+});
+
+test('inventory rejects malformed cdp_urls', async () => {
+  for (const cdp_urls of ['not json', '["ftp://x"]', JSON.stringify(Array(9).fill('ws://127.0.0.1:1/'))]) {
+    const response = await adapterRequest({ protocol: 'abra-adapter/1', kind: 'dev.abra.browser.session.v1', verb: 'inventory', request_id: '21', options: { cdp_urls } });
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, 'invalid_request');
   }
 });
 

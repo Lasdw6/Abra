@@ -16,8 +16,23 @@ await runAdapter({
   internalMessage: 'browser-session operation failed'
 });
 
-async function inventoryRequest() {
-  return { label: 'Browser', items: await browserInventory() };
+async function inventoryRequest(r) {
+  const options = requestOptions(r);
+  return { label: 'Browser', items: await browserInventory({ cdpUrls: await parseCdpUrls(options.cdp_urls) }) };
+}
+
+async function parseCdpUrls(value) {
+  if (value === undefined || value === '') return [];
+  let parsed;
+  try { parsed = JSON.parse(value); } catch { throw coded('invalid_request', 'cdp_urls must be a JSON string array'); }
+  if (!Array.isArray(parsed) || parsed.length > 8 || parsed.some(item => typeof item !== 'string' || !isCdpEndpoint(item))) {
+    throw coded('invalid_request', 'cdp_urls must be a JSON array of at most 8 ws(s) or http(s) DevTools endpoints');
+  }
+  const urls = [];
+  for (const item of parsed) {
+    try { urls.push(await resolveCdpUrl(item)); } catch { /* Browser exited. */ }
+  }
+  return [...new Set(urls)];
 }
 
 async function exportRequest(r) {

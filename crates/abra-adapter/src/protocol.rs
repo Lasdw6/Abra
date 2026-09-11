@@ -232,6 +232,32 @@ mod tests {
     }
 
     #[test]
+    fn inventory_context_is_optional_and_bounded() {
+        let line = json!({"request_id":"ab","ok":true,"label":"Files","context":{"path":"/tmp","parent":"/"},"items":[]}).to_string();
+        let value = parse_response("inventory", "ab", &line).unwrap();
+        assert_eq!(value["context"]["path"], "/tmp");
+        let line = json!({"request_id":"ab","ok":true,"label":"Files","context":{"path":"x".repeat(16 * 1024)},"items":[]}).to_string();
+        assert!(parse_response("inventory", "ab", &line)
+            .unwrap_err()
+            .to_string()
+            .contains("16 KiB"));
+    }
+
+    #[test]
+    fn inventory_description_is_optional_and_bounded() {
+        let line = ok_line(
+            "ab",
+            r#""label":"Files","description":"Add files to the shared folder.","items":[]"#,
+        );
+        let value = parse_response("inventory", "ab", &line).unwrap();
+        assert_eq!(value["description"], "Add files to the shared folder.");
+        for description in ["x".repeat(1025), "bad\ntext".to_string()] {
+            let line = json!({"request_id":"ab","ok":true,"label":"Files","description":description,"items":[]}).to_string();
+            assert!(parse_response("inventory", "ab", &line).is_err());
+        }
+    }
+
+    #[test]
     fn parse_response_inventory_validates_items_and_limit() {
         let value = parse_response("inventory", "ab", &ok_line("ab", r#""label":"Browser","items":[{"id":"tab-1","kind":"com.test","label":"Example","source":{"tab":"1"},"transferable":true}]"#)).unwrap();
         assert_eq!(value["items"][0]["id"], "tab-1");

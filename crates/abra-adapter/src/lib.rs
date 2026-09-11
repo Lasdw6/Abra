@@ -345,6 +345,15 @@ impl AdapterRegistry {
     }
     /// Enumerate current transferable items without changing or launching the source.
     pub async fn inventory(&self, adapter_name: &str) -> Result<InventoryReport> {
+        self.inventory_with_options(adapter_name, &BTreeMap::new())
+            .await
+    }
+    /// Enumerate using caller-selected adapter options, such as a folder to browse.
+    pub async fn inventory_with_options(
+        &self,
+        adapter_name: &str,
+        options: &BTreeMap<String, String>,
+    ) -> Result<InventoryReport> {
         let adapter = self
             .by_name
             .get(adapter_name)
@@ -357,7 +366,7 @@ impl AdapterRegistry {
             .ok_or("adapter manifest has no kinds")?;
         let value = invoke(
             adapter,
-            json!({"verb":"inventory","kind":kind,"options":{}}),
+            json!({"verb":"inventory","kind":kind,"options":options}),
             Some(Duration::from_secs(10)),
         )
         .await?;
@@ -483,6 +492,10 @@ pub struct InspectResult {
 #[derive(Clone, Debug, Serialize)]
 pub struct InventoryReport {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
     pub items: Vec<InventoryItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -512,11 +525,29 @@ impl<'de> Deserialize<'de> for InventoryReport {
         #[serde(deny_unknown_fields)]
         struct Raw {
             label: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            context: Option<Value>,
             items: Vec<InventoryItem>,
             #[serde(default)]
             error: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
+        if raw
+            .description
+            .as_ref()
+            .is_some_and(|s| s.len() > 1024 || s.chars().any(char::is_control))
+        {
+            return Err(serde::de::Error::custom("inventory description is invalid"));
+        }
+        if raw
+            .context
+            .as_ref()
+            .is_some_and(|value| value.to_string().len() > 16 * 1024)
+        {
+            return Err(serde::de::Error::custom("inventory context exceeds 16 KiB"));
+        }
         if raw.items.len() > 256 {
             return Err(serde::de::Error::custom(
                 "inventory report exceeds 256 items",
@@ -524,6 +555,8 @@ impl<'de> Deserialize<'de> for InventoryReport {
         }
         Ok(Self {
             label: raw.label,
+            description: raw.description,
+            context: raw.context,
             items: raw.items,
             error: raw.error,
         })

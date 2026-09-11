@@ -33,5 +33,13 @@ let result = abra_adapter::protocol::parse_response("export", &request_id, &line
 `control`'s `result`, and parses `inspect` as `InspectResult`.
 
 `AdapterRegistry::inventory` calls an adapter once by name with its first
-declared kind, empty options, no source, and a 10-second timeout. Reports are
-limited to 256 items and remain subject to the protocol's 1 MiB response cap.
+declared kind, empty options, no source, and a 10-second timeout.
+`inventory_with_options` takes a string-to-string options map for the same call,
+allowing callers to select a folder or page. Reports are limited to 256 items
+and remain subject to the protocol's 1 MiB response cap.
+
+Inventory reports may include `description`, a plain-text source/setup hint of
+at most 1024 UTF-8 bytes with no control characters. Consumers should show it
+even for an empty item list. Reports can also include opaque `context` JSON
+(up to 16 KiB), such as the current folder, parent, roots, or next page.
+Consumers must not treat context as transferable content.

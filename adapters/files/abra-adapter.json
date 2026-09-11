@@ -1,0 +1,14 @@
+{
+  "spec": "abra-adapter/1",
+  "name": "dev.abra.files",
+  "version": "0.2.0",
+  "kinds": [
+    "dev.abra.files.v1"
+  ],
+  "verbs": [
+    "inventory",
+    "export",
+    "import"
+  ],
+  "executable": "files.py"
+}

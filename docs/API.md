@@ -51,6 +51,7 @@ Operations and request fields:
 | `send` | `peer`; one payload: `snapshot_id`, `path`, `link`, or `kind` + `source`; optional send fields | ids; linked workspace fields; inspect fields; wait entries |
 | `adapters-list` / `adapters-add` / `adapters-remove` | `dir?`, `name?` | list returns `{adapters:[...],errors:[...]}`; add/remove return the registration change |
 | `inspect` | `kind`, `source`, `options?` | `{summary?,warnings:[...],blocked:[...]}` from the adapter |
+| `inventory` | `adapter?`, `options?` | one named adapter report, or `{reports:[...]}` for all inventory adapters |
 | `inbox` | `kind?`, `from?`, `wait?`, `timeout_ms?` | partial floor cards, read state, and `provenance` |
 | `accept` | `to`; `id` or `latest:true` + `kind`; optional `from`, `replace`, `workspace`, `timeout_ms`, `no_lease`, `discard_local`, `allow_divergence`, `no_import`, `destination`, `options`; legacy `into` aliases `replace` | materializes, imports, marks read, and returns `replace` plus `import` (`{result, deep_link?}`) when an adapter ran; `no_import:true` skips the importer |
 | `handoffs` | `kind?`, `peer?` | rows shaped `{kind,last_acked_send,last_pending_send,last_unread_receive,last_read_receive,capsule}`; missing values are `null` |
@@ -77,6 +78,12 @@ is `root` for `<root>/adapters/*`, `registry`
 for the persisted `adapters add` list, and `flag` or `env` for directories a
 daemon was started with. `adapters remove` refuses a `flag`/`env` registration
 because there is nothing persisted to remove.
+
+`inventory` lists transferable items without changing their source. With
+`adapter`, the result is `{adapter,label,description?,context?,items,error?}`.
+Without it, `reports` contains that shape for up to 64 adapters. One failed
+adapter returns an error report with no items while the others still run. See
+[Inventory shapes](ADAPTERS.md#inventory-shapes) for list and tree navigation.
 
 Paths sent to `capsule-create`, `snapshot`, and `accept` must be absolute. The
 CLI resolves them in the caller's working directory before making the request;

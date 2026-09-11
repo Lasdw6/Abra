@@ -58,28 +58,33 @@ class FilesTest(unittest.TestCase):
         self.assertEqual((self.root / "note.txt").read_bytes(), b"hello\x00world")
         self.assertFalse(any(p.name.startswith(("Received-", ".abra-incoming-")) for p in target.iterdir()))
 
-    def test_dynamic_roots_browsing_and_all_mode(self):
+    def test_dynamic_roots_and_default_root_browsing(self):
         other = self.base / "any-other-folder"
         other.mkdir()
         (other / "note").write_text("data")
-        options = {"mode": "selected", "paths": json.dumps([str(self.root), str(other)])}
+        options = {"roots": json.dumps([str(self.root), str(other)])}
         roots = self.call("inventory", options=options)
         self.assertEqual(roots["context"]["path"], None)
         self.assertEqual({i["source"]["absolute_path"] for i in roots["items"]}, {str(self.root), str(other)})
-        opened = self.call("inventory", options={**options, "browse_path": str(other)})
+        self.assertTrue(all(item["open"] == item["source"]["absolute_path"] for item in roots["items"]))
+        opened = self.call("inventory", options={**options, "path": str(other)})
         self.assertEqual(opened["context"]["path"], str(other))
         self.assertIsNone(opened["context"]["parent"])
         self.assertEqual(opened["items"][0]["label"], "note")
         self.assertTrue(self.capture(opened["items"][0]["source"])["ok"])
-        outside = self.call("inventory", options={**options, "browse_path": str(self.base)})
-        self.assertIn("outside the selected", outside["error"])
-        all_folders = self.call("inventory", options={"mode": "all", "browse_path": str(self.base)})
-        self.assertTrue(all_folders["ok"])
-        self.assertEqual(all_folders["context"]["parent"], str(self.base.parent))
+        self.assertNotIn("open", opened["items"][0])
+        outside = self.call("inventory", options={**options, "path": str(self.base)})
+        self.assertIn("outside the configured", outside["error"])
+        default = self.call("inventory")
+        self.assertTrue(default["ok"])
+        self.assertEqual(default["context"]["path"], str(self.root))
+        self.assertEqual(default["context"]["roots"], [str(self.root)])
+        self.assertTrue(default["context"]["destination"])
+        self.assertEqual(default["context"]["shape"], "tree")
         self.assertFalse((self.base / "Abra").exists())
         alias = self.base / "folder-alias"
         alias.symlink_to(other, target_is_directory=True)
-        via_alias = self.call("inventory", options={"mode": "all", "browse_path": str(alias)})
+        via_alias = self.call("inventory", options={"roots": json.dumps([str(alias)]), "path": str(alias)})
         self.assertTrue(via_alias["ok"], via_alias)
         self.assertTrue(self.capture(via_alias["items"][0]["source"])["ok"])
 
@@ -87,7 +92,8 @@ class FilesTest(unittest.TestCase):
         self.root.rmdir()
         missing = self.call("inventory")
         self.assertIn("No such file", missing["error"])
-        self.assertEqual(missing["context"]["browser"], "filesystem")
+        self.assertEqual(missing["context"]["shape"], "tree")
+        self.assertTrue(missing["context"]["destination"])
         self.assertFalse(self.root.exists())
         self.root.mkdir()
         for i in range(260):

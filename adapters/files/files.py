@@ -82,32 +82,33 @@ def natural_name(value):
 
 def _inventory(req):
     options = req.get("options") or {}
-    mode = options.get("mode", "all")
-    if mode not in ("selected", "all"):
-        fail("invalid_request", "Files mode must be selected or all")
-    paths = json.loads(options.get("paths", "[]"))
-    if not isinstance(paths, list) or len(paths) > 32:
+    configured_roots = json.loads(options.get("roots", "[]"))
+    if not isinstance(configured_roots, list) or len(configured_roots) > 32:
         fail("invalid_request", "Choose up to 32 folders")
-    roots = list(dict.fromkeys(os.path.realpath(absolute_path(path)) for path in paths)) if mode == "selected" else []
-    browse = options.get("browse_path")
-    path = absolute_path(browse) if browse else (root_path() if mode == "all" else None)
-    if path and mode == "selected" and not any(
+    if not all(isinstance(root, str) for root in configured_roots):
+        fail("invalid_request", "Roots must be folder path strings")
+    roots = list(dict.fromkeys(os.path.realpath(absolute_path(root)) for root in configured_roots))
+    if not roots:
+        roots = [root_path()]
+    browse = options.get("path")
+    path = absolute_path(browse) if browse else (roots[0] if not configured_roots else None)
+    if path and not any(
         os.path.commonpath((os.path.realpath(path), os.path.realpath(root))) == os.path.realpath(root)
         for root in roots
     ):
-        fail("permission_denied", "This folder is outside the selected folders")
+        fail("permission_denied", "This folder is outside the configured roots")
     offset = int(options.get("offset", "0"))
     if offset < 0 or offset > 1000000:
         fail("invalid_request", "Invalid folder page")
     parent = None
     if path:
         candidate = os.path.dirname(path)
-        if candidate != path and (mode == "all" or any(
+        if candidate != path and any(
             os.path.commonpath((os.path.realpath(candidate), os.path.realpath(root))) == os.path.realpath(root)
             for root in roots
-        )):
+        ):
             parent = candidate
-    context = {"browser": "filesystem", "requested_options": options, "mode": mode, "roots": roots if mode == "selected" else [root_path()], "path": path, "parent": parent,
+    context = {"shape": "tree", "destination": True, "requested_options": options, "roots": roots, "path": path, "parent": parent,
                "offset": offset, "next_offset": None}
     items = []
 
@@ -116,10 +117,13 @@ def _inventory(req):
         entry_type = "directory" if stat.S_ISDIR(info.st_mode) else "file"
         source = {"path": name, "absolute_path": full, "entry_type": entry_type,
                   "root": parent_id, "expected": identity(info)}
-        return {"id": hashlib.sha256(full.encode()).hexdigest(), "kind": KIND,
+        result = {"id": hashlib.sha256(full.encode()).hexdigest(), "kind": KIND,
                 "label": display(name or full, 200),
                 "detail": "Folder" if entry_type == "directory" else f"File · {info.st_size} bytes",
                 "source": source, "transferable": True}
+        if entry_type == "directory":
+            result["open"] = full
+        return result
 
     if path:
         with directory(path) as root:
@@ -170,10 +174,17 @@ def inventory(req):
         options = req.get("options") or {}
         # Keep controls available when a chosen folder disappears or access is denied.
         message = error.message if isinstance(error, Failure) else str(error)
+        roots = []
+        try:
+            configured = json.loads(options.get("roots", "[]"))
+            if isinstance(configured, list) and all(isinstance(root, str) for root in configured):
+                roots = [os.path.realpath(absolute_path(root)) for root in configured] or [root_path()]
+        except (Failure, OSError, ValueError, TypeError):
+            pass
         return {"label": "Files", "items": [], "error": display(message, 4096),
-                "context": {"browser": "filesystem", "requested_options": options,
-                            "mode": options.get("mode", "all"), "roots": [],
-                            "path": options.get("browse_path"), "parent": None,
+                "context": {"shape": "tree", "destination": True,
+                            "requested_options": options, "roots": roots,
+                            "path": options.get("path"), "parent": None,
                             "offset": 0, "next_offset": None}}
 
 

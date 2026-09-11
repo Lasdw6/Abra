@@ -1250,6 +1250,41 @@ fn shell_adapter(
     dir.to_path_buf()
 }
 
+fn inventory_adapter(dir: &Path, name: &str, kind: &str, fails: bool) -> std::path::PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("abra-adapter.json"),
+        serde_json::to_vec(&json!({
+            "spec":"abra-adapter/1",
+            "name":name,
+            "version":"1",
+            "kinds":[kind],
+            "verbs":["inventory"],
+            "executable":"run.py"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let executable = dir.join("run.py");
+    let body = if fails {
+        r#"#!/usr/bin/env python3
+import json, sys
+request = json.loads(sys.stdin.readline())
+print(json.dumps({"request_id": request["request_id"], "ok": False, "error": {"code": "internal", "message": "inventory failed", "retryable": False}}))
+"#
+    } else {
+        r#"#!/usr/bin/env python3
+import json, sys
+request = json.loads(sys.stdin.readline())
+result = {"request_id": request["request_id"], "ok": True, "label": "Fixture", "context": {"shape": "list", "requested_options": request["options"]}, "items": [{"id": "one", "kind": request["kind"], "label": "One", "source": "one", "transferable": True}]}
+print(json.dumps(result))
+"#
+    };
+    fs::write(&executable, body).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    dir.to_path_buf()
+}
+
 const EXPORT_BODY: &str = r###"read line
 id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
 staging=$(printf '%s' "$line" | sed -n 's/.*"staging_dir":"\([^"]*\)".*/\1/p')
@@ -2349,6 +2384,62 @@ async fn inspect_runs_the_verb_on_its_own() {
         .unwrap()
         .iter()
         .any(|event| event["event"] == "adapter-inspect" && event["blocked"] == json!(1)));
+}
+
+#[tokio::test]
+async fn inventory_lists_one_or_all_adapters_and_keeps_failures_local() {
+    let network = LoopbackNetwork::default();
+    let root = private_root();
+    let good = inventory_adapter(
+        &root.path().join("good-inventory"),
+        "test.good-inventory",
+        "com.test.good-inventory",
+        false,
+    );
+    let failing = inventory_adapter(
+        &root.path().join("failing-inventory"),
+        "test.failing-inventory",
+        "com.test.failing-inventory",
+        true,
+    );
+    let daemon = Arc::new(Daemon::loopback(root.path(), &network, true).unwrap());
+    daemon
+        .handle(json!({"op":"adapters-add","dir":good}))
+        .await
+        .unwrap();
+    daemon
+        .handle(json!({"op":"adapters-add","dir":failing}))
+        .await
+        .unwrap();
+
+    let one = daemon
+        .handle(json!({"op":"inventory","adapter":"test.good-inventory","options":{"page":"2"}}))
+        .await
+        .unwrap();
+    assert_eq!(one["adapter"], json!("test.good-inventory"));
+    assert_eq!(one["items"][0]["id"], json!("one"));
+    assert_eq!(one["context"]["requested_options"]["page"], json!("2"));
+
+    let all = daemon.handle(json!({"op":"inventory"})).await.unwrap();
+    let reports = all["reports"].as_array().unwrap();
+    let good = reports
+        .iter()
+        .find(|report| report["adapter"] == "test.good-inventory")
+        .unwrap();
+    let failed = reports
+        .iter()
+        .find(|report| report["adapter"] == "test.failing-inventory")
+        .unwrap();
+    assert_eq!(good["items"][0]["label"], json!("One"));
+    assert_eq!(failed["items"], json!([]));
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("inventory failed"),
+        "{}",
+        failed["error"]
+    );
 }
 
 #[tokio::test]

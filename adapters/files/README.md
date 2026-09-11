@@ -14,18 +14,18 @@ or recursively scan the filesystem. The operating system's permissions apply.
 
 Options are strings in the inventory request's `options` map:
 
-- `mode`: `all` (default) or `selected`.
-- `paths`: a JSON array of up to 32 existing folder paths for selected mode.
-- `browse_path`: the folder to list. In selected mode it must be inside a
-  selected root; omit it to list the chosen roots themselves.
+- `roots`: a JSON array of up to 32 folder paths. Browsing stays inside these
+  roots. If absent or empty, the default root is the user's home folder or
+  `ABRA_FILES_ROOT` when set.
+- `path`: the folder to list. It must be inside a root. Omit it to list the
+  configured roots. With default roots, omitting it lists the default root.
 - `offset`: directory page offset, starting at `0`.
 
-All mode starts at the current user's home folder. `ABRA_FILES_ROOT` remains an
-optional initial browse location for installations and tests; it does not
-restrict source or destination paths. Absolute paths and `~` paths are accepted.
+Absolute paths and `~` paths are accepted.
 Cloud stores options per device and sends them with each inventory poll. The
-report's `context` describes navigation and echoes the requested options so the
-UI can distinguish a new report from the previous folder's contents.
+report's tree `context` describes navigation and echoes the requested options.
+Folder items include `open`, which clients send back as the next `path`. File
+items do not include it.
 
 The adapter returns at most 256 entries per page and `context.next_offset` for
 more. Pagination reflects the live directory stream, so refresh a folder if its

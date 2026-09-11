@@ -252,6 +252,11 @@ impl AdapterRegistry {
     pub fn list(&self) -> Value {
         json!({"adapters":self.by_name.values().collect::<Vec<_>>(),"errors":self.errors})
     }
+    pub fn inventory_adapters(&self) -> impl Iterator<Item = &AdapterRegistration> {
+        self.by_name
+            .values()
+            .filter(|adapter| adapter.supports("inventory"))
+    }
     pub fn for_kind(&self, kind: &str) -> Option<&AdapterRegistration> {
         self.by_name.get(self.kinds.get(kind)?)
     }
@@ -515,6 +520,10 @@ pub struct InventoryItem {
     pub transferable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Value for the `path` inventory option that lists this item's contents.
+    /// Only meaningful when the report's context has `shape: "tree"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for InventoryReport {
@@ -551,6 +560,15 @@ impl<'de> Deserialize<'de> for InventoryReport {
         if raw.items.len() > 256 {
             return Err(serde::de::Error::custom(
                 "inventory report exceeds 256 items",
+            ));
+        }
+        if raw.items.iter().any(|item| {
+            item.open
+                .as_ref()
+                .is_some_and(|open| open.is_empty() || open.len() > 4096)
+        }) {
+            return Err(serde::de::Error::custom(
+                "inventory item open must be 1 to 4096 bytes",
             ));
         }
         Ok(Self {

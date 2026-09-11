@@ -873,7 +873,7 @@ impl Daemon {
             | "peers" | "enroll-mint" | "enroll-join" | "revoke" => {
                 self.handle_pairing(op, &request).await
             }
-            "adapters-list" | "adapters-add" | "adapters-remove" | "inspect" => {
+            "adapters-list" | "adapters-add" | "adapters-remove" | "inspect" | "inventory" => {
                 self.handle_adapters(op, &request).await
             }
             "relay-list" | "relay-add" | "relay-remove" => self.handle_relays(op, &request).await,
@@ -1015,6 +1015,44 @@ impl Daemon {
                 let source = json_object_or_string(required_str(request, "source")?);
                 let options = adapter_options(request)?;
                 self.inspect_source(kind, source, &options).await
+            }
+            "inventory" => {
+                let options = adapter_options(request)?;
+                let registry = self.registry()?;
+                if let Some(name) = request.get("adapter").and_then(Value::as_str) {
+                    let report = registry.inventory_with_options(name, &options).await?;
+                    let mut value = serde_json::to_value(report)?;
+                    value["adapter"] = json!(name);
+                    Ok(value)
+                } else if request.get("adapter").is_some()
+                    && !request.get("adapter").is_some_and(Value::is_null)
+                {
+                    Err("adapter must be a string".into())
+                } else {
+                    let names = registry
+                        .inventory_adapters()
+                        .take(64)
+                        .map(|adapter| adapter.manifest.name.clone())
+                        .collect::<Vec<_>>();
+                    let mut reports = Vec::with_capacity(names.len());
+                    for name in names {
+                        let value = match registry.inventory_with_options(&name, &options).await {
+                            Ok(report) => {
+                                let mut value = serde_json::to_value(report)?;
+                                value["adapter"] = json!(name);
+                                value
+                            }
+                            Err(error) => json!({
+                                "adapter": name,
+                                "label": name,
+                                "items": [],
+                                "error": error.to_string(),
+                            }),
+                        };
+                        reports.push(value);
+                    }
+                    Ok(json!({"reports": reports}))
+                }
             }
             _ => Err(format!("unknown operation: {op}").into()),
         }

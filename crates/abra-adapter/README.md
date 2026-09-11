@@ -43,3 +43,6 @@ at most 1024 UTF-8 bytes with no control characters. Consumers should show it
 even for an empty item list. Reports can also include opaque `context` JSON
 (up to 16 KiB), such as the current folder, parent, roots, or next page.
 Consumers must not treat context as transferable content.
+Container items may include `open`, which is sent back as the tree's `path`
+option. See [Adapter protocol](../../docs/ADAPTERS.md#inventory-shapes) for the
+list and tree shapes.

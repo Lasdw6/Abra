@@ -124,6 +124,8 @@ enum Command {
     Control(ControlArgs),
     /// Run only an adapter's inspect verb on a source.
     Inspect(InspectArgs),
+    /// List items that adapters can transfer.
+    Inventory(InventoryArgs),
     Watch,
     Link {
         #[command(subcommand)]
@@ -265,6 +267,14 @@ struct InspectArgs {
     kind: String,
     #[arg(long)]
     source: String,
+    #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
+    adapter_options: Vec<(String, String)>,
+}
+
+#[derive(Args)]
+struct InventoryArgs {
+    #[arg(long)]
+    adapter: Option<String>,
     #[arg(long = "adapter-option", value_parser = parse_adapter_option)]
     adapter_options: Vec<(String, String)>,
 }
@@ -650,6 +660,13 @@ async fn main() -> cadabra::Result<()> {
                 .collect::<std::collections::BTreeMap<_, _>>();
             json!({"op":"inspect","kind":args.kind,"source":args.source,"options":options})
         }
+        Command::Inventory(args) => {
+            let options = args
+                .adapter_options
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            json!({"op":"inventory","adapter":args.adapter,"options":options})
+        }
         Command::Adapters { command } => match command {
             AdapterCommand::List => json!({"op":"adapters-list"}),
             AdapterCommand::Add { dir } => {
@@ -690,6 +707,8 @@ async fn main() -> cadabra::Result<()> {
             .and_then(Value::as_str)
             .ok_or("daemon returned no enrollment token")?;
         println!("{token}");
+    } else if request.get("op").and_then(Value::as_str) == Some("inventory") {
+        print_inventory(&result);
     } else {
         if result.get("workspace_detected") == Some(&Value::Bool(true)) {
             eprintln!(
@@ -1361,9 +1380,66 @@ fn print_human(value: &Value) {
     }
 }
 
+fn print_inventory(value: &Value) {
+    let reports = value
+        .get("reports")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(value));
+    for report in reports {
+        let adapter = report
+            .get("adapter")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for item in report
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            let label = item
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut suffix = item
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(|detail| format!("  {detail}"))
+                .unwrap_or_default();
+            if item.get("transferable") == Some(&Value::Bool(false)) {
+                let reason = item
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not transferable");
+                suffix.push_str(&format!("  [not transferable: {reason}]"));
+            }
+            println!("{adapter}  {id}  {label}{suffix}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_parses_adapter_and_options() {
+        let parsed = Cli::try_parse_from([
+            "abra",
+            "inventory",
+            "--adapter",
+            "dev.files",
+            "--adapter-option",
+            "path=/tmp",
+        ])
+        .unwrap();
+        let Command::Inventory(args) = parsed.command else {
+            panic!("expected inventory");
+        };
+        assert_eq!(args.adapter.as_deref(), Some("dev.files"));
+        assert_eq!(args.adapter_options, vec![("path".into(), "/tmp".into())]);
+    }
 
     #[test]
     fn snapshot_host_facts_require_a_capture_barrier() {

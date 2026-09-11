@@ -261,6 +261,13 @@ mod tests {
     fn parse_response_inventory_validates_items_and_limit() {
         let value = parse_response("inventory", "ab", &ok_line("ab", r#""label":"Browser","items":[{"id":"tab-1","kind":"com.test","label":"Example","source":{"tab":"1"},"transferable":true}]"#)).unwrap();
         assert_eq!(value["items"][0]["id"], "tab-1");
+        let value = parse_response("inventory", "ab", &ok_line("ab", r#""label":"Files","context":{"shape":"tree","path":"/","parent":null,"roots":["/"],"offset":0,"next_offset":null},"items":[{"id":"d","kind":"com.test","label":"docs","source":{"p":"/docs"},"transferable":true,"open":"/docs"}]"#)).unwrap();
+        assert_eq!(value["items"][0]["open"], "/docs");
+        let line = json!({"request_id":"ab","ok":true,"label":"x","items":[{"id":"d","kind":"com.test","label":"docs","source":{},"transferable":true,"open":""}]}).to_string();
+        assert!(parse_response("inventory", "ab", &line)
+            .unwrap_err()
+            .to_string()
+            .contains("open"));
         let items = (0..257).map(|i| json!({"id":i.to_string(),"kind":"com.test","label":"x","source":{},"transferable":true})).collect::<Vec<_>>();
         let line = json!({"request_id":"ab","ok":true,"label":"x","items":items}).to_string();
         assert!(parse_response("inventory", "ab", &line)

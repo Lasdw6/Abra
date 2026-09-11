@@ -80,6 +80,12 @@ Cancellation sends `cancel {request_id}` and kills the process after five second
   only examines the source. Before an adapter `send`, the daemon runs it when
   present. A non-empty `blocked` list stops the send unless `--force` was set.
 
+- `inventory`: optional. Request `{kind,options}`. It is read-only and uses the
+  adapter's first declared kind. Success returns
+  `{label,description?,context?,items,error?}`. Reports contain at most 256
+  items. `context` is at most 16 KiB, `description` is plain text of at most
+  1024 bytes, and the call has a 10-second budget.
+
 - `preview`: optional. Request `{kind,source,options}`. Success returns
   `{media_type,data,width,height,title?,items?}`. `media_type` is `image/jpeg`,
   `image/png`, or `image/webp`. `data` is base64. The decoded image is at most
@@ -95,6 +101,29 @@ Cancellation sends `cancel {request_id}` and kills the process after five second
   returns top-level `{result}`. `op` is `pause`, `stop`, or `instruct`. `text` is present
   only for `instruct`. `workspace` is the last local materialization of that
   capsule, or `null` when the daemon has no recorded path.
+
+### Inventory shapes
+
+`context.shape` is `list` or `tree`. Missing context or a missing shape means
+`list`, a flat searchable multi-select list.
+
+For `tree`, consumers may send three reserved string options: `path` is the
+container to list, `offset` is a decimal page offset that defaults to `0`, and
+`roots` is a JSON array of containers that bound browsing. Missing or empty
+`roots` selects the adapter's defaults. Adapters may accept more options.
+
+Tree context requires `shape:"tree"`, `path`, `parent`, `roots`, `offset`,
+`next_offset`, `requested_options`, and `destination`. `path` and `parent` are
+strings or `null`; a null path means the roots are listed, and parent is null at
+a root. `roots` is the active string array. `offset` is a non-negative integer,
+and `next_offset` is the next integer or `null`. `requested_options` echoes the
+request options unchanged. When `destination` is true, consumers may pass the
+current non-null `path` as a transfer destination. Otherwise they use manifest
+presets.
+
+An inventory item may include `open`, a 1 to 4096-byte string for a container.
+To list it, send inventory again with `path` set to that value. `open` only has
+meaning for tree reports.
 
 Cadabra's built-in workspace export/import and handoff handling are the
 reference behavior for this contract; they are not external adapter processes.

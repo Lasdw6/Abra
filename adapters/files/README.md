@@ -33,6 +33,10 @@ entries change while paging. Symlinks, special files, and incomplete
 `.abra-incoming-*` folders are omitted. Missing or inaccessible folders report
 errors; browsing does not create them.
 
+Listings sort entry names and types before reading detailed metadata for the
+visible page. File identities are read again for that page without following
+symlinks; transfer-time identity checks still reject stale selections.
+
 ## Transfers
 
 Export requires an inventory source selector. It rechecks the selected file and

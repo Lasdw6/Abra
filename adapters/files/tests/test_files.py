@@ -1,11 +1,16 @@
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ADAPTER = Path(__file__).resolve().parents[1] / "files.py"
+spec = importlib.util.spec_from_file_location("files_adapter", ADAPTER)
+files_adapter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(files_adapter)
 
 
 class FilesTest(unittest.TestCase):
@@ -31,6 +36,64 @@ class FilesTest(unittest.TestCase):
         stage = self.base / f"stage-{self.counter}"
         stage.mkdir()
         return self.call("export", source=source, staging_dir=str(stage))
+
+    def test_inventory_reads_detailed_metadata_only_for_the_visible_page(self):
+        for index in range(300):
+            (self.root / f"file-{index}").touch()
+        original_scandir = os.scandir
+        original_stat = os.stat
+        detailed_reads = []
+
+        class Entry:
+            def __init__(self, entry):
+                self.name = entry.name
+                self.is_dir = entry.is_dir
+                self.is_file = entry.is_file
+                self.original = entry
+
+            def stat(self, **kwargs):
+                detailed_reads.append(self.name)
+                return self.original.stat(**kwargs)
+
+        class Scan:
+            def __init__(self, root):
+                self.scan = original_scandir(root)
+
+            def __enter__(self):
+                return (Entry(entry) for entry in self.scan)
+
+            def __exit__(self, *args):
+                self.scan.close()
+
+        def read_stat(name, **kwargs):
+            if kwargs.get("dir_fd") is not None:
+                detailed_reads.append(name)
+            return original_stat(name, **kwargs)
+
+        with patch.dict(os.environ, {"ABRA_FILES_ROOT": str(self.root)}), \
+                patch.object(files_adapter.os, "scandir", Scan), \
+                patch.object(files_adapter.os, "stat", read_stat):
+            report = files_adapter.inventory({"options": {"offset": "256"}})
+        self.assertEqual(len(report["items"]), 44)
+        self.assertEqual(detailed_reads, [f"file-{index}" for index in range(256, 300)])
+        self.assertIsNone(report["context"]["next_offset"])
+
+    def test_inventory_skips_a_file_replaced_by_a_symlink_after_listing(self):
+        selected = self.root / "selected"
+        selected.write_text("original")
+        original_stat = os.stat
+
+        def replace_before_stat(name, **kwargs):
+            if name == "selected" and kwargs.get("dir_fd") is not None:
+                selected.unlink()
+                selected.symlink_to(self.base)
+            return original_stat(name, **kwargs)
+
+        with patch.dict(os.environ, {"ABRA_FILES_ROOT": str(self.root)}), \
+                patch.object(files_adapter.os, "stat", replace_before_stat):
+            report = files_adapter.inventory({})
+        self.assertEqual(report["items"], [])
+        self.assertNotIn("error", report)
 
     def test_roundtrip_to_chosen_existing_folder_and_no_overwrite(self):
         (self.root / "note.txt").write_bytes(b"hello\x00world")

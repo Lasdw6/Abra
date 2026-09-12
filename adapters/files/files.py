@@ -133,20 +133,27 @@ def _inventory(req):
                     if entry.name.startswith(".abra-incoming-"):
                         continue
                     try:
-                        info = entry.stat(follow_symlinks=False)
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                        visible = is_directory or entry.is_file(follow_symlinks=False)
                     except FileNotFoundError:
                         continue
-                    if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
-                        ordered.append((entry.name, info))
+                    if visible:
+                        ordered.append((entry.name, is_directory))
                         if len(ordered) > MAX_ENTRIES:
                             fail("limit_exceeded", "This folder contains more than 10,000 visible entries")
-                ordered.sort(key=lambda value: (not stat.S_ISDIR(value[1].st_mode), natural_name(value[0])))
+                ordered.sort(key=lambda value: (not value[1], natural_name(value[0])))
                 page = ordered[offset:offset + MAX_ITEMS]
                 if offset + len(page) < len(ordered):
                     context["next_offset"] = offset + len(page)
                 parent_id = root_identity(root)
-                for name, info in page:
-                    items.append(item(os.path.join(path, name), info, parent_id))
+                # Only the visible page needs sizes and transfer identities.
+                for name, _ in page:
+                    try:
+                        info = os.stat(name, dir_fd=root, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
+                        items.append(item(os.path.join(path, name), info, parent_id))
     else:
         for selected in roots:
             try:

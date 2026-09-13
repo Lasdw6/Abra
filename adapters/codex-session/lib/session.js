@@ -1,10 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
+import { WINDOWS, execFileTree, homeDir } from '../../lib/platform.js';
 
-const execFileAsync = promisify(execFile);
 const KIND = 'dev.abra.codex.session.v1';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HASH = /^[0-9a-f]{64}$/;
@@ -147,6 +146,30 @@ function transferLockFile(codexHome, sessionId) {
   return path.join(codexHome, '.abra-teleport', 'active-locks', `${sessionId}.json`);
 }
 
+// The lock is held by a child process so that a crash releases it with the
+// process. POSIX uses perl's flock. Windows has no flock, so the helper claims
+// the name with an exclusive create, records its pid, and reclaims the file
+// only when the recorded pid is gone. Both exit 75 when someone else holds it.
+const PERL_LOCK = 'use Fcntl qw(:flock); use IO::Handle; open(my $fh, ">>", $ARGV[0]) or die $!; if (!flock($fh, LOCK_EX|LOCK_NB)) { exit 75; } STDOUT->autoflush(1); print "locked\\n"; while (<STDIN>) {}';
+const NODE_LOCK = `
+const fs = require('fs'); const file = process.argv[1];
+const claim = () => { try { fs.writeFileSync(file, String(process.pid), { flag: 'wx' }); return true; } catch (error) { if (error.code !== 'EEXIST') throw error; return false; } };
+if (!claim()) {
+  let stale = false;
+  try { const pid = Number(String(fs.readFileSync(file, 'utf8')).trim()); if (!pid) stale = true; else { try { process.kill(pid, 0); } catch (error) { stale = error.code === 'ESRCH'; } } }
+  catch { stale = true; }
+  if (stale) { try { fs.unlinkSync(file); } catch {} }
+  if (!stale || !claim()) process.exit(75);
+}
+process.on('exit', () => { try { fs.unlinkSync(file); } catch {} });
+process.stdout.write('locked\\n');
+process.stdin.resume(); process.stdin.on('end', () => process.exit(0));
+`;
+function writerLockHelper(lockPath) {
+  if (WINDOWS) return [process.execPath, ['-e', NODE_LOCK, lockPath]];
+  return [process.env.PERL_BIN || '/usr/bin/perl', ['-e', PERL_LOCK, lockPath]];
+}
+
 export async function acquireWriterLock(codexHome, sessionId) {
   if (!UUID.test(sessionId || '')) throw coded('invalid_request', 'session_id must be a UUID');
   const directory = path.join(path.resolve(codexHome), 'thread-writer-locks');
@@ -154,9 +177,8 @@ export async function acquireWriterLock(codexHome, sessionId) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await rejectSymlinkComponents(directory, path.resolve(codexHome));
   const lockPath = path.join(directory, `${sessionId}.lock`);
-  const perl = process.env.PERL_BIN || '/usr/bin/perl';
-  const script = 'use Fcntl qw(:flock); use IO::Handle; open(my $fh, ">>", $ARGV[0]) or die $!; if (!flock($fh, LOCK_EX|LOCK_NB)) { exit 75; } STDOUT->autoflush(1); print "locked\\n"; while (<STDIN>) {}';
-  const child = spawn(perl, ['-e', script, lockPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const [helper, helperArgs] = writerLockHelper(lockPath);
+  const child = spawn(helper, helperArgs, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
@@ -266,7 +288,7 @@ function workspaceFields(source) {
 
 export async function exportSession(request) {
   const source = parseSource(request.source);
-  const codexHome = path.resolve(source.codex_home || process.env.CODEX_HOME || path.join(process.env.HOME || '.', '.codex'));
+  const codexHome = path.resolve(source.codex_home || process.env.CODEX_HOME || path.join(homeDir(), '.codex'));
   const guard = await authorizedWriterGuard(codexHome, source.session_id, request.options);
   try {
   const file = await findSession(codexHome, source.session_id);
@@ -342,7 +364,7 @@ async function installedCodexVersion(options) {
   if (options?.skip_version_check === 'true') return null;
   const binary = process.env.CODEX_BIN || 'codex';
   try {
-    const { stdout } = await execFileAsync(binary, ['--version'], { timeout: 10000 });
+    const { stdout } = await execFileTree(binary, ['--version'], { timeout: 10000 });
     const match = stdout.match(/codex-cli\s+([^\s]+)/);
     if (!match) throw new Error('unexpected version output');
     return match[1];
@@ -470,7 +492,7 @@ async function readWorkspaceSession(workspace) {
  */
 export async function inspectSession(request) {
   const source = parseSource(request.source);
-  const codexHome = path.resolve(source.codex_home || process.env.CODEX_HOME || path.join(process.env.HOME || '.', '.codex'));
+  const codexHome = path.resolve(source.codex_home || process.env.CODEX_HOME || path.join(homeDir(), '.codex'));
   const file = await findSession(codexHome, source.session_id);
   const info = await stat(file);
   if (info.size > MAX_SESSION_BYTES) {
@@ -506,7 +528,9 @@ export async function controlSession(request, context = {}) {
     return { result: { session_id: sessionId, completed: false, skipped: 'set ABRA_CODEX_TEST_REAL=1 to run codex' } };
   }
   const binary = process.env.CODEX_BIN || 'codex';
-  const { stdout } = await execFileAsync(
+  // execFileTree resolves PATHEXT and tears down the whole tree on cancel;
+  // SIGTERM alone would leave a Windows `.cmd` wrapper's grandchildren running.
+  const { stdout } = await execFileTree(
     binary,
     ['exec', '--sandbox', 'workspace-write', '-C', workspace, 'resume', '--skip-git-repo-check', sessionId, request.text],
     { timeout: 9 * 60 * 1000, maxBuffer: 16 * 1024 * 1024, signal: context.signal }

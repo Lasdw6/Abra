@@ -109,6 +109,26 @@ See [Add Abra to your sandbox](docs/INTEGRATE.md) for setup steps.
 [Design](DESIGN.md) explains design choices. The [protocol specification](SPEC.md)
 defines the wire format.
 
+## Supported platforms
+
+| | Linux x86_64 / arm64 | macOS x86_64 / arm64 | Windows x86_64 |
+| --- | --- | --- | --- |
+| `abra` CLI and daemon | yes | yes | yes |
+| Files and browser adapters | yes | yes | yes |
+| Capability links, pairing, relay | yes | yes | yes |
+| `abra observe` | yes | yes | no |
+| `abra process` (CRIU checkpoints) | yes | no | no |
+| `abra-fc` (Firecracker) | yes | no | no |
+| Sandbox helper and collector | yes | no | no |
+
+On Windows the daemon's control channel is an owner-only named pipe derived
+from the store root rather than a Unix socket; `abra` finds its default store
+under `%USERPROFILE%\.abra`. Restoring a snapshot that contains symlinks needs
+Developer Mode or an elevated shell, and a snapshot whose entries use DOS
+device names (`CON`, `NUL`, `COM1`, ...) or differ only by case is rejected
+before anything is written. Node and Python adapters are launched through their
+interpreter, which `ABRA_NODE_BIN` and `ABRA_PYTHON_BIN` override.
+
 ## Status
 
 Developer alpha. Abra has local snapshot storage, restore planning, encrypted

@@ -48,7 +48,9 @@ export function createFacade({ root, userId = 'local', secret, stagingRoot = pat
 
 function publicProfile(p) { return { id: p.id, userId: p.userId, name: p.name, lastUsedAt: p.lastUsedAt, createdAt: p.createdAt, updatedAt: p.updatedAt, cookieDomains: [...new Set(p.cookieDomains || [])].sort() }; }
 function domainsFromCookies(cookies = []) { return [...new Set(cookies.map(c => String(c.domain || '').replace(/^\./, '')).filter(Boolean))]; }
-async function secureTree(target){const info=await stat(target);if(info.isDirectory()){await chmod(target,0o700);for(const name of await readdir(target))await secureTree(path.join(target,name));}else await chmod(target,0o600);}
+// Windows has no POSIX mode bits; chmod there only flips the read-only flag.
+const WINDOWS = process.platform === 'win32';
+async function secureTree(target){const info=await stat(target);if(info.isDirectory()){if(!WINDOWS)await chmod(target,0o700);for(const name of await readdir(target))await secureTree(path.join(target,name));}else if(!WINDOWS)await chmod(target,0o600);}
 async function storeBundle(source, destination, stagingRoot) { const root=await realpath(stagingRoot),resolved=await realpath(path.resolve(source));if(resolved===root||!resolved.startsWith(`${root}${path.sep}`))throw new Error('bundle is outside staging');await rm(destination,{recursive:true,force:true});await cp(resolved,destination,{recursive:true});await secureTree(destination); }
 async function bodyJson(req) { const chunks = []; for await (const c of req) chunks.push(c); if (!chunks.length) return {}; return JSON.parse(Buffer.concat(chunks)); }
 function json(res, status, value) { const body = JSON.stringify(value); res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }); res.end(body); }

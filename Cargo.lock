@@ -7,6 +7,7 @@ name = "abra-adapter"
 version = "0.1.0"
 dependencies = [
  "abra-core",
+ "dunce",
  "hex",
  "rand 0.8.8",
  "serde",
@@ -29,6 +30,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -398,6 +400,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

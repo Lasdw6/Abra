@@ -3,11 +3,12 @@ import { chmod, mkdir, readFile, stat, truncate, writeFile } from 'node:fs/promi
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp } from 'node:fs/promises';
 import { acquireWriterLock, exportSession, importSession, inspectSession, scanSecrets } from '../lib/session.js';
 
+const WINDOWS = process.platform === 'win32';
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const TS = '2026-09-02T12-34-56';
 
@@ -79,7 +80,8 @@ test('Codex adapter round trip advances an unchanged ancestor', async () => {
   const second = await adapterExport(cloud, secondBundle);
   await adapterImport(secondBundle, local, second.payload);
   assert.equal(await readFile(localFile, 'utf8'), rollout(['cloud changed it']));
-  assert.equal((await stat(localFile)).mode & 0o777, 0o600);
+  // Windows has no POSIX mode bits; chmod there only toggles the read-only flag.
+  if (!WINDOWS) assert.equal((await stat(localFile)).mode & 0o777, 0o600);
   assert.equal(second.payload.ancestor_sha256, first.payload.sha256);
 });
 
@@ -221,9 +223,22 @@ async function fakeCodex(root) {
   const bin = path.join(root, 'bin');
   await mkdir(bin, { recursive: true });
   const log = path.join(root, 'codex-argv.txt');
-  await writeFile(path.join(bin, 'codex'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${log}'\necho done\n`);
-  await chmod(path.join(bin, 'codex'), 0o755);
+  if (WINDOWS) {
+    await writeCmdShim(bin, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join('\\n') + '\\n');\nconsole.log('done');\n`);
+  } else {
+    await writeFile(path.join(bin, 'codex'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${log}'\necho done\n`);
+    await chmod(path.join(bin, 'codex'), 0o755);
+  }
   return { bin, log };
+}
+
+// Windows has no shebang, so the fake `codex` is a .cmd that hands its argv to
+// a Node script. PATHEXT and the ComSpec wrapper are what the adapter must get
+// right, so exercising them here is the point rather than an inconvenience.
+async function writeCmdShim(bin, source) {
+  const script = path.join(bin, 'codex-fake.mjs');
+  await writeFile(script, source);
+  await writeFile(path.join(bin, 'codex.cmd'), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
 }
 
 test('control instruct resumes the session recorded in the workspace', async () => {
@@ -249,7 +264,7 @@ test('control instruct resumes the session recorded in the workspace', async () 
   const { bin, log } = await fakeCodex(root);
   const instructed = await adapterRequest(
     { verb: 'control', kind: 'dev.abra.workspace', op: 'instruct', text: 'add a test', workspace, options: {} },
-    { PATH: `${bin}:${process.env.PATH}`, ABRA_CODEX_TEST_REAL: '1', CODEX_BIN: 'codex' }
+    { PATH: `${bin}${path.delimiter}${process.env.PATH}`, ABRA_CODEX_TEST_REAL: '1', CODEX_BIN: 'codex' }
   );
   assert.equal(instructed.ok, true);
   assert.deepEqual(
@@ -277,12 +292,16 @@ test('cancel over stdio stops an in-flight Codex control child', async () => {
   await mkdir(path.join(workspace, '.abra'), { recursive: true });
   await mkdir(bin, { recursive: true });
   await writeFile(path.join(workspace, '.abra', 'codex-session.json'), `${JSON.stringify({ session_id: SESSION_ID })}\n`);
-  await writeFile(path.join(bin, 'codex'), `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 60\n`);
-  await chmod(path.join(bin, 'codex'), 0o755);
+  if (WINDOWS) {
+    await writeCmdShim(bin, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetTimeout(() => {}, 60_000);\n`);
+  } else {
+    await writeFile(path.join(bin, 'codex'), `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 60\n`);
+    await chmod(path.join(bin, 'codex'), 0o755);
+  }
 
   const child = spawn(process.execPath, [ADAPTER], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CODEX_BIN: 'codex', ABRA_CODEX_TEST_REAL: '1' }
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, CODEX_BIN: 'codex', ABRA_CODEX_TEST_REAL: '1' }
   });
   const replies = [];
   child.stdout.setEncoding('utf8');
@@ -311,7 +330,9 @@ test('inspect warns per secret finding and blocks an oversized session', async (
   assert.equal(report.warnings[0].code, 'possible_secret');
   assert.match(report.warnings[0].message, /openai-key/);
 
-  // Sparse: the file only has to report a size over the limit.
+  // Sparse: the file only has to report a size over the limit. NTFS allocates
+  // on truncate unless the sparse flag is set first.
+  if (WINDOWS) spawnSync('fsutil', ['sparse', 'setflag', file], { stdio: 'ignore', windowsHide: true });
   await truncate(file, 512 * 1024 * 1024 + 1);
   const oversized = await inspectSession({ source: { session_id: SESSION_ID, codex_home: home }, options: {} });
   assert.equal(oversized.warnings.length, 0);

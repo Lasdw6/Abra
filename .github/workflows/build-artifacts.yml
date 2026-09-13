@@ -25,6 +25,9 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
             firecracker: false
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            firecracker: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -36,28 +39,54 @@ jobs:
       - name: Build Firecracker adapter
         if: matrix.firecracker
         run: cargo build --release --locked --target ${{ matrix.target }} -p abra-fc
-      - name: Create archive and checksum
+      - name: Stage archive contents
         shell: bash
         run: |
           mkdir -p dist/stage
-          cp target/${{ matrix.target }}/release/abra dist/stage/
-          cp target/${{ matrix.target }}/release/abra-relay dist/stage/
+          suffix=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          cp target/${{ matrix.target }}/release/abra$suffix dist/stage/
+          cp target/${{ matrix.target }}/release/abra-relay$suffix dist/stage/
           if [[ "${{ matrix.firecracker }}" == "true" ]]; then
             cp target/${{ matrix.target }}/release/abra-fc dist/stage/
           fi
           cp -R adapters dist/stage/
           cp -R docs dist/stage/
           cp LICENSE-APACHE LICENSE-MIT README.md DESIGN.md SPEC.md dist/stage/
+      - name: Create archive and checksum
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
           tar -C dist/stage -czf dist/abra-${{ matrix.target }}.tar.gz .
           if command -v sha256sum >/dev/null; then
             (cd dist && sha256sum abra-${{ matrix.target }}.tar.gz > abra-${{ matrix.target }}.tar.gz.sha256)
           else
             (cd dist && shasum -a 256 abra-${{ matrix.target }}.tar.gz > abra-${{ matrix.target }}.tar.gz.sha256)
           fi
+      # Windows users get a zip: it unpacks without extra tooling and keeps the
+      # same layout as the tarballs.
+      - name: Create zip and checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/stage/* -DestinationPath dist/abra-windows-x86_64.zip
+          $hash = (Get-FileHash dist/abra-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  abra-windows-x86_64.zip" | Out-File -Encoding ascii dist/abra-windows-x86_64.zip.sha256
       - uses: actions/upload-artifact@v7
+        if: runner.os != 'Windows'
         with:
           name: abra-${{ matrix.target }}
           path: |
             dist/abra-${{ matrix.target }}.tar.gz
             dist/abra-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: abra-${{ matrix.target }}
+          path: |
+            dist/abra-windows-x86_64.zip
+            dist/abra-windows-x86_64.zip.sha256
           if-no-files-found: error

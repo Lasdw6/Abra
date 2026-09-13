@@ -58,15 +58,18 @@ capture when the sandbox denied seccomp suspension. See the
 ## Build distributable binaries
 
 The manually triggered `Build release artifacts` workflow builds native Linux
-and macOS binaries for x86_64 and ARM. Its archives contain `abra`, `abra-relay`,
-the adapters, documentation and licenses. Linux archives also contain `abra-fc`. `cadabra` is a
-library used by `abra daemon`, not a separate executable.
+and macOS binaries for x86_64 and ARM, and a native Windows x86_64 build. Its
+archives contain `abra`, `abra-relay`, the adapters, documentation and licenses.
+Linux archives also contain `abra-fc`. `cadabra` is a library used by
+`abra daemon`, not a separate executable.
 
 The workflow uploads archives and SHA-256 files as CI artifacts without publishing
 a release. Linux GNU artifacts require a compatible libc; their target triple is
 part of the filename. Test the oldest supported distribution or build musl
-artifacts before promising broader Linux compatibility. Native Windows core
-distribution is not part of this workflow.
+artifacts before promising broader Linux compatibility. The Windows target ships
+as `abra-windows-x86_64.zip` holding `abra.exe`, `abra-relay.exe` and the same
+adapters and documentation; CRIU, `abra observe`, `abra-fc` and the sandbox
+collector are Linux-only and are absent from it.
 
 Before publishing, install an archive on a fresh machine and test pairing,
 snapshot delivery, restore planning, materialization, restart and peer removal.

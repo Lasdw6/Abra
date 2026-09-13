@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,6 +12,8 @@ ADAPTER = Path(__file__).resolve().parents[1] / "files.py"
 spec = importlib.util.spec_from_file_location("files_adapter", ADAPTER)
 files_adapter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(files_adapter)
+WINDOWS = sys.platform == "win32"
+MISSING_FILE = "cannot find the (file|path)" if WINDOWS else "No such file"
 
 
 class FilesTest(unittest.TestCase):
@@ -26,7 +29,7 @@ class FilesTest(unittest.TestCase):
 
     def call(self, verb, **fields):
         request = {"protocol": "abra-adapter/1", "request_id": "test", "verb": verb, **fields}
-        result = subprocess.run([str(ADAPTER)], input=json.dumps(request) + "\n", text=True, capture_output=True, env={**os.environ, "ABRA_FILES_ROOT": str(self.root)}, check=True)
+        result = subprocess.run([sys.executable, str(ADAPTER)], input=json.dumps(request) + "\n", text=True, capture_output=True, env={**os.environ, "ABRA_FILES_ROOT": str(self.root)}, check=True)
         response = json.loads(result.stdout)
         self.assertEqual(response["request_id"], "test")
         return response
@@ -68,6 +71,9 @@ class FilesTest(unittest.TestCase):
         def read_stat(name, **kwargs):
             if kwargs.get("dir_fd") is not None:
                 detailed_reads.append(name)
+            elif kwargs.get("follow_symlinks") is False and os.path.dirname(str(name)) == str(self.root):
+                # Without dir_fd the adapter stats the joined child path.
+                detailed_reads.append(os.path.basename(str(name)))
             return original_stat(name, **kwargs)
 
         with patch.dict(os.environ, {"ABRA_FILES_ROOT": str(self.root)}), \
@@ -84,7 +90,8 @@ class FilesTest(unittest.TestCase):
         original_stat = os.stat
 
         def replace_before_stat(name, **kwargs):
-            if name == "selected" and kwargs.get("dir_fd") is not None:
+            child = kwargs.get("dir_fd") is not None or os.path.dirname(str(name)) == str(self.root)
+            if os.path.basename(str(name)) == "selected" and child:
                 selected.unlink()
                 selected.symlink_to(self.base)
             return original_stat(name, **kwargs)
@@ -115,7 +122,9 @@ class FilesTest(unittest.TestCase):
             repeated = self.call("import", materialized_files=exported["files_path"], destination=str(target))
             self.assertEqual(repeated["error"]["code"], "conflict")
         self.assertEqual((target / "note.txt").read_bytes(), b"hello\x00world")
-        self.assertEqual((target / "project/run.sh").stat().st_mode & 0o777, 0o755)
+        if not WINDOWS:
+            # Windows has no POSIX permission bits to carry across.
+            self.assertEqual((target / "project/run.sh").stat().st_mode & 0o777, 0o755)
         self.assertTrue((target / "project/empty").is_dir())
         self.assertEqual((target / "unrelated").read_text(), "keep")
         self.assertEqual((self.root / "note.txt").read_bytes(), b"hello\x00world")
@@ -154,7 +163,7 @@ class FilesTest(unittest.TestCase):
     def test_missing_path_reports_error_and_pagination_reaches_all_items(self):
         self.root.rmdir()
         missing = self.call("inventory")
-        self.assertIn("No such file", missing["error"])
+        self.assertRegex(missing["error"], MISSING_FILE)
         self.assertEqual(missing["context"]["shape"], "tree")
         self.assertTrue(missing["context"]["destination"])
         self.assertFalse(self.root.exists())
@@ -197,7 +206,9 @@ class FilesTest(unittest.TestCase):
         folder.mkdir()
         (folder / "escape").symlink_to(self.base)
         (self.root / "link").symlink_to(self.base)
-        os.mkfifo(self.root / "pipe")
+        if not WINDOWS:
+            # Windows has no FIFOs; the reparse-point test covers its analogue.
+            os.mkfifo(self.root / "pipe")
         items = self.call("inventory")["items"]
         self.assertEqual([i["label"] for i in items], ["folder"])
         self.assertFalse(self.capture(items[0]["source"])["ok"])
@@ -216,7 +227,9 @@ class FilesTest(unittest.TestCase):
         item = self.call("inventory")["items"][0]
         self.assertEqual(self.capture(item["source"])["error"]["code"], "limit_exceeded")
         file.unlink()
-        (self.root / "line\nbreak").touch()
+        # Windows rejects control characters in file names, so use a Unicode
+        # format character, which `display` blanks out the same way.
+        (self.root / ("line­break" if WINDOWS else "line\nbreak")).touch()
         item = self.call("inventory")["items"][0]
         self.assertEqual(item["label"], "line break")
         self.assertTrue(self.capture(item["source"])["ok"])
@@ -234,6 +247,46 @@ class FilesTest(unittest.TestCase):
         result = self.call("import", materialized_files=str(materialized), destination=str(target))
         self.assertEqual(result["error"]["code"], "conflict")
         self.assertTrue((target / "file").is_symlink())
+
+    @unittest.skipUnless(WINDOWS, "junctions are a Windows reparse point")
+    def test_windows_junction_is_hidden_and_refused(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("secret")
+        junction = self.root / "junction"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(outside)], check=True, capture_output=True)
+        self.assertTrue(junction.exists())
+        self.assertTrue(files_adapter.reparse_point(os.stat(junction, follow_symlinks=False)))
+        listed = self.call("inventory")
+        self.assertEqual([item["label"] for item in listed["items"]], [])
+        folder = self.root / "folder"
+        folder.mkdir()
+        inside = folder / "inside-junction"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(inside), str(outside)], check=True, capture_output=True)
+        item = self.call("inventory")["items"][0]
+        self.assertEqual(item["label"], "folder")
+        refused = self.capture(item["source"])
+        self.assertEqual(refused["error"]["code"], "permission_denied")
+
+    @unittest.skipUnless(WINDOWS, "exercises the Windows no-replace rename")
+    def test_windows_publish_is_atomic_and_never_replaces(self):
+        source = self.base / "publish-source"
+        source.mkdir()
+        (source / "name").write_text("new")
+        target = self.base / "publish-target"
+        target.mkdir()
+        with files_adapter.directory(str(source)) as staged, files_adapter.directory(str(target)) as root:
+            self.assertIsInstance(staged, str)
+            files_adapter.publish_entry(staged, root, "name")
+        self.assertEqual((target / "name").read_text(), "new")
+        self.assertFalse((source / "name").exists())
+        (source / "name").write_text("second")
+        with files_adapter.directory(str(source)) as staged, files_adapter.directory(str(target)) as root:
+            with self.assertRaises(files_adapter.Failure) as raised:
+                files_adapter.publish_entry(staged, root, "name")
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual((target / "name").read_text(), "new")
+        self.assertEqual((source / "name").read_text(), "second")
 
 
 if __name__ == "__main__":

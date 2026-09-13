@@ -59,6 +59,7 @@ impl AbraStore {
             #[cfg(unix)]
             builder.mode(0o700);
             builder.create(&root).map_err(|e| Error::io(&root, e))?;
+            crate::util::restrict_to_owner(&root)?;
         }
         #[cfg(unix)]
         {
@@ -90,14 +91,18 @@ impl AbraStore {
             "capsules", "inbox", "outbox", "keys", "objects", "tmp", "net",
         ] {
             let path = root.join(d);
+            let fresh = !path.exists();
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
             #[cfg(unix)]
             builder.mode(0o700);
             builder.create(&path).map_err(|e| Error::io(&path, e))?;
-            #[cfg(unix)]
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::io(&path, e))?;
+            // Unix re-asserts the mode on every open. On Windows the entry is
+            // inherited from the store root, so only a new directory needs the
+            // call, which spawns a process.
+            if fresh || cfg!(unix) {
+                crate::util::restrict_to_owner(&path)?;
+            }
         }
         let cas = BlobStore::open(&root)?;
         let keys = DeviceKeys::load_or_generate(root.join("keys/device.json"))?;

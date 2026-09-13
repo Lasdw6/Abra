@@ -1,7 +1,11 @@
 //! Library-first Abra daemon and its newline-delimited JSON control API.
-#![forbid(unsafe_code)]
+// The Windows control transport needs a handful of Win32 calls; every other
+// module in this crate stays free of `unsafe`.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
 pub mod adapters;
 pub mod background;
+pub mod local;
 pub mod relay;
 
 use abra_core::{
@@ -24,21 +28,23 @@ use abra_net::{
 };
 #[cfg(feature = "iroh")]
 use abra_net::{IrohRelayMode, IrohTransport};
+use local::{LocalListener, LocalStream};
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+#[cfg(unix)]
+use std::io::Write;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     sync::{watch, Mutex, Semaphore},
     task::JoinHandle,
 };
@@ -419,7 +425,7 @@ impl Daemon {
         })
     }
 
-    async fn bind_control_socket(&self) -> Result<(PathBuf, UnixListener, File)> {
+    async fn bind_control_socket(&self) -> Result<(PathBuf, LocalListener, File)> {
         let socket = self.root.join("cadabra.sock");
         if socket.exists()
             && tokio::time::timeout(
@@ -448,7 +454,7 @@ impl Daemon {
         }
         #[cfg(unix)]
         let old_umask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
-        let listener_result = UnixListener::bind(&socket);
+        let listener_result = LocalListener::bind(&socket);
         #[cfg(unix)]
         rustix::process::umask(old_umask);
         let listener = listener_result?;
@@ -460,7 +466,7 @@ impl Daemon {
         Ok((socket, listener, lock))
     }
 
-    fn spawn_control_server(self: &Arc<Self>, listener: UnixListener) -> JoinHandle<()> {
+    fn spawn_control_server(self: &Arc<Self>, listener: LocalListener) -> JoinHandle<()> {
         let daemon = Arc::clone(self);
         let clients = Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS));
         let mut stop = self.shutdown.subscribe();
@@ -469,7 +475,7 @@ impl Daemon {
                 tokio::select! {
                     _ = stop.changed() => break,
                     accepted = listener.accept() => match accepted {
-                        Ok((stream, _)) => {
+                        Ok(stream) => {
                             let daemon = Arc::clone(&daemon);
                             let clients = Arc::clone(&clients);
                             tokio::spawn(async move {
@@ -757,15 +763,12 @@ impl Daemon {
         Ok(count)
     }
 
-    async fn serve_client(&self, stream: UnixStream) -> Result<()> {
+    async fn serve_client(&self, stream: LocalStream) -> Result<()> {
         #[cfg(unix)]
-        {
-            let peer = stream.peer_cred()?;
-            if peer.uid() != rustix::process::geteuid().as_raw() {
-                return Err("control client uid differs from daemon uid".into());
-            }
+        if stream.peer_uid()? != rustix::process::geteuid().as_raw() {
+            return Err("control client uid differs from daemon uid".into());
         }
-        let (read, mut write) = stream.into_split();
+        let (read, mut write) = tokio::io::split(stream);
         let mut reader = BufReader::new(read);
         loop {
             let mut bytes = Vec::new();
@@ -821,7 +824,7 @@ impl Daemon {
         Ok(())
     }
 
-    async fn serve_watch(&self, write: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    async fn serve_watch(&self, write: &mut (impl AsyncWriteExt + Unpin)) -> Result<()> {
         use std::io::{Read, Seek, SeekFrom};
         let path = self.root.join("net/events.ndjson");
         let mut sent = 0u64;
@@ -3809,8 +3812,8 @@ fn string_or(value: &Value, key: &str, default: &str) -> String {
 
 /// Send one NDJSON request to a daemon socket.
 pub async fn control_call(root: impl AsRef<Path>, request: &Value) -> Result<Value> {
-    let stream = UnixStream::connect(root.as_ref().join("cadabra.sock")).await?;
-    let (read, mut write) = stream.into_split();
+    let stream = LocalStream::connect(root.as_ref().join("cadabra.sock")).await?;
+    let (read, mut write) = tokio::io::split(stream);
     write
         .write_all(serde_json::to_string(request)?.as_bytes())
         .await?;

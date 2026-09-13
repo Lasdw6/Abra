@@ -263,6 +263,10 @@ async fn write_json_response(
         )
         .await?;
     stream.write_all(&body).await?;
+    // Every response is `Connection: close`. Half-closing sends a FIN so the
+    // peer reads the body instead of a reset when the socket is dropped with
+    // an unread request still buffered.
+    stream.shutdown().await?;
     Ok(())
 }
 
@@ -285,6 +289,12 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
             .await
             .expect("server waited for a request body")
+            // Windows reports a reset once the server has closed a connection
+            // whose request it deliberately stopped reading.
+            .or_else(|error| match error.kind() {
+                std::io::ErrorKind::ConnectionReset => Ok(0),
+                _ => Err(error),
+            })
             .unwrap();
         server.await.unwrap();
         response.truncate(read);

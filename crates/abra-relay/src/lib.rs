@@ -385,10 +385,16 @@ fn parse_envelope(envelope: &[u8], max: usize) -> Result<OpaqueEnvelope, String>
     Ok(parsed)
 }
 
+/// Unix needs a directory fsync for a rename to survive a crash. Windows
+/// cannot open a directory as a file and orders the metadata itself.
 fn sync_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
     File::open(path)
         .and_then(|dir| dir.sync_all())
-        .map_err(|e| format!("cannot sync relay data directory {}: {e}", path.display()))
+        .map_err(|e| format!("cannot sync relay data directory {}: {e}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {

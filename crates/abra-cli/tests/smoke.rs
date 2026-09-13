@@ -1,12 +1,11 @@
-#![cfg(unix)]
-
+use cadabra::local::LocalStream;
 use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    path::Path,
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -16,14 +15,11 @@ impl Drop for ChildGuard {
     }
 }
 
-#[test]
-fn uds_rejects_oversize_line() {
-    let root = tempfile::tempdir().unwrap();
-    let binary = env!("CARGO_BIN_EXE_abra");
-    let child = Command::new(binary)
+fn spawn_daemon(root: &Path) -> ChildGuard {
+    let child = Command::new(env!("CARGO_BIN_EXE_abra"))
         .args([
             "--root",
-            root.path().to_str().unwrap(),
+            root.to_str().unwrap(),
             "daemon",
             "--yes",
             "--transport",
@@ -33,41 +29,42 @@ fn uds_rejects_oversize_line() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let _guard = ChildGuard(child);
-    let socket = root.path().join("cadabra.sock");
+    ChildGuard(child)
+}
+
+/// The control transport is a socket on Unix and a named pipe on Windows, so
+/// readiness is a successful connection rather than a file appearing.
+async fn connect_when_ready(root: &Path) -> LocalStream {
+    let socket = root.join("cadabra.sock");
     for _ in 0..200 {
-        if socket.exists() {
-            break;
+        if let Ok(stream) = LocalStream::connect(&socket).await {
+            return stream;
         }
-        thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut stream = UnixStream::connect(socket).unwrap();
-    stream.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    panic!("daemon control transport did not become ready")
+}
+
+#[tokio::test]
+async fn control_transport_rejects_oversize_line() {
+    let root = tempfile::tempdir().unwrap();
+    let _guard = spawn_daemon(root.path());
+    let stream = connect_when_ready(root.path()).await;
+    let (read, mut write) = tokio::io::split(stream);
+    write.write_all(&vec![b'x'; 1024 * 1024 + 1]).await.unwrap();
+    write.flush().await.unwrap();
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
+    BufReader::new(read).read_line(&mut response).await.unwrap();
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response["ok"], false);
     assert_eq!(response["error"], "request too large");
 }
 
 #[test]
-fn real_cli_round_trips_status_over_uds() {
+fn real_cli_round_trips_status_over_the_control_transport() {
     let root = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_abra");
-    let child = Command::new(binary)
-        .args([
-            "--root",
-            root.path().to_str().unwrap(),
-            "daemon",
-            "--yes",
-            "--transport",
-            "tcp",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let _guard = ChildGuard(child);
+    let _guard = spawn_daemon(root.path());
     for _ in 0..100 {
         let output = Command::new(binary)
             .args(["--root", root.path().to_str().unwrap(), "--json", "status"])
@@ -84,6 +81,9 @@ fn real_cli_round_trips_status_over_uds() {
     panic!("daemon socket did not become ready")
 }
 
+/// `observe` reads `/proc` and drives fd-relative syscalls; it has no Windows
+/// counterpart.
+#[cfg(unix)]
 #[test]
 fn rust_observation_round_trips_through_cli_and_signed_manifest() {
     let root = tempfile::tempdir().unwrap();
@@ -91,20 +91,7 @@ fn rust_observation_round_trips_through_cli_and_signed_manifest() {
     let fake_proc = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_abra");
-    let child = Command::new(binary)
-        .args([
-            "--root",
-            root.path().to_str().unwrap(),
-            "daemon",
-            "--yes",
-            "--transport",
-            "tcp",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let _guard = ChildGuard(child);
+    let _guard = spawn_daemon(root.path());
     for _ in 0..200 {
         if root.path().join("cadabra.sock").exists() {
             break;

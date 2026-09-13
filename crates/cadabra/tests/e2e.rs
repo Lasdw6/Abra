@@ -1,15 +1,11 @@
-#![cfg(unix)]
-
 use abra_net::LoopbackNetwork;
 use cadabra::{control_call, Daemon};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    os::unix::fs::{symlink, PermissionsExt},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+// Adapter fixtures written as `/bin/sh` scripts, symlinks and mode bits only
+// exist on Unix; the tests that need them are gated one by one.
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 
 async fn wait_for<F, Fut>(mut check: F) -> Value
 where
@@ -44,6 +40,7 @@ async fn relay_add_keeps_configured_deposit_and_polling_tuning() {
     assert_eq!(config.relay_poll_seconds, 5);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn failed_adapter_import_keeps_inbox_unread_and_reports_materialized_path() {
     let network = LoopbackNetwork::default();
@@ -134,6 +131,7 @@ printf '{"request_id":"%s","ok":false,"error":{"code":"import_failed"}}\n' "$id"
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn accept_no_import_materializes_and_marks_read_without_running_the_adapter() {
     let network = LoopbackNetwork::default();
@@ -213,7 +211,9 @@ async fn tcp_daemon_writes_port_and_opens_control_socket_under_three_seconds() {
     assert_ne!(port, 0);
 
     let running = daemon.start().await.unwrap();
-    assert!(root.path().join("cadabra.sock").exists());
+    control_call(root.path(), &json!({"op":"status"}))
+        .await
+        .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "TCP daemon startup took {:?}",
@@ -807,6 +807,7 @@ async fn control_lease_ops_see_capsule_committed_after_daemon_start() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemons_pair_sync_handoff_and_resume_outbox() {
     let network = LoopbackNetwork::default();
@@ -1223,6 +1224,7 @@ async fn reciprocal_forward_grants_do_not_bounce_deliveries() {
 }
 
 /// Write a shell adapter that answers one request and exits.
+#[cfg(unix)]
 fn shell_adapter(
     dir: &Path,
     name: &str,
@@ -1281,10 +1283,12 @@ print(json.dumps(result))
 "#
     };
     fs::write(&executable, body).unwrap();
+    #[cfg(unix)]
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
     dir.to_path_buf()
 }
 
+#[cfg(unix)]
 const EXPORT_BODY: &str = r###"read line
 id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
 staging=$(printf '%s' "$line" | sed -n 's/.*"staging_dir":"\([^"]*\)".*/\1/p')
@@ -1292,6 +1296,7 @@ printf 'session bytes' > "$staging/session.txt"
 printf '{"request_id":"%s","ok":true,"payload":{"schema":"test/1"},"files_path":"%s","floor":{"title":"linked handoff"}}\n' "$id" "$staging"
 "###;
 
+#[cfg(unix)]
 fn import_body(capture: &Path) -> String {
     format!(
         r###"read line
@@ -1315,7 +1320,7 @@ async fn pair_daemons(a: &Arc<Daemon>, b: &Arc<Daemon>) {
 
 fn private_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    abra_core::util::restrict_to_owner(root.path()).unwrap();
     root
 }
 
@@ -1444,6 +1449,7 @@ async fn inbox_filters_and_waits_and_accept_latest_picks_the_one_unread_match() 
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn linked_handoff_restores_the_workspace_before_the_adapter_import() {
     let network = LoopbackNetwork::default();
@@ -1555,6 +1561,7 @@ async fn linked_handoff_restores_the_workspace_before_the_adapter_import() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn adapter_provenance_enqueues_the_full_snapshot_first() {
     let network = LoopbackNetwork::default();
@@ -1623,6 +1630,7 @@ printf '{{"request_id":"%s","ok":true,"payload":{{"schema":"test/1"}},"provenanc
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failed_linked_import_restores_the_previous_workspace() {
     let network = LoopbackNetwork::default();
@@ -1944,6 +1952,7 @@ async fn handoffs_summarizes_sends_and_receives_per_kind() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn flag_and_env_adapter_directories_join_discovery_without_persisting() {
     let root = private_root();
@@ -2106,6 +2115,7 @@ async fn control_reaches_the_adapter_that_claims_the_capsule_kind() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn slow_inbound_control_does_not_block_local_status() {
     let network = LoopbackNetwork::default();
@@ -2209,6 +2219,7 @@ async fn control_without_an_adapter_refuses_instruct_and_records_pause() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn auto_accept_runs_the_importer_and_forwards_to_the_next_peer() {
     let network = LoopbackNetwork::default();
@@ -2442,6 +2453,7 @@ async fn inventory_lists_one_or_all_adapters_and_keeps_failures_local() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn accept_returns_the_adapter_import_result() {
     let network = LoopbackNetwork::default();
@@ -2699,6 +2711,7 @@ async fn replace_skips_guards_when_snapshot_id_is_absent() {
     a_run.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn linked_accept_refuses_a_dirty_workspace() {
     let network = LoopbackNetwork::default();

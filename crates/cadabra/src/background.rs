@@ -45,11 +45,7 @@ impl PidFile {
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = pid_path(root);
         fs::write(&path, serde_json::to_vec(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
+        abra_core::util::restrict_to_owner(&path)?;
         Ok(())
     }
     pub fn remove(root: &Path) -> Result<()> {
@@ -62,6 +58,7 @@ impl PidFile {
 }
 
 /// A pid we cannot signal but that exists is still alive.
+#[cfg(unix)]
 pub fn is_alive(pid: i32) -> bool {
     let Some(pid) = rustix::process::Pid::from_raw(pid) else {
         return false;
@@ -74,6 +71,7 @@ pub fn is_alive(pid: i32) -> bool {
 
 /// `(start time, command line)` as `ps` reports them. Pid reuse is the reason
 /// both are checked before a signal is sent.
+#[cfg(unix)]
 pub fn process_identity(pid: i32) -> Option<(String, String)> {
     let output = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="])
@@ -138,8 +136,7 @@ pub async fn stop(root: &Path) -> Result<Value> {
         )
         .into());
     }
-    let pid = rustix::process::Pid::from_raw(record.pid).ok_or("invalid recorded pid")?;
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    terminate(record.pid)?;
     let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
     while is_alive(record.pid) {
         if tokio::time::Instant::now() >= deadline {
@@ -160,9 +157,113 @@ pub async fn stop(root: &Path) -> Result<Value> {
 /// there does not reach it. The re-executed child calls this itself, which
 /// keeps the parent free of `pre_exec` and unsafe code.
 pub fn detach_from_terminal() {
+    #[cfg(unix)]
     if std::env::var_os("ABRA_DAEMON_DETACH").is_some() {
         let _ = rustix::process::setsid();
     }
+}
+
+/// Ask the recorded daemon to exit.
+#[cfg(unix)]
+fn terminate(pid: i32) -> Result<()> {
+    let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid recorded pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    Ok(())
+}
+
+/// Windows cannot send another process a `SIGTERM`, so `taskkill` asks first
+/// and only then forces the process and its children down.
+#[cfg(windows)]
+fn terminate(pid: i32) -> Result<()> {
+    let pid = pid.to_string();
+    if taskkill(&["/PID", &pid]).is_ok_and(|success| success) {
+        return Ok(());
+    }
+    if taskkill(&["/PID", &pid, "/T", "/F"])? {
+        return Ok(());
+    }
+    Err(format!("could not terminate daemon pid {pid}").into())
+}
+
+#[cfg(windows)]
+fn taskkill(args: &[&str]) -> Result<bool> {
+    Ok(windows_command("taskkill.exe")
+        .args(args)
+        .output()?
+        .status
+        .success())
+}
+
+/// A console-less child: `abra stop` must not flash a window when it runs from
+/// a GUI application.
+#[cfg(windows)]
+fn windows_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+/// `CREATE_NO_WINDOW`.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `DETACHED_PROCESS`: the child keeps running after its launcher's console
+/// closes, which is the Windows counterpart of `setsid`.
+#[cfg(windows)]
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// An open handle whose exit code is still `STILL_ACTIVE` is a live process.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn is_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: a failed open returns null, which is checked before use, and the
+    // handle is closed on every path below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut code = 0u32;
+    // SAFETY: `handle` is live and `code` is a valid out-pointer.
+    let read = unsafe { GetExitCodeProcess(handle, &mut code) };
+    // SAFETY: `handle` came from `OpenProcess` and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    read != 0 && code == STILL_ACTIVE as u32
+}
+
+/// The Windows answer to `ps -o lstart= -o command=`. `Get-CimInstance` is the
+/// only supported way to read another process' command line.
+#[cfg(windows)]
+pub fn process_identity(pid: i32) -> Option<(String, String)> {
+    if pid <= 0 {
+        return None;
+    }
+    let script = [
+        &format!("$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}';"),
+        "if (-not $p) { exit 1 };",
+        "@{ started_at = $p.CreationDate.ToUniversalTime().ToString('o');",
+        "command = $p.CommandLine } | ConvertTo-Json -Compress",
+    ]
+    .join(" ");
+    let output = windows_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some((
+        value["started_at"].as_str()?.to_owned(),
+        value["command"].as_str()?.to_owned(),
+    ))
 }
 
 #[cfg(test)]

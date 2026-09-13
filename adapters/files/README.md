@@ -1,7 +1,8 @@
 # Files adapter
 
 `dev.abra.files` exposes `dev.abra.files.v1` through the standard
-`abra-adapter/1` NDJSON protocol. Python 3.9 or newer on macOS/Linux is required.
+`abra-adapter/1` NDJSON protocol. Python 3.9 or newer on Windows, macOS, or
+Linux is required.
 Abra core handles packing, transport, verification, and materialization.
 
 Browse existing folders on a device, select files or folders, and choose the
@@ -59,6 +60,28 @@ Regular contents, empty folders, and ordinary permission bits are preserved.
 Ownership, ACLs, extended attributes, timestamps, hard-link identity, and special
 permission bits are not preserved. Sources should stop changing for a consistent
 copy; this is not a filesystem snapshot.
+
+## Platform differences
+
+macOS and Linux open every entry through a directory descriptor with
+`O_NOFOLLOW`, so a symlink swapped in mid-transfer cannot be followed at all,
+and each top-level entry is published with `renameat2`/`renameatx_np`, which
+fails rather than replace an existing name.
+
+Windows has neither directory descriptors nor `O_NOFOLLOW`. There the adapter
+checks `lstat` before it opens or walks an entry and refuses anything that is a
+symlink or carries `FILE_ATTRIBUTE_REPARSE_POINT`, which covers junctions; it
+then re-checks the entry identity after the copy. A swap during the copy is
+therefore detected afterwards rather than prevented, which is a narrower
+guarantee than the descriptor walk. Publishing uses `os.rename`, which on
+Windows is `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`: one atomic call
+that reports a conflict instead of overwriting.
+
+POSIX permission bits are preserved on macOS and Linux and are not set on
+Windows, which has no equivalent. Drive and UNC share roots such as `C:\` list
+like `/` does: they can be opened but not transferred whole. Incoming `source`
+and `destination` paths accept either separator; absolute paths come back in
+native form.
 
 Run disposable fixture tests:
 

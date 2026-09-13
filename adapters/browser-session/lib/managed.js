@@ -1,10 +1,11 @@
 import { access, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { browserWebSocketFromUrl } from './cdp.js';
 import { dataDir, readJson, writeJson } from './util.js';
+import { WINDOWS, resolveExecutable } from '../../lib/platform.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,16 +18,36 @@ export async function exists(file) {
 }
 
 async function executableOnPath(name) {
+  if (WINDOWS) return resolveExecutable(name);
   try {
     const { stdout } = await execFileAsync('/usr/bin/which', [name]);
     return stdout.trim().split(/\r?\n/)[0] || null;
   } catch { return null; }
 }
 
+// Windows records the installed browser under App Paths. Reading it is a
+// best-effort last resort: a missing key or a missing reg.exe just means the
+// caller falls through to "set CHROME_BIN".
+function chromeFromRegistry() {
+  if (!WINDOWS) return null;
+  const result = spawnSync('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe', '/ve'], { encoding: 'utf8', windowsHide: true });
+  if (result.error || result.status !== 0) return null;
+  const match = String(result.stdout).match(/REG_SZ\s+(.+?)\s*$/m);
+  return match ? match[1].replace(/^"|"$/g, '') : null;
+}
+
+function windowsChromeCandidates() {
+  const relative = path.join('Google', 'Chrome', 'Application', 'chrome.exe');
+  return [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA]
+    .filter(Boolean)
+    .map(root => path.join(root, relative));
+}
+
 export async function chromeBinary() {
   const candidates = [
     process.env.CHROME_BIN,
     process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : null,
+    ...(WINDOWS ? [...windowsChromeCandidates(), await executableOnPath('chrome'), chromeFromRegistry()] : []),
     await executableOnPath('google-chrome'),
     await executableOnPath('google-chrome-stable'),
     await executableOnPath('chromium'),
@@ -42,8 +63,26 @@ export function isProcessAlive(pid) {
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 }
 
+// Windows has no ps. CIM gives the same two facts - when a process started and
+// what command line it was given - in a form that is stable to parse.
+const WINDOWS_PROCESS_QUERY = 'Get-CimInstance Win32_Process | ForEach-Object { "{0}`t{1}`t{2}" -f $_.ProcessId, $_.CreationDate.ToString("o"), ($_.CommandLine -replace "[`r`n`t]", " ") }';
+
+async function windowsProcesses() {
+  const result = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESS_QUERY], { maxBuffer: 8 * 1024 * 1024, windowsHide: true }).catch(() => null);
+  if (!result) return [];
+  return String(result.stdout).split(/\r?\n/).flatMap(line => {
+    const [pid, started, ...rest] = line.split('\t');
+    const id = Number(pid);
+    return Number.isSafeInteger(id) && id > 0 ? [{ pid: id, started_at: started || '', command: rest.join('\t') }] : [];
+  });
+}
+
 export async function processIdentity(pid) {
   if (!isProcessAlive(pid)) return null;
+  if (WINDOWS) {
+    const found = (await windowsProcesses()).find(entry => entry.pid === pid);
+    return found && found.command ? { started_at: found.started_at, command: found.command } : null;
+  }
   const { stdout } = await execFileAsync('/bin/ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'command=']);
   const match = stdout.trim().match(/^(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+([\s\S]+)$/);
   if (!match) return null;
@@ -52,8 +91,9 @@ export async function processIdentity(pid) {
 
 async function chromePids(profileDir) {
   if (!profileDir) return [];
-  const { stdout } = await execFileAsync('/bin/ps', ['-ax', '-o', 'pid=', '-o', 'command=']);
   const marker = `--user-data-dir=${profileDir}`;
+  if (WINDOWS) return (await windowsProcesses()).filter(entry => entry.command.includes(marker)).map(entry => entry.pid);
+  const { stdout } = await execFileAsync('/bin/ps', ['-ax', '-o', 'pid=', '-o', 'command=']);
   return stdout.split('\n').flatMap(line => {
     const match = line.match(/^\s*(\d+)\s+([\s\S]+)$/);
     return match && match[2].includes(marker) ? [Number(match[1])] : [];
@@ -69,16 +109,26 @@ async function waitForChromeExit(pids, profileDir, timeoutMs) {
   return !pids.some(isProcessAlive) && !(await chromePids(profileDir)).length;
 }
 
+// Chrome exits gracefully on SIGTERM. Windows has no such signal: node's
+// process.kill there is an immediate TerminateProcess of that one process, so
+// the renderer and GPU children would be orphaned. `taskkill /T` is the closest
+// equivalent, and callers that hold a CDP connection should ask the browser to
+// close itself before reaching this.
+function requestExit(processId) {
+  if (WINDOWS) { spawnSync('taskkill', ['/PID', String(processId), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); return; }
+  try { process.kill(processId, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
+function forceExit(processId) {
+  if (WINDOWS) { spawnSync('taskkill', ['/PID', String(processId), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); return; }
+  try { process.kill(processId, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
+
 export async function stopChrome(pid, profileDir, timeoutMs = 5000) {
   const initial = new Set([pid, ...await chromePids(profileDir)].filter(value => Number.isSafeInteger(value) && value > 0));
-  for (const processId of initial) {
-    try { process.kill(processId, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  }
+  for (const processId of initial) requestExit(processId);
   if (await waitForChromeExit([...initial], profileDir, timeoutMs)) return;
   const remaining = new Set([[...initial].filter(isProcessAlive), await chromePids(profileDir)].flat());
-  for (const processId of remaining) {
-    try { process.kill(processId, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  }
+  for (const processId of remaining) forceExit(processId);
   if (!await waitForChromeExit([...remaining], profileDir, 2000)) throw new Error(`Chrome did not exit within ${timeoutMs + 2000}ms`);
 }
 
@@ -155,7 +205,7 @@ export async function ensureManagedBrowser({ headless } = {}) {
     ...(process.platform === 'linux' ? ['--disable-dev-shm-usage'] : []),
     'about:blank'
   ];
-  const child = spawn(binary, args, { detached: true, stdio: 'ignore', env: { ...process.env, ...desktop.env } });
+  const child = spawn(binary, args, { detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, ...desktop.env } });
   child.unref();
   let port;
   for (let attempt = 0; attempt < 300; attempt++) {
@@ -196,6 +246,15 @@ export async function ensureManagedBrowser({ headless } = {}) {
   return { ...state, started: true };
 }
 
+async function closeOverCdp(port) {
+  if (!port) return;
+  try {
+    const { CDP } = await import('./cdp.js');
+    const cdp = await new CDP(await browserWebSocketFromUrl(`http://127.0.0.1:${port}`)).connect();
+    try { await cdp.send('Browser.close'); } finally { cdp.close(); }
+  } catch { /* the browser may already be gone, or may not accept CDP */ }
+}
+
 export async function stopManagedBrowser() {
   let state;
   try { state = await readJson(managedStateFile()); }
@@ -208,6 +267,14 @@ export async function stopManagedBrowser() {
   const identity = await processIdentity(state.pid);
   if (!matchesManagedIdentity(state, identity, profile)) {
     throw new Error(`refusing to stop PID ${state.pid}; process identity does not match`);
+  }
+  // Ask the browser to close itself first. Windows has no SIGTERM, so this is
+  // the only orderly shutdown available there; elsewhere it just saves Chrome
+  // from having to recover the profile on next start.
+  await closeOverCdp(state.port);
+  if (await waitForChromeExit([state.pid], profile, 3000)) {
+    await rm(managedStateFile(), { force: true });
+    return { stopped: true };
   }
   await stopChrome(state.pid, profile);
   await rm(managedStateFile(), { force: true });

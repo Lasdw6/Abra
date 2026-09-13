@@ -4,8 +4,18 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { NativeBrowserHost, normalBrowserEndpoint } from '../lib/native-browser-host.js';
 import { normalBrowserRequest } from '../lib/normal-browser.js';
+
+// Windows cannot listen on a filesystem path. The production code picks a named
+// pipe there; the tests need a unique one per case for the same reason they
+// need a unique temp directory.
+function testSocket(root) {
+  const file = path.join(root, 'host.sock');
+  if (process.platform !== 'win32') return file;
+  return `\\\\.\\pipe\\abra-browser-test-${createHash('sha256').update(file).digest('hex').slice(0, 24)}`;
+}
 
 test('normal browser endpoint accepts only loopback DevToolsActivePort data', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-normal-endpoint-'));
@@ -22,7 +32,7 @@ test('normal browser endpoint accepts only loopback DevToolsActivePort data', as
 
 test('native browser host reuses one CDP connection across adapter requests', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-normal-host-'));
-  const chromeRoot = path.join(root, 'chrome'), socketPath = path.join(root, 'host.sock');
+  const chromeRoot = path.join(root, 'chrome'), socketPath = testSocket(root);
   await mkdir(chromeRoot);
   await writeFile(path.join(chromeRoot, 'DevToolsActivePort'), '9333\n/devtools/browser/stable\n');
   let connects = 0;
@@ -52,7 +62,7 @@ test('native browser host reuses one CDP connection across adapter requests', as
 
 test('only explicit connect starts a detached host and retries a missing socket', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-normal-autostart-'));
-  const socketPath = path.join(root, 'host.sock');
+  const socketPath = testSocket(root);
   let server, spawns = 0, detached;
   const spawnFn = (_node, _args, options) => {
     spawns++; detached = options.detached;
@@ -77,7 +87,7 @@ test('only explicit connect starts a detached host and retries a missing socket'
 
 test('native host rejects unknown operations before connecting and reconnects a closed websocket', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-normal-reconnect-'));
-  const chromeRoot = path.join(root, 'chrome'), socketPath = path.join(root, 'host.sock');
+  const chromeRoot = path.join(root, 'chrome'), socketPath = testSocket(root);
   await mkdir(chromeRoot);
   await writeFile(path.join(chromeRoot, 'DevToolsActivePort'), '9555\n/devtools/browser/reconnect\n');
   let connects = 0;
@@ -102,7 +112,7 @@ test('native host rejects unknown operations before connecting and reconnects a 
 
 test('native host serializes browser operations', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'abra-normal-queue-'));
-  const chromeRoot = path.join(root, 'chrome'), socketPath = path.join(root, 'host.sock');
+  const chromeRoot = path.join(root, 'chrome'), socketPath = testSocket(root);
   await mkdir(chromeRoot);
   await writeFile(path.join(chromeRoot, 'DevToolsActivePort'), '9666\n/devtools/browser/queue\n');
   let active = 0, maxActive = 0;

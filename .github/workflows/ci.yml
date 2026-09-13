@@ -25,10 +25,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15]
+        runner: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      # Windows has no CRIU, no observe and no Firecracker; those targets are
+      # compiled out, so the check proves the rest of the tree still builds.
+      - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo test --workspace --all-features --locked
 
   rust-musl:

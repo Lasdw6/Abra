@@ -8,6 +8,13 @@ import path from 'node:path';
 import { readSavedCookies } from '../lib/saved-cookies.js';
 import { captureSavedCookieTab } from '../lib/browser.js';
 
+const WINDOWS = process.platform === 'win32';
+// captureSavedCookieTab refuses to read a saved profile off macOS unless an
+// explicit Chrome root is configured. These cases supply their own root through
+// `dependencies`, so declaring one keeps the path and identity checks covered
+// on every platform.
+process.env.ABRA_BROWSER_CHROME_ROOT ||= path.join(os.tmpdir(), 'abra-saved-cookie-chrome-root');
+
 const password = 'synthetic safe storage key';
 
 function encrypted(host, value, { hash = true, prefix = 'v10' } = {}) {
@@ -120,7 +127,8 @@ test('saved-cookie-tab rejects a Network parent symlink escaping the selected pr
   const outside = await mkdtemp(path.join(os.tmpdir(), 'abra-saved-route-outside-'));
   await mkdir(path.join(root, 'Profile 1'));
   await writeFile(path.join(outside, 'Cookies'), 'fixture');
-  await symlink(outside, path.join(root, 'Profile 1', 'Network'));
+  // Node defaults to a file symlink on Windows; a directory link must say so.
+  await symlink(outside, path.join(root, 'Profile 1', 'Network'), WINDOWS ? 'junction' : undefined);
   try {
     await assert.rejects(captureSavedCookieTab({ profile: 'Profile 1', tab_id: '42', expected_url: 'https://github.com/' }, {}, {
       root,

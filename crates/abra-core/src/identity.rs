@@ -207,6 +207,9 @@ fn save_private(p: &Path, b: &[u8]) -> Result<()> {
         fs::set_permissions(p, fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(p, e))?;
     }
     #[cfg(not(unix))]
-    fs::write(p, b).map_err(|e| Error::io(p, e))?;
+    {
+        fs::write(p, b).map_err(|e| Error::io(p, e))?;
+        crate::util::restrict_to_owner(p)?;
+    }
     Ok(())
 }

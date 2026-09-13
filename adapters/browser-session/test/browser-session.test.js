@@ -16,6 +16,7 @@ import { cleanupLocalProfile } from '../lib/import.js';
 import { allowedDomain, assertPrivateFile, canonical, filterState, loadBundle, nonPortableCookieReasons, saveBundle, signingIdentity, signObject, toStorageState, verifyObject, writeJson } from '../lib/util.js';
 import { createFacade } from '../facade/server.js';
 
+const WINDOWS = process.platform === 'win32';
 const NO_CHROME_MESSAGE = 'Chrome tests disabled by ABRA_BROWSER_TEST_NO_CHROME=1';
 process.env.ABRA_BROWSER_DATA_DIR = await mkdtemp(path.join(os.tmpdir(), 'abra-browser-data-test-'));
 process.env.ABRA_BROWSER_CHROME_ROOT = path.join(process.env.ABRA_BROWSER_DATA_DIR, 'missing-chrome-root');
@@ -86,10 +87,12 @@ test('revoke rejects forged receipts before using paths, pids, or CDP capabiliti
 test('bundle payloads and exports are private and inspect never emits values', async () => {
   const root=await mkdtemp(path.join(os.tmpdir(),'abra-modes-')),bundle=path.join(root,'bundle'),out=path.join(root,'out.json');
   const manifest=await saveBundle(bundle,{cookies:[{name:'sid',value:'alpha',domain:'example.com'}],origins:[],tabs:[{url:'https://example.com/callback?code=SUPER_SECRET',title:'x'}]});
-  for(const name of ['state.json','storage_state.json','manifest.json'])assert.equal((await stat(path.join(bundle,name))).mode&0o777,0o600);
-  assert.equal((await stat(bundle)).mode&0o777,0o700);let inspected='';await run(['inspect',bundle],{log(value){inspected+=value;}});assert.doesNotMatch(inspected,/alpha|SUPER_SECRET/);
+  // Windows has no POSIX mode bits: privacy there comes from the directory ACL,
+  // which assertPrivateFile checks instead.
+  for(const name of ['state.json','storage_state.json','manifest.json'])if(WINDOWS)assert.equal(await assertPrivateFile(path.join(bundle,name)),true);else assert.equal((await stat(path.join(bundle,name))).mode&0o777,0o600);
+  if(!WINDOWS)assert.equal((await stat(bundle)).mode&0o777,0o700);let inspected='';await run(['inspect',bundle],{log(value){inspected+=value;}});assert.doesNotMatch(inspected,/alpha|SUPER_SECRET/);
   assert.doesNotMatch(JSON.stringify({payload:{manifest}}),/alpha|SUPER_SECRET/,'adapter export shape contains metadata only');
-  await run(['storage-state','export',bundle,'--out',out],{log(){}});assert.equal((await stat(out)).mode&0o777,0o600);
+  await run(['storage-state','export',bundle,'--out',out],{log(){}});if(!WINDOWS)assert.equal((await stat(out)).mode&0o777,0o600);
 });
 
 test('storage projection preserves partitioning and does not invent SameSite', () => {
@@ -274,13 +277,15 @@ test('adapter ignores sender payload paths and does not chmod them', async () =>
   const hostile = await mkdtemp(path.join(os.tmpdir(), 'abra-hostile-payload-'));
   const marker = path.join(hostile, 'marker');
   await writeFile(marker, 'safe');
-  await chmod(hostile, 0o755);
-  await chmod(marker, 0o644);
+  if (!WINDOWS) { await chmod(hostile, 0o755); await chmod(marker, 0o644); }
+  // The point is that the adapter leaves sender-supplied paths alone. Windows
+  // has no mode bits to set, so compare what they were before the request.
+  const before = [(await stat(hostile)).mode, (await stat(marker)).mode];
   const response = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'e1', verb: 'import', kind: 'dev.abra.browser.session.v1', payload: { bundle_path: hostile }, destination: 'local', options: {} });
   assert.equal(response.error.code, 'invalid_request');
   assert.match(response.error.message, /materialized_files is required/);
-  assert.equal((await stat(hostile)).mode & 0o777, 0o755);
-  assert.equal((await stat(marker)).mode & 0o777, 0o644);
+  assert.deepEqual([(await stat(hostile)).mode, (await stat(marker)).mode], before);
+  if (!WINDOWS) assert.equal((await stat(hostile)).mode & 0o777, 0o755);
 });
 
 function skipChromeTest(t) {
@@ -420,14 +425,18 @@ test('CDP export/import, receiver deny, inspect secrecy, and revoke', { timeout:
 test('adapter rejects the daemon filesystem destination without changing bundle modes', async () => {
   const bundle = await mkdtemp(path.join(os.tmpdir(), 'abra-adapter-bundle-'));
   await saveBundle(bundle, { cookies: [], origins: [], tabs: [] });
-  await chmod(bundle, 0o755);
-  for (const name of ['state.json', 'storage_state.json', 'manifest.json']) await chmod(path.join(bundle, name), 0o644);
+  if (!WINDOWS) {
+    await chmod(bundle, 0o755);
+    for (const name of ['state.json', 'storage_state.json', 'manifest.json']) await chmod(path.join(bundle, name), 0o644);
+  }
+  const beforeModes = [bundle, ...['state.json', 'storage_state.json', 'manifest.json'].map(n => path.join(bundle, n))];
+  const before = await Promise.all(beforeModes.map(async file => (await stat(file)).mode));
   const destinationPath = path.join(bundle, 'daemon-default-destination');
   const imported = await adapterRequest({ protocol: 'abra-adapter/1', request_id: 'b2', verb: 'import', kind: 'dev.abra.browser.session.v1', payload: {}, materialized_files: bundle, destination: destinationPath, options: {} });
   assert.equal(imported.error.code, 'invalid_request');
   assert.match(imported.error.message, /requires --destination local, normal, managed, or cdp/);
-  assert.equal((await stat(bundle)).mode & 0o777, 0o755);
-  for (const name of ['state.json', 'storage_state.json', 'manifest.json']) assert.equal((await stat(path.join(bundle, name))).mode & 0o777, 0o644);
+  assert.deepEqual(await Promise.all(beforeModes.map(async file => (await stat(file)).mode)), before);
+  if (!WINDOWS) assert.equal((await stat(bundle)).mode & 0o777, 0o755);
 });
 
 test('storage_state import/export is byte-stable', async () => {
@@ -560,7 +569,8 @@ test('adapter re-exports a foreign bundle unchanged and refuses non-re-exportabl
     assert.doesNotMatch(JSON.stringify(response), /alpha/);
     for (const name of ['state.json', 'storage_state.json', 'manifest.json']) {
       assert.deepEqual(await readFile(path.join(staging, name)), await readFile(path.join(bundle, name)));
-      assert.equal((await stat(path.join(staging, name))).mode & 0o777, 0o600);
+      if (WINDOWS) assert.equal(await assertPrivateFile(path.join(staging, name)), true);
+      else assert.equal((await stat(path.join(staging, name))).mode & 0o777, 0o600);
     }
     assert.equal((await loadBundle(staging, { trustSender: other.fingerprint })).state.cookies[0].value, 'alpha');
   }

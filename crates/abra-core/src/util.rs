@@ -1,6 +1,8 @@
 //! Small shared helpers: hex, time, durable writes.
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{fs, io::Write, path::Path};
 
 /// Writes `bytes` to `path` so readers only ever see the old or the new file:
@@ -20,9 +22,75 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
     file.sync_all().map_err(|e| Error::io(&tmp, e))?;
     fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
-    fs::File::open(parent)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| Error::io(parent, e))
+    sync_directory(parent)
+}
+
+/// Flush a rename into the directory itself.
+///
+/// Unix needs this for the rename to survive a crash. Windows cannot open a
+/// directory as a file and orders metadata itself, so there it does nothing.
+pub fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| Error::io(path, e))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Take `path` out of reach of every other account on the machine.
+///
+/// Unix sets `0o700` on directories and `0o600` on files. Windows has no mode
+/// bits, so inheritance is broken and a single full-control entry for the
+/// current user is granted instead.
+pub fn restrict_to_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = fs::symlink_metadata(path)
+            .map_err(|e| Error::io(path, e))?
+            .is_dir();
+        let mode = if directory { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::io(path, e))?;
+    }
+    #[cfg(windows)]
+    windows_restrict_to_owner(path)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_restrict_to_owner(path: &Path) -> Result<()> {
+    let Some(user) = std::env::var_os("USERNAME").filter(|name| !name.is_empty()) else {
+        // Without an account name there is nobody to grant access to; leaving
+        // inherited permissions is better than locking the store out.
+        return Ok(());
+    };
+    // Inheritance flags belong on a container; on a file they would mark the
+    // entry inherit-only, leaving the owner with no access at all.
+    let directory = fs::symlink_metadata(path)
+        .map_err(|e| Error::io(path, e))?
+        .is_dir();
+    let scope = if directory { "(OI)(CI)F" } else { "F" };
+    let grant = format!("{}:{scope}", user.to_string_lossy());
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|e| Error::io(path, e))?;
+    if !output.status.success() {
+        return Err(Error::invalid(format!(
+            "could not restrict {} to {}: {}",
+            path.display(),
+            grant,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -152,5 +220,18 @@ mod tests {
     #[test]
     fn now_ms_is_after_2020() {
         assert!(now_ms() > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn owner_only_paths_stay_writable_by_this_process() {
+        let directory = tempfile::tempdir().unwrap();
+        restrict_to_owner(directory.path()).unwrap();
+        let file = directory.path().join("secret");
+        atomic_write(&file, b"one").unwrap();
+        restrict_to_owner(&file).unwrap();
+        // Hardening must not lock the owner out of its own store.
+        atomic_write(&file, b"two").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"two");
+        sync_directory(directory.path()).unwrap();
     }
 }

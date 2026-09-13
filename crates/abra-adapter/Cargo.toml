@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["process", "io-util", "time"] }
 rand.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+dunce.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

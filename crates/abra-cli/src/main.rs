@@ -1,3 +1,4 @@
+use cadabra::local::LocalStream;
 #[cfg(any(feature = "iroh", feature = "tcp"))]
 use cadabra::{adapters::ExtraAdapterDir, Daemon};
 use cadabra::{background, control_call, relay::RelayConfig, DaemonConfig};
@@ -11,7 +12,6 @@ use std::{
     process::Command as ProcessCommand,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "abra", version, about = "Teleport workspaces and handoffs")]
@@ -27,7 +27,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Collect process and environment observations inside a sandbox.
+    #[cfg(unix)]
     Observe(abra_runtime::observe::ObserveArgs),
+    /// Collect process and environment observations inside a sandbox.
+    #[cfg(not(unix))]
+    Observe {
+        /// Accepted and rejected: observation is a Linux/macOS feature.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Check, capture, and restore live Linux processes with CRIU.
     Process(abra_runtime::process::ProcessArgs),
     /// Internal file transfer and process helpers for sandbox coordinators.
@@ -450,18 +458,31 @@ fn parse_duration(s: &str) -> Result<u64, String> {
 }
 
 fn default_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".abra")
+}
+
+/// `HOME`, or `USERPROFILE` where Windows sets that instead.
+fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 #[tokio::main]
 async fn main() -> cadabra::Result<()> {
     let cli = Cli::parse();
     // These commands operate inside a sandbox and do not need a daemon or identity.
+    #[cfg(unix)]
     if let Command::Observe(args) = cli.command {
         return print_runtime_result(abra_runtime::observe::run(args), true);
+    }
+    #[cfg(not(unix))]
+    if let Command::Observe { .. } = cli.command {
+        return Err("observe is only supported on Linux/macOS".into());
     }
     if let Command::Process(args) = cli.command {
         return print_runtime_result(abra_runtime::process::run(args), cli.json);
@@ -527,8 +548,8 @@ async fn main() -> cadabra::Result<()> {
         }
     }
     if matches!(cli.command, Command::Watch) {
-        let stream = UnixStream::connect(root.join("cadabra.sock")).await?;
-        let (read, mut write) = stream.into_split();
+        let stream = LocalStream::connect(root.join("cadabra.sock")).await?;
+        let (read, mut write) = tokio::io::split(stream);
         write.write_all(b"{\"op\":\"watch\"}\n").await?;
         let mut lines = BufReader::new(read).lines();
         while let Some(line) = lines.next_line().await? {
@@ -685,7 +706,9 @@ async fn main() -> cadabra::Result<()> {
         Command::Link { .. } => unreachable!(),
         Command::Daemon { .. } | Command::Stop => unreachable!(),
         Command::Config { .. } => unreachable!(),
-        Command::Observe(_) | Command::Process(_) | Command::SandboxHelper(_) => unreachable!(),
+        Command::Observe { .. } | Command::Process(_) | Command::SandboxHelper(_) => {
+            unreachable!()
+        }
     };
     let result = call_with_pairing_hint(&root, &request, !cli.json).await?;
     if cli.json {
@@ -772,6 +795,18 @@ fn absolute(path: PathBuf) -> cadabra::Result<PathBuf> {
     }
 }
 
+/// Run a template through the platform's command shell.
+fn shell_command(command: &str) -> ProcessCommand {
+    let mut shell = if cfg!(windows) {
+        ProcessCommand::new("cmd")
+    } else {
+        ProcessCommand::new("sh")
+    };
+    shell.arg(if cfg!(windows) { "/C" } else { "-c" });
+    shell.arg(command);
+    shell
+}
+
 /// Re-execute this binary without `--background`, detached, and wait for the
 /// child to answer on the control socket.
 #[cfg(any(feature = "iroh", feature = "tcp"))]
@@ -785,6 +820,7 @@ async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Res
     }
     if !root.exists() {
         builder.create(root)?;
+        abra_core::util::restrict_to_owner(root)?;
     }
     let launch_lock = fs::OpenOptions::new()
         .create(true)
@@ -810,15 +846,26 @@ async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Res
         options.mode(0o600);
     }
     let log = options.open(&log_path)?;
-    #[cfg(unix)]
+    abra_core::util::restrict_to_owner(&log_path)?;
+    let mut command = ProcessCommand::new(&binary);
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))?;
+        use std::os::windows::process::CommandExt;
+        // A console-less, detached child that holds none of this process'
+        // handles, so a PowerShell pipeline or a parent `.output()` sees EOF.
+        stop_stdio_inheritance()?;
+        command.creation_flags(background::CREATE_NO_WINDOW | background::DETACHED_PROCESS);
     }
-    let child = ProcessCommand::new(&binary)
+    // Windows would otherwise let the daemon hold the launcher's console,
+    // so only stderr reaches the log there; Unix keeps both streams.
+    #[cfg(windows)]
+    let stdout = Stdio::null();
+    #[cfg(not(windows))]
+    let stdout = Stdio::from(log.try_clone()?);
+    let child = command
         .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
+        .stdout(stdout)
         .stderr(Stdio::from(log))
         .env("ABRA_DAEMON_DETACH", "1")
         .spawn()?;
@@ -866,6 +913,33 @@ async fn start_background_daemon(root: &Path, json_output: bool) -> cadabra::Res
 }
 
 #[cfg(any(feature = "iroh", feature = "tcp"))]
+/// Redirecting a child's stdio does not stop `CreateProcess` from duplicating
+/// this process' own inheritable handles into it. A daemon holding the
+/// launcher's pipes keeps the caller waiting for an EOF that never comes.
+#[cfg(all(windows, any(feature = "iroh", feature = "tcp")))]
+fn stop_stdio_inheritance() -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: these borrowed standard handles stay owned by this process;
+        // only their inheritance flag changes, and reads and writes are
+        // unaffected.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 fn remove_pid_file_if_matches(root: &Path, pid: i32) {
     if background::PidFile::load(root)
         .is_ok_and(|record| record.is_some_and(|record| record.pid == pid))
@@ -1111,8 +1185,7 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
                     .replace("{file}", &blob_path.to_string_lossy())
                     .replace("{hash}", &blob_hash.to_hex())
                     .replace("{url}", &actual_url);
-                let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
-                if !status.success() {
+                if !shell_command(&command).status()?.success() {
                     return Err("uploader command failed".into());
                 }
             }
@@ -1179,8 +1252,7 @@ async fn run_link(root: &Path, command: LinkCommand, json_output: bool) -> cadab
                     .replace("{file}", file)
                     .replace("{hash}", &hash)
                     .replace("{url}", &record.url);
-                let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
-                if !status.success() {
+                if !shell_command(&command).status()?.success() {
                     return Err("remote revoke command failed".into());
                 }
             }

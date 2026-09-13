@@ -1994,6 +1994,7 @@ fn make_bundle_payload_private(root: &Path) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
@@ -2081,6 +2082,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_runner_drains_output_and_uses_fake_executable() {
         let temp = tempfile::tempdir().unwrap();
@@ -2112,6 +2114,7 @@ mod tests {
             .any(|value| value.contains("missing captured features: avx")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn complete_inventory_detects_corruption_and_extra_files() {
         let temp = tempfile::tempdir().unwrap();
@@ -2209,6 +2212,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_output_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
@@ -2224,6 +2228,7 @@ mod tests {
         assert_eq!(output.stdout.len(), MAX_COMMAND_OUTPUT);
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_returns_promptly_after_owned_group_cleanup() {
         let temp = tempfile::tempdir().unwrap();
@@ -2236,6 +2241,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    #[cfg(unix)]
     #[test]
     fn saved_criu_log_is_private_and_bounded() {
         let temp = tempfile::tempdir().unwrap();

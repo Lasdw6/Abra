@@ -4,7 +4,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { CDP } from './cdp.js';
-import { normalBrowserSocket } from './normal-browser.js';
+import { isPipeName, normalBrowserSocket } from './normal-browser.js';
 
 const MAX_MESSAGE = 1024 * 1024;
 const OPERATIONS = new Set(['connect', 'inventory', 'export', 'import']);
@@ -29,7 +29,8 @@ export function defaultNormalChromeRoot() {
   if (process.env.ABRA_BROWSER_CHROME_ROOT) return path.resolve(process.env.ABRA_BROWSER_CHROME_ROOT);
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
   if (process.platform === 'linux') return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'google-chrome');
-  throw coded('unsupported', 'Normal Chrome remote debugging currently supports macOS and Linux.');
+  if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Google', 'Chrome', 'User Data');
+  throw coded('unsupported', 'Normal Chrome remote debugging currently supports Windows, macOS, and Linux.');
 }
 
 export class NativeBrowserHost {
@@ -71,14 +72,20 @@ export class NativeBrowserHost {
 
   async start() {
     if ((!this.operations || typeof this.operations !== 'object') && typeof this.operationsFactory !== 'function') throw new Error('native browser operations are required');
-    await mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
-    await removeStaleSocket(this.socketPath);
+    // A Windows named pipe has no parent directory and no mode bits. Its
+    // default ACL already limits it to the creating user's session, and a
+    // second listener on the same name fails, which is the staleness check.
+    const pipe = isPipeName(this.socketPath);
+    if (!pipe) {
+      await mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
+      await removeStaleSocket(this.socketPath);
+    }
     this.server = net.createServer(socket => this.handle(socket));
     await new Promise((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(this.socketPath, resolve);
     });
-    await chmod(this.socketPath, 0o600);
+    if (!pipe) await chmod(this.socketPath, 0o600);
     return this;
   }
 
@@ -121,6 +128,7 @@ export class NativeBrowserHost {
   async close() {
     this.current?.cdp?.close();
     if (this.server) await new Promise(resolve => this.server.close(resolve));
+    if (isPipeName(this.socketPath)) return;
     await unlink(this.socketPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
 }
@@ -128,7 +136,7 @@ export class NativeBrowserHost {
 async function removeStaleSocket(socketPath) {
   let info;
   try { info = await lstat(socketPath); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  if (!info.isSocket() || info.uid !== process.getuid()) throw new Error('Unexpected normal-browser socket path.');
+  if (!info.isSocket() || (process.getuid && info.uid !== process.getuid())) throw new Error('Unexpected normal-browser socket path.');
   const alive = await new Promise(resolve => {
     const socket = net.createConnection(socketPath);
     socket.once('connect', () => { socket.destroy(); resolve(true); });

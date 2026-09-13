@@ -332,9 +332,7 @@ impl BlobStore {
         }
         fs::rename(path, &dest).map_err(|e| Error::io(&dest, e))?;
         let shard = dest.parent().expect("CAS object has shard directory");
-        fs::File::open(shard)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| Error::io(shard, e))?;
+        crate::util::sync_directory(shard)?;
         Ok(bytes)
     }
 
@@ -363,9 +361,7 @@ impl BlobStore {
         }
         fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
         let shard = dest.parent().expect("CAS object has shard directory");
-        fs::File::open(shard)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| Error::io(shard, e))?;
+        crate::util::sync_directory(shard)?;
         Ok(hash)
     }
 
@@ -403,9 +399,7 @@ impl BlobStore {
         }
         fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
         let shard = dest.parent().expect("CAS object has shard directory");
-        fs::File::open(shard)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| Error::io(shard, e))?;
+        crate::util::sync_directory(shard)?;
         Ok((hash, bytes))
     }
 
@@ -424,7 +418,10 @@ impl BlobStore {
         }
         let temporary = destination.with_extension(format!("{}.tmp", rand::random::<u64>()));
         let bytes = fs::copy(&source, &temporary).map_err(|e| Error::io(&temporary, e))?;
-        fs::File::open(&temporary)
+        // Windows only flushes a handle opened for writing.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|e| Error::io(&temporary, e))?;
         if hash_file(&temporary)? != *hash {
@@ -433,9 +430,7 @@ impl BlobStore {
         }
         fs::rename(&temporary, destination).map_err(|e| Error::io(destination, e))?;
         let parent = destination.parent().expect("destination has parent");
-        fs::File::open(parent)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| Error::io(parent, e))?;
+        crate::util::sync_directory(parent)?;
         Ok(bytes)
     }
 
@@ -585,7 +580,23 @@ pub fn materialize(store: &BlobStore, root: &Hash, dest: impl AsRef<Path>) -> Re
         Err(e) => return Err(Error::io(dest, e)),
     }
     validate_materialization(store, root)?;
-    materialize_inner(store, root, dest, 0, 0)
+    materialize_inner(store, &writable_root(dest)?, root, 0, 0)
+}
+
+/// The destination every entry is written under.
+///
+/// Windows caps ordinary paths at 260 characters, which a deep tree passes
+/// easily. Canonicalizing the root once yields the `\\?\` verbatim form that
+/// lifts the cap for every path built from it.
+#[cfg(windows)]
+fn writable_root(dest: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dest).map_err(|e| Error::io(dest, e))?;
+    fs::canonicalize(dest).map_err(|e| Error::io(dest, e))
+}
+
+#[cfg(not(windows))]
+fn writable_root(dest: &Path) -> Result<PathBuf> {
+    Ok(dest.to_path_buf())
 }
 
 /// Verify the tree and its objects without writing to the store or destination.
@@ -610,7 +621,66 @@ pub fn validate_materialization(store: &BlobStore, root: &Hash) -> Result<()> {
             checked_link_target(&store.get(&entry.hash)?)?;
         }
         Ok(())
-    })
+    })?;
+    #[cfg(windows)]
+    check_windows_names(store, root)?;
+    Ok(())
+}
+
+/// Why Windows would refuse to create a file with this name, if it would.
+///
+/// Restoring a tree containing one of these names silently creates the wrong
+/// thing (a device, or a file with the trailing dot stripped), so the tree is
+/// rejected up front instead.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_name_problem(name: &str) -> Option<&'static str> {
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if name.contains(['<', '>', ':', '"', '|', '?', '*', '\\', '/']) {
+        return Some("contains a character Windows reserves");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Some("contains a control character");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("ends in a dot or a space, which Windows strips");
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if DEVICES.contains(&stem.as_str()) {
+        return Some("is a DOS device name");
+    }
+    None
+}
+
+/// Reject names Windows cannot store, and names that would collide once the
+/// filesystem folds their case.
+#[cfg(windows)]
+fn check_windows_names(store: &BlobStore, root: &Hash) -> Result<()> {
+    let mut pending = vec![(*root, String::new())];
+    let mut seen = BTreeSet::new();
+    while let Some((hash, prefix)) = pending.pop() {
+        if !seen.insert(hash) {
+            continue;
+        }
+        let mut folded: BTreeMap<String, String> = BTreeMap::new();
+        for entry in store.get_tree(&hash)?.entries() {
+            let path = format!("{prefix}{}", entry.name);
+            if let Some(problem) = windows_name_problem(&entry.name) {
+                return Err(Error::invalid(format!("{path} {problem}")));
+            }
+            if let Some(other) = folded.insert(entry.name.to_lowercase(), entry.name.clone()) {
+                return Err(Error::invalid(format!(
+                    "{path} and {prefix}{other} differ only by case, which one Windows directory cannot hold"
+                )));
+            }
+            if entry.mode == EntryMode::Tree {
+                pending.push((entry.hash, format!("{path}/")));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_entry_size(entry: &TreeEntry, length: u64) -> Result<()> {
@@ -628,7 +698,7 @@ fn checked_link_target(bytes: &[u8]) -> Result<PathBuf> {
         ));
     }
     let target = bytes_to_path(bytes)?;
-    if !cfg!(unix) {
+    if !cfg!(unix) && !cfg!(windows) {
         return Err(Error::invalid("cannot create symlinks on this platform"));
     }
     Ok(target)
@@ -651,8 +721,8 @@ fn child_path_len(path_len: usize, name: &str) -> Result<usize> {
 
 fn materialize_inner(
     store: &BlobStore,
-    root: &Hash,
     dest: &Path,
+    root: &Hash,
     depth: usize,
     path_len: usize,
 ) -> Result<()> {
@@ -670,7 +740,7 @@ fn materialize_inner(
                 {
                     remove_existing(&path)?;
                 }
-                materialize_inner(store, &entry.hash, &path, depth + 1, child_len)?
+                materialize_inner(store, &path, &entry.hash, depth + 1, child_len)?
             }
             EntryMode::Link => {
                 let bytes = store.get(&entry.hash)?;
@@ -772,7 +842,33 @@ fn symlink(target: &Path, at: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, at).map_err(|e| Error::io(at, e))
 }
 
-#[cfg(not(unix))]
+/// Windows picks a symlink's kind when it is created, so the target has to be
+/// resolved first, and creating one needs Developer Mode or an elevated token.
+#[cfg(windows)]
+fn symlink(target: &Path, at: &Path) -> Result<()> {
+    /// `ERROR_PRIVILEGE_NOT_HELD`.
+    const NO_PRIVILEGE: i32 = 1314;
+    let resolved = at
+        .parent()
+        .map_or_else(|| target.to_path_buf(), |parent| parent.join(target));
+    let create = if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir
+    } else {
+        std::os::windows::fs::symlink_file
+    };
+    create(target, at).map_err(|error| {
+        if error.raw_os_error() == Some(NO_PRIVILEGE) {
+            Error::invalid(format!(
+                "cannot create symlink at {}: enable Developer Mode or run elevated",
+                at.display()
+            ))
+        } else {
+            Error::io(at, error)
+        }
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn symlink(_target: &Path, at: &Path) -> Result<()> {
     Err(Error::invalid(format!(
         "cannot create symlink at {} on this platform",
@@ -1202,5 +1298,66 @@ mod tests {
         let out = tmp.path().join("out");
         materialize(&other, &root, &out).unwrap();
         assert_eq!(fs::read(out.join("readme.md")).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn windows_name_rules_name_the_problem() {
+        for name in ["CON", "nul.txt", "com1", "LPT9.log"] {
+            assert_eq!(windows_name_problem(name), Some("is a DOS device name"));
+        }
+        assert!(windows_name_problem("a:b").is_some());
+        assert!(windows_name_problem("what?").is_some());
+        assert!(windows_name_problem("trailing.").is_some());
+        assert!(windows_name_problem("trailing ").is_some());
+        assert!(windows_name_problem("bell\u{7}").is_some());
+        for name in ["readme.md", "console", "com10", "nul-ish", ".gitignore"] {
+            assert_eq!(windows_name_problem(name), None, "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_reserved_names_and_case_collisions() {
+        let (_dir, store) = store();
+        let blob = store.put(b"x").unwrap();
+        let entry = |name: &str| TreeEntry {
+            mode: EntryMode::File,
+            name: name.into(),
+            hash: blob,
+            size: 1,
+        };
+        let reserved = store
+            .put_tree(&Tree::new(vec![entry("ok.txt"), entry("aux.txt")]).unwrap())
+            .unwrap();
+        let error = validate_materialization(&store, &reserved)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aux.txt"), "{error}");
+        assert!(error.contains("DOS device name"), "{error}");
+
+        let collision = store
+            .put_tree(&Tree::new(vec![entry("Readme.md"), entry("readme.md")]).unwrap())
+            .unwrap();
+        let error = validate_materialization(&store, &collision)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("readme.md"), "{error}");
+        assert!(error.contains("differ only by case"), "{error}");
+
+        let nested = store
+            .put_tree(
+                &Tree::new(vec![TreeEntry {
+                    mode: EntryMode::Tree,
+                    name: "sub".into(),
+                    hash: reserved,
+                    size: 0,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let error = validate_materialization(&store, &nested)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sub/aux.txt"), "{error}");
     }
 }

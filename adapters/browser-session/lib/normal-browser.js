@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -6,9 +7,16 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { dataDir } from './util.js';
 
+// Windows has no filesystem sockets. A named pipe is the local equivalent and
+// `net.createServer().listen()` accepts a pipe name directly. The name is
+// derived from the data directory so two Abra installations do not collide.
 export function normalBrowserSocket() {
-  return path.join(dataDir(), 'chrome-bridge.sock');
+  const file = path.join(dataDir(), 'chrome-bridge.sock');
+  if (process.platform !== 'win32') return file;
+  return `\\\\.\\pipe\\abra-browser-${createHash('sha256').update(file).digest('hex').slice(0, 32)}`;
 }
+
+export function isPipeName(value) { return process.platform === 'win32' && String(value).startsWith('\\\\.\\pipe\\'); }
 
 // A persistent local host owns this user-only socket and holds Chrome's
 // permission-gated CDP connection. No HTTP server or CDP capability is exposed.
@@ -59,14 +67,15 @@ export async function startNormalBrowserHost({ socketPath = normalBrowserSocket(
   const endpoint = endpointFn || hostModule.normalBrowserEndpoint;
   await endpoint(chromeRoot || hostModule.defaultNormalChromeRoot());
   await mkdir(logDir, { recursive: true, mode: 0o700 });
-  await chmod(logDir, 0o700);
+  if (process.platform !== 'win32') await chmod(logDir, 0o700);
   const log = await open(path.join(logDir, 'native-browser-host.log'), 'a', 0o600);
-  await log.chmod(0o600);
+  if (process.platform !== 'win32') await log.chmod(0o600);
   const executable = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'native-browser-host.js');
   let spawnError;
   try {
     const child = spawnFn(process.execPath, [executable], {
       detached: true,
+      windowsHide: true,
       stdio: ['ignore', log.fd, log.fd],
       env: { ...process.env, ...(chromeRoot ? { ABRA_BROWSER_CHROME_ROOT: chromeRoot } : {}), ABRA_BROWSER_SOCKET: socketPath }
     });

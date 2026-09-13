@@ -1,6 +1,9 @@
+// Materialization is exercised by a test that needs Unix file modes.
+#[cfg(unix)]
+use abra_core::cas::materialize;
 use abra_core::{
     capsule::{Genesis, LabelOp, LeaseMode, LeaseRecord},
-    cas::{materialize, snapshot_dir, Hash},
+    cas::{snapshot_dir, Hash},
     identity::{Identity, PeerId, Signature},
     manifest::{Fingerprint, Manifest, NativeBlobRef, Origin, RawManifest, Scope},
 };

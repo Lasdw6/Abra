@@ -51,5 +51,21 @@ node --test adapters/codex-session/test/*.test.js
 
 They use temporary `CODEX_HOME` directories and never touch a real `~/.codex`.
 `ABRA_CODEX_TEST_REAL=1` additionally enables the one test that shells out to an
-installed `codex` binary for the version check. The writer lock uses `perl`
-(`PERL_BIN` overrides the path).
+installed `codex` binary for the version check.
+
+## Platforms
+
+macOS, Linux, and Windows are supported. The Codex home defaults to
+`CODEX_HOME`, else `.codex` under the OS home directory, which is what Windows
+needs because `HOME` is usually unset there.
+
+The writer lock is held by a child process so a crash releases it. On macOS and
+Linux that child is `perl` holding an advisory `flock` (`PERL_BIN` overrides the
+path). Windows has no `flock`, so the child is `node`: it claims the lock name
+with an exclusive create, records its pid, and reclaims the file only when the
+recorded pid is gone. Both report a busy lock the same way.
+
+`codex` is resolved through PATH using PATHEXT on Windows, and a `.cmd` or
+`.bat` wrapper is run through `ComSpec`. Cancelling a `control` request tears
+the whole process tree down with `taskkill /T` on Windows, where terminating
+only the direct child would orphan whatever the wrapper started.

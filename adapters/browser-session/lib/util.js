@@ -1,9 +1,12 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
-import { chmod, lstat, mkdir, open, readFile, readdir, rename, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { domainToASCII } from 'node:url';
 import { isIP } from 'node:net';
+
+const WINDOWS = process.platform === 'win32';
 
 export const KIND = 'dev.abra.browser.session.v1';
 export const LEGACY_KIND = 'dev.abra.browser-session.v1';
@@ -13,6 +16,7 @@ const SIGNING_PREFIX = 'abra-browser-session-v1';
 export function dataDir() {
   if (process.env.ABRA_BROWSER_DATA_DIR) return path.resolve(process.env.ABRA_BROWSER_DATA_DIR);
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Abra', 'browser-session');
+  if (WINDOWS) return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Abra', 'browser-session');
   return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'abra', 'browser-session');
 }
 
@@ -24,21 +28,67 @@ export function canonical(value) {
 }
 export function sha256(value) { return createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : canonical(value)).digest('hex'); }
 
-async function privateDir(dir) { await mkdir(dir, { recursive: true, mode: 0o700 }); await chmod(dir, 0o700); }
+// Windows has no POSIX mode bits: node's chmod there only flips the read-only
+// attribute, which would make the tree unwritable rather than private. The
+// equivalent is an ACL that drops inheritance and grants the current user
+// alone, applied once at the root and inherited by everything under it.
+const aclApplied = new Set();
+let aclWarned = false;
+function restrictToOwner(dir) {
+  const key = path.resolve(dir);
+  if (aclApplied.has(key)) return;
+  aclApplied.add(key);
+  const user = process.env.USERNAME ? `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ''}${process.env.USERNAME}` : null;
+  if (!user) return;
+  const result = spawnSync('icacls', [key, '/inheritance:r', '/grant:r', `${user}:(OI)(CI)F`], { stdio: 'ignore', windowsHide: true });
+  if ((result.error || result.status !== 0) && !aclWarned) {
+    aclWarned = true;
+    process.stderr.write('abra browser-session: could not restrict data directory permissions with icacls; relying on the profile directory defaults\n');
+  }
+}
+
+async function privateDir(dir) {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  if (WINDOWS) return restrictToOwner(dir);
+  await chmod(dir, 0o700);
+}
 export async function secureTree(target) {
   const info = await lstat(target);
   if (info.isSymbolicLink()) throw new Error('bundle contains a symbolic link');
   if (info.isDirectory()) {
-    await chmod(target, 0o700);
+    if (WINDOWS) restrictToOwner(target);
+    else await chmod(target, 0o700);
     for (const name of await readdir(target)) await secureTree(path.join(target, name));
-  } else {
+  } else if (!WINDOWS) {
     await chmod(target, 0o600);
   }
 }
 export async function writePrivate(file, bytes) {
   await privateDir(path.dirname(file));
-  const handle = await open(file, 'w', 0o600);
-  try { await handle.writeFile(bytes); await handle.chmod(0o600); } finally { await handle.close(); }
+  // Write a sibling and rename over the target so a reader never sees a
+  // half-written file, and so Windows never truncates a file another process
+  // still has open.
+  const temporary = `${file}.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const handle = await open(temporary, 'wx', 0o600);
+  try {
+    await handle.writeFile(bytes);
+    if (!WINDOWS) await handle.chmod(0o600);
+    await handle.sync();
+  } finally { await handle.close(); }
+  try { await replaceFile(temporary, file); }
+  catch (error) { await rm(temporary, { force: true }); throw error; }
+}
+
+// Windows fails a rename over a file that another process has open. Retry
+// briefly: an antivirus or indexer handle is normally released within a tick.
+async function replaceFile(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await rename(from, to); }
+    catch (error) {
+      if (!WINDOWS || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || attempt >= 10) throw error;
+      await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)));
+    }
+  }
 }
 export async function writeJson(file, value) { await writePrivate(file, `${JSON.stringify(value, null, 2)}\n`); }
 export async function readJson(file) { return JSON.parse(await readFile(file, 'utf8')); }
@@ -160,4 +210,6 @@ export function buildManifest(state, metadata={}) {
   const domains=[...groups].sort(([a],[b])=>a.localeCompare(b)).map(([domain,cookies])=>({domain,cookie_count:cookies.length,http_only_count:cookies.filter(c=>c.httpOnly).length,secure_count:cookies.filter(c=>c.secure).length}));
   return { kind:KIND,version:1,capture_time:metadata.captureTime||new Date().toISOString(),source_browser:metadata.sourceBrowser||'Chrome via CDP',source:metadata.source||'cdp',...(metadata.dataScope?{data_scope:metadata.dataScope}:{}),policy:metadata.policy||{include_domains:[],exclude_domains:[]},domains,origins:(state.origins||[]).map(o=>({origin:o.origin,local_storage:Boolean(o.localStorage?.length),session_storage:Boolean(o.sessionStorage?.length),indexed_db:Boolean(o.indexedDB?.databases?.length)})),tabs:(state.tabs||[]).map(({url,title})=>({url:safeTabUrl(url),title})),total_size:Buffer.byteLength(JSON.stringify(state)),non_teleportable:[...blockedCookieGroups(metadata.blockedCookies),...[...groups].flatMap(([domain,cookies])=>{const reasons=dbscReasons(domain,cookies);return reasons.length?[{domain,reasons,heuristic:true}]:[]})],cookie_flags_preserved:['HttpOnly','Secure','SameSite','priority','sameParty','sourceScheme','sourcePort','partitionKey'],provenance:metadata.provenance||{capture:'direct-cdp',reexportable:true} };
 }
-export async function assertPrivateFile(file) { const mode=(await stat(file)).mode & 0o777; return mode === 0o600; }
+// Windows reports a synthetic mode, so privacy there comes from the directory
+// ACL restrictToOwner applies, not from the file's mode bits.
+export async function assertPrivateFile(file) { if (WINDOWS) { await stat(file); return true; } const mode=(await stat(file)).mode & 0o777; return mode === 0o600; }

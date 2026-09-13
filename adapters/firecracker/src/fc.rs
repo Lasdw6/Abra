@@ -1,0 +1,1825 @@
+use abra_core::{
+    cas::{materialize, Hash},
+    manifest::{Fingerprint, NativeBlobRef},
+    restore::{plan_restore, NativeStatus, RestoreMode},
+    store::AbraStore,
+};
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::{fs::PermissionsExt, net::UnixStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Parser)]
+#[command(
+    name = "abra-fc",
+    version,
+    about = "Run Abra capsules in Firecracker microVMs"
+)]
+struct Cli {
+    #[arg(long, env = "ABRA_ROOT", global = true)]
+    root: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "ABRA_FC_BINARY",
+        default_value = "firecracker",
+        global = true
+    )]
+    firecracker: PathBuf,
+    #[arg(long, env = "ABRA_FC_SSH_KEY", global = true)]
+    ssh_key: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Action,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    Up {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        rootfs: PathBuf,
+        #[arg(long)]
+        kernel: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        mem: u32,
+        #[arg(long, default_value_t = 1)]
+        vcpus: u8,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Snapshot {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        capsule: String,
+    },
+    Restore {
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        capsule: String,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, env = "ABRA_FC_KERNEL")]
+        kernel: Option<PathBuf>,
+        #[arg(long, env = "ABRA_FC_ROOTFS")]
+        rootfs: Option<PathBuf>,
+        #[arg(long, env = "ABRA_FC_MEM")]
+        mem: Option<u32>,
+        #[arg(long, env = "ABRA_FC_VCPUS")]
+        vcpus: Option<u8>,
+    },
+    Down {
+        #[arg(long)]
+        slot: u8,
+    },
+    Ls,
+    Fingerprint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Config {
+    kernel: PathBuf,
+    base_rootfs: PathBuf,
+    ssh_key: PathBuf,
+    mem_mib: u32,
+    vcpus: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RestoreOverrides {
+    kernel: Option<PathBuf>,
+    rootfs: Option<PathBuf>,
+    ssh_key: Option<PathBuf>,
+    mem_mib: Option<u32>,
+    vcpus: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum RestoreConfigNeed {
+    Native,
+    Portable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlotState {
+    slot: u8,
+    pid: u32,
+    #[serde(default)]
+    pid_starttime: u64,
+    api_socket: PathBuf,
+    tap: String,
+    host_ip: String,
+    guest_ip: String,
+    guest_mac: String,
+    rootfs: PathBuf,
+    kernel: PathBuf,
+    mem_mib: u32,
+    vcpus: u8,
+    status: String,
+}
+
+pub fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let root = cli.root.unwrap_or_else(default_root);
+    match cli.command {
+        Action::Up {
+            slot,
+            rootfs,
+            kernel,
+            mem,
+            vcpus,
+            token,
+        } => {
+            let key = resolve_key(cli.ssh_key)?;
+            let state = up(
+                &root,
+                &cli.firecracker,
+                slot,
+                Config {
+                    kernel,
+                    base_rootfs: rootfs,
+                    ssh_key: key,
+                    mem_mib: mem,
+                    vcpus,
+                },
+                token.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        Action::Snapshot { slot, capsule } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&snapshot(&root, &cli.firecracker, slot, &capsule)?)?
+            );
+        }
+        Action::Restore {
+            slot,
+            capsule,
+            snapshot,
+            kernel,
+            rootfs,
+            mem,
+            vcpus,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&restore(
+                    &root,
+                    &cli.firecracker,
+                    RestoreOverrides {
+                        kernel,
+                        rootfs,
+                        ssh_key: cli.ssh_key,
+                        mem_mib: mem,
+                        vcpus,
+                    },
+                    slot,
+                    &capsule,
+                    snapshot.as_deref()
+                )?)?
+            );
+        }
+        Action::Down { slot } => down(&root, slot)?,
+        Action::Ls => list(&root)?,
+        Action::Fingerprint => println!(
+            "{}",
+            serde_json::to_string_pretty(&fingerprint(&cli.firecracker)?)?
+        ),
+    }
+    Ok(())
+}
+
+fn default_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into())
+        .join(".abra")
+}
+
+fn adapter_root(root: &Path) -> PathBuf {
+    root.join("firecracker")
+}
+fn slot_dir(root: &Path, slot: u8) -> PathBuf {
+    adapter_root(root).join("slots").join(slot.to_string())
+}
+fn state_path(root: &Path, slot: u8) -> PathBuf {
+    slot_dir(root, slot).join("state.json")
+}
+
+fn resolve_key(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let key = explicit
+        .filter(|p| p.is_file())
+        .ok_or("SSH key not found; set --ssh-key or ABRA_FC_SSH_KEY")?;
+    if key.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(format!("SSH key must have mode 0600: {}", key.display()).into());
+    }
+    Ok(key)
+}
+
+fn network(slot: u8) -> (String, String, String, String) {
+    let tap = format!("osdtap{slot}");
+    let host = format!("172.30.{slot}.1");
+    let guest = format!("172.30.{slot}.2");
+    let mac = format!("06:00:AC:1E:{slot:02X}:02");
+    (tap, host, guest, mac)
+}
+
+fn up(root: &Path, fc: &Path, slot: u8, config: Config, token: Option<&str>) -> Result<SlotState> {
+    require_file(&config.kernel)?;
+    require_file(&config.base_rootfs)?;
+    require_file(&config.ssh_key)?;
+    let _ = down(root, slot);
+    let dir = slot_dir(root, slot);
+    create_slot_dir(root, slot)?;
+    let rootfs = dir.join("rootfs.ext4");
+    fs::copy(&config.base_rootfs, &rootfs)?;
+    if let Some(token) = token {
+        validate_token(token)?;
+        inject_token(&rootfs, token)?;
+    }
+    create_adapter_root(root)?;
+    fs::write(
+        adapter_root(root).join("config.json"),
+        serde_json::to_vec_pretty(&config)?,
+    )?;
+    start_vm(root, fc, slot, config, rootfs)
+}
+
+/// A started Firecracker process plus the host resources its slot holds before
+/// the VM is recorded as running. Dropping it kills the child, removes the TAP
+/// device, and deletes the API socket; `keep` hands ownership to the slot state.
+struct Vm {
+    child: Option<Child>,
+    socket: PathBuf,
+    tap: String,
+    host_ip: String,
+    guest_ip: String,
+    guest_mac: String,
+    armed: bool,
+}
+
+impl Vm {
+    fn pid(&self) -> u32 {
+        self.child.as_ref().map_or(0, Child::id)
+    }
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(child) = self.child.as_mut() {
+            cleanup_child(child);
+        }
+        teardown_network(&self.tap);
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+fn spawn_firecracker(fc: &Path, slot: u8, dir: &Path) -> Result<Vm> {
+    let (tap, host_ip, guest_ip, guest_mac) = network(slot);
+    setup_network(&tap, &host_ip, &guest_ip, &guest_mac)?;
+    let mut vm = Vm {
+        child: None,
+        socket: dir.join("firecracker.sock"),
+        tap,
+        host_ip,
+        guest_ip,
+        guest_mac,
+        armed: true,
+    };
+    vm.child = Some(
+        Command::new(fc)
+            .args(["--api-sock"])
+            .arg(&vm.socket)
+            .stdout(Stdio::from(fs::File::create(dir.join("stdout.log"))?))
+            .stderr(Stdio::from(fs::File::create(dir.join("stderr.log"))?))
+            .spawn()?,
+    );
+    wait_path(&vm.socket, Duration::from_secs(5))?;
+    fs::set_permissions(&vm.socket, fs::Permissions::from_mode(0o600))?;
+    Ok(vm)
+}
+
+fn finish_start(
+    root: &Path,
+    slot: u8,
+    vm: Vm,
+    config: &Config,
+    rootfs: PathBuf,
+    ssh_timeout: Duration,
+) -> Result<SlotState> {
+    let state = SlotState {
+        slot,
+        pid: vm.pid(),
+        pid_starttime: proc_starttime(vm.pid()).unwrap_or(0),
+        api_socket: vm.socket.clone(),
+        tap: vm.tap.clone(),
+        host_ip: vm.host_ip.clone(),
+        guest_ip: vm.guest_ip.clone(),
+        guest_mac: vm.guest_mac.clone(),
+        rootfs,
+        kernel: config.kernel.clone(),
+        mem_mib: config.mem_mib,
+        vcpus: config.vcpus,
+        status: "running".into(),
+    };
+    write_state(root, &state)?;
+    wait_ssh(&state, &config.ssh_key, ssh_timeout)?;
+    vm.keep();
+    Ok(state)
+}
+
+fn start_vm(
+    root: &Path,
+    fc: &Path,
+    slot: u8,
+    config: Config,
+    rootfs: PathBuf,
+) -> Result<SlotState> {
+    let dir = slot_dir(root, slot);
+    create_slot_dir(root, slot)?;
+    let log = dir.join("firecracker.log");
+    let vm = spawn_firecracker(fc, slot, &dir)?;
+    fs::File::create(&log)?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/logger",
+        &json!({"log_path":log,"level":"Info","show_level":true,"show_log_origin":true}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/machine-config",
+        &json!({"vcpu_count":config.vcpus,"mem_size_mib":config.mem_mib,"smt":false,"track_dirty_pages":true}),
+    )?;
+    let (guest_ip, host_ip) = (&vm.guest_ip, &vm.host_ip);
+    let boot = format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/os-desktop-init.sh ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off");
+    api(
+        &vm.socket,
+        "PUT",
+        "/boot-source",
+        &json!({"kernel_image_path":config.kernel,"boot_args":boot}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/drives/rootfs",
+        &json!({"drive_id":"rootfs","path_on_host":rootfs,"is_root_device":true,"is_read_only":false}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/network-interfaces/net1",
+        &json!({"iface_id":"net1","guest_mac":vm.guest_mac,"host_dev_name":vm.tap}),
+    )?;
+    api(
+        &vm.socket,
+        "PUT",
+        "/actions",
+        &json!({"action_type":"InstanceStart"}),
+    )?;
+    finish_start(root, slot, vm, &config, rootfs, Duration::from_secs(90))
+}
+
+fn file_digest(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(fs::File::open(path)?)?;
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn artifact_observation(path: &Path) -> Value {
+    match file_digest(path) {
+        Ok(digest) => json!({"digest":digest,"captured":false,"available":true}),
+        Err(_) => json!({"captured":false,"available":false,"error":"digest_unavailable"}),
+    }
+}
+
+fn host_observation(state: &SlotState, config: &Config) -> Value {
+    json!({
+        "collector":"firecracker-host",
+        "observed_at_unix_ms":abra_core::now_ms(),
+        "architecture":std::env::consts::ARCH,
+        "base_image":artifact_observation(&config.base_rootfs),
+        "kernel":artifact_observation(&state.kernel),
+        "configured_resources":{"memory_mb":state.mem_mib,"cpus":state.vcpus},
+        "consistency":{"mode":"best-effort","applications_quiesced":false}
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn capture_command(barrier: &str, host: &Value) -> Result<String> {
+    if barrier.is_empty()
+        || barrier.len() > 64
+        || !barrier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("invalid observation barrier".into());
+    }
+    let host = shell_quote(&serde_json::to_string(host)?);
+    // Cleanup only this capture. The observer creates it without overwriting an existing file.
+    Ok(format!(
+        "set -e; /usr/local/libexec/abra-observer --workspace /workspace --once --barrier '{barrier}' >/dev/null; trap 'rm -f /workspace/.abra/observed-{barrier}.json' EXIT; abra --root /var/lib/abra --json snapshot /workspace --observation-barrier '{barrier}' --observation-host {host}; sync"
+    ))
+}
+
+fn validate_capture_response(response: &Value, barrier: &str) -> Result<()> {
+    if response.get("observation_barrier").and_then(Value::as_str) != Some(barrier) {
+        return Err("guest snapshot did not confirm the observation barrier".into());
+    }
+    Ok(())
+}
+
+fn snapshot(root: &Path, fc: &Path, slot: u8, capsule: &str) -> Result<Value> {
+    let state = read_state(root, slot)?;
+    ensure_running(&state)?;
+    let config: Config =
+        serde_json::from_slice(&fs::read(adapter_root(root).join("config.json"))?)?;
+    let barrier = format!("fc-{slot}-{:032x}", rand::random::<u128>());
+    let host = host_observation(&state, &config);
+    let host_status = Command::new(std::env::current_exe()?.with_file_name("abra"))
+        .args([
+            "--root",
+            root.to_str().ok_or("non-UTF8 root")?,
+            "--json",
+            "status",
+        ])
+        .output()?;
+    if !host_status.status.success() {
+        return Err("could not determine host Abra peer id".into());
+    }
+    let host_status: Value = serde_json::from_slice(&host_status.stdout)?;
+    let host_peer = host_status
+        .get("peer_id")
+        .and_then(Value::as_str)
+        .ok_or("host status lacks peer_id")?;
+    let portable = ssh_output(&state, &config.ssh_key, &capture_command(&barrier, &host)?)?;
+    let portable: Value = serde_json::from_str(&portable)?;
+    validate_capture_response(&portable, &barrier)?;
+    let portable_snapshot = portable
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or("guest snapshot response lacks snapshot_id")?
+        .to_owned();
+    api(
+        &state.api_socket,
+        "PATCH",
+        "/vm",
+        &json!({"state":"Paused"}),
+    )?;
+    let captured = (|| {
+        let snap_dir = slot_dir(root, slot).join("snapshots").join(epoch_id());
+        fs::create_dir_all(&snap_dir)?;
+        let vmstate = snap_dir.join("vmstate");
+        let memory = snap_dir.join("memory");
+        let disk = snap_dir.join("disk");
+        api(
+            &state.api_socket,
+            "PUT",
+            "/snapshot/create",
+            &json!({
+                "snapshot_type": "Full",
+                "snapshot_path": vmstate,
+                "mem_file_path": memory
+            }),
+        )?;
+        fs::copy(&state.rootfs, &disk)?;
+        let fp = fingerprint_for_snapshot(fc, &vmstate)?;
+        Ok::<_, Box<dyn std::error::Error>>((vmstate, memory, disk, fp))
+    })();
+    let resumed = api(
+        &state.api_socket,
+        "PATCH",
+        "/vm",
+        &json!({"state":"Resumed"}),
+    );
+    if let Err(error) = resumed {
+        eprintln!("warning: failed to resume slot {slot}: {error}");
+    }
+    let (vmstate, memory, disk, fp) = captured?;
+
+    // The guest sends the portable parent only after resume; the paused-time
+    // disk copy is attached once it arrives, then dropped whatever happened.
+    let attached = (|| {
+        ssh(
+            &state,
+            &config.ssh_key,
+            &format!(
+                "abra --root /var/lib/abra send '{host_peer}' --capsule '{portable_snapshot}' >/dev/null"
+            ),
+        )?;
+        let portable_hash: Hash = portable_snapshot.parse()?;
+        let capsule_hash: Hash = capsule.parse()?;
+        let receive_started = Instant::now();
+        while receive_started.elapsed() < Duration::from_secs(30) {
+            if AbraStore::open(root)?
+                .capsules
+                .get(&capsule_hash)
+                .and_then(|cap| cap.snapshot(&portable_hash))
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if AbraStore::open(root)?
+            .capsules
+            .get(&capsule_hash)
+            .and_then(|cap| cap.snapshot(&portable_hash))
+            .is_none()
+        {
+            return Err("portable guest snapshot was not received before native attach".into());
+        }
+        control(
+            root,
+            &json!({"op":"native-attach","capsule":capsule,"fingerprint":fp,
+            "parent_snapshot":portable_snapshot,"snapshot_type":"Full","artifact_root":slot_dir(root, slot),
+            "artifacts":[{"role":"vmstate","path":vmstate},{"role":"memory","path":memory},{"role":"disk","path":disk}]}),
+        )
+    })();
+    if let Err(error) = fs::remove_file(&disk) {
+        eprintln!("warning: failed to remove snapshot disk copy: {error}");
+    }
+    snapshot_output(&portable_snapshot, &barrier, &attached?)
+}
+
+fn restore(
+    root: &Path,
+    fc: &Path,
+    overrides: RestoreOverrides,
+    slot: u8,
+    capsule: &str,
+    requested: Option<&str>,
+) -> Result<Value> {
+    let started = Instant::now();
+    let store = AbraStore::open(root)?;
+    let capsule_id: Hash = capsule.parse()?;
+    let cap = store.capsules.get(&capsule_id).ok_or("unknown capsule")?;
+    let snapshot_id = match requested {
+        Some(id) => id.parse()?,
+        None => {
+            cap.label("main")
+                .ok_or("capsule has no main head")?
+                .snapshot_id
+        }
+    };
+    let record = cap
+        .snapshot(&snapshot_id)
+        .ok_or("snapshot not found in capsule")?;
+    // Always probe the live receiver; a captured fingerprint never identifies it.
+    let local = fingerprint(fc)?;
+    let plan = plan_restore(
+        &store.cas,
+        &record.raw,
+        Some(&local),
+        &["vmstate", "memory", "disk"],
+    )?;
+    if plan.mode == RestoreMode::Unavailable {
+        return Err(format!(
+            "snapshot cannot be restored: {}",
+            plan.portable
+                .error
+                .as_deref()
+                .unwrap_or("portable tree unavailable")
+        )
+        .into());
+    }
+    let mut fallback_reason = serde_json::to_value(&plan.native.status)?;
+    let matched = if plan.native.status == NativeStatus::Eligible {
+        matching_native(Some(&plan.native.artifacts), &local)
+    } else {
+        None
+    };
+    if let Some((vmstate, memory, disk)) = matched {
+        let config = resolve_restore_config(root, overrides.clone(), RestoreConfigNeed::Native)?;
+        let native_attempt = (|| -> Result<Value> {
+            let _ = down(root, slot);
+            let dir = slot_dir(root, slot);
+            create_slot_dir(root, slot)?;
+            let vmstate_path = dir.join("restore.vmstate");
+            let memory_path = dir.join("restore.memory");
+            let disk_path = dir.join("rootfs.ext4");
+            store.cas.copy_to_file(&vmstate.blob, &vmstate_path)?;
+            store.cas.copy_to_file(&memory.blob, &memory_path)?;
+            store.cas.copy_to_file(&disk.blob, &disk_path)?;
+            let vm = spawn_firecracker(fc, slot, &dir)?;
+            api(
+                &vm.socket,
+                "PUT",
+                "/snapshot/load",
+                &json!({"snapshot_path":vmstate_path,"mem_file_path":memory_path,
+            "track_dirty_pages":true,"resume_vm":false,"network_overrides":[{"iface_id":"net1","host_dev_name":vm.tap,"guest_mac":vm.guest_mac}]}),
+            )?;
+            api(
+                &vm.socket,
+                "PATCH",
+                "/drives/rootfs",
+                &json!({"drive_id":"rootfs","path_on_host":disk_path}),
+            )?;
+            api(&vm.socket, "PATCH", "/vm", &json!({"state":"Resumed"}))?;
+            finish_start(root, slot, vm, &config, disk_path, Duration::from_secs(30))?;
+            Ok(
+                json!({"mode":"native","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"restore_plan":plan}),
+            )
+        })();
+        match native_attempt {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                eprintln!("native restore unavailable; using portable fallback: {error}");
+                fallback_reason = json!({"native_restore_failed":error.to_string()});
+                let _ = down(root, slot);
+            }
+        }
+    }
+    if !plan.portable.available {
+        return Err(format!(
+            "native restore failed and portable fallback is unavailable: {}",
+            plan.portable
+                .error
+                .as_deref()
+                .unwrap_or("snapshot lacks files")
+        )
+        .into());
+    }
+    let config = resolve_restore_config(root, overrides, RestoreConfigNeed::Portable)?;
+    let temp = tempfile::tempdir()?;
+    materialize(
+        &store.cas,
+        &record.raw.manifest().files.ok_or("snapshot lacks files")?,
+        temp.path(),
+    )?;
+    let metadata = fresh_workspace_metadata(temp.path())?;
+    let recipes = record.raw.manifest().recipes.clone().unwrap_or_default();
+    let recipes_path = metadata.join("recipes.json");
+    fs::write(&recipes_path, serde_json::to_vec(&recipes)?)?;
+    fs::set_permissions(&recipes_path, fs::Permissions::from_mode(0o600))?;
+    if let Some(observed) = record
+        .raw
+        .manifest()
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("dev.abra.observed"))
+    {
+        let observed_path = metadata.join("received-observed.json");
+        fs::write(&observed_path, serde_json::to_vec(observed)?)?;
+        fs::set_permissions(&observed_path, fs::Permissions::from_mode(0o600))?;
+    }
+    let state = up(root, fc, slot, config.clone(), None)?;
+    restore_workspace(temp.path(), &state, &config.ssh_key)?;
+    ssh(
+        &state,
+        &config.ssh_key,
+        "chmod 700 /workspace/.abra && chmod 600 /workspace/.abra/*.json",
+    )?;
+    eprintln!(
+        "recipes (data only; not executed): {}",
+        serde_json::to_string_pretty(&recipes)?
+    );
+    Ok(
+        json!({"mode":"portable-fallback","snapshot_id":snapshot_id,"fingerprint":local,"restore_ms":started.elapsed().as_millis(),"recipes":recipes,"fallback_reason":fallback_reason,"restore_plan":plan}),
+    )
+}
+
+fn matching_native<'a>(
+    native: Option<&'a [NativeBlobRef]>,
+    fp: &Fingerprint,
+) -> Option<(&'a NativeBlobRef, &'a NativeBlobRef, &'a NativeBlobRef)> {
+    let matching: Vec<_> = native?.iter().filter(|n| &n.fingerprint == fp).collect();
+    Some((
+        matching.iter().find(|n| n.role == "vmstate")?,
+        matching.iter().find(|n| n.role == "memory")?,
+        matching.iter().find(|n| n.role == "disk")?,
+    ))
+}
+
+fn snapshot_output(
+    portable_snapshot: &str,
+    barrier: &str,
+    native_response: &Value,
+) -> Result<Value> {
+    let native_snapshot = native_response
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or("native-attach response lacks snapshot_id")?;
+    Ok(json!({
+        "portable_snapshot_id": portable_snapshot,
+        "native_snapshot_id": native_snapshot,
+        "barrier": barrier,
+    }))
+}
+
+fn resolve_restore_config(
+    root: &Path,
+    overrides: RestoreOverrides,
+    need: RestoreConfigNeed,
+) -> Result<Config> {
+    let path = adapter_root(root).join("config.json");
+    let existing = match fs::read(&path) {
+        Ok(bytes) => Some(serde_json::from_slice::<Config>(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let config_was_absent = existing.is_none();
+    let mut config = match existing {
+        Some(config) => config,
+        None => Config {
+            kernel: overrides.kernel.clone().unwrap_or_default(),
+            base_rootfs: overrides.rootfs.clone().unwrap_or_default(),
+            ssh_key: overrides.ssh_key.clone().unwrap_or_default(),
+            mem_mib: overrides.mem_mib.unwrap_or(512),
+            vcpus: overrides.vcpus.unwrap_or(1),
+        },
+    };
+    if let Some(value) = overrides.kernel {
+        config.kernel = value;
+    }
+    if let Some(value) = overrides.rootfs {
+        config.base_rootfs = value;
+    }
+    if let Some(value) = overrides.ssh_key {
+        config.ssh_key = value;
+    }
+    if let Some(value) = overrides.mem_mib {
+        config.mem_mib = value;
+    }
+    if let Some(value) = overrides.vcpus {
+        config.vcpus = value;
+    }
+    let mut missing = Vec::new();
+    if matches!(need, RestoreConfigNeed::Portable) && config.kernel.as_os_str().is_empty() {
+        missing.push("--kernel or ABRA_FC_KERNEL");
+    }
+    if matches!(need, RestoreConfigNeed::Portable) && config.base_rootfs.as_os_str().is_empty() {
+        missing.push("--rootfs or ABRA_FC_ROOTFS");
+    }
+    if config.ssh_key.as_os_str().is_empty() {
+        missing.push("--ssh-key or ABRA_FC_SSH_KEY");
+    }
+    if !missing.is_empty() {
+        return Err(format!("restore config is missing: {}", missing.join(", ")).into());
+    }
+    if matches!(need, RestoreConfigNeed::Portable) {
+        require_file(&config.kernel)?;
+        require_file(&config.base_rootfs)?;
+    }
+    resolve_key(Some(config.ssh_key.clone()))?;
+    if config_was_absent {
+        create_adapter_root(root)?;
+        fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    }
+    Ok(config)
+}
+
+fn fingerprint(fc: &Path) -> Result<Fingerprint> {
+    #[cfg(test)]
+    if let Ok(fake) = std::env::var("ABRA_FC_FAKE_FINGERPRINT") {
+        return Ok(serde_json::from_str(&fake)?);
+    }
+    let major = if let Ok(value) = std::env::var("ABRA_FC_SNAPSHOT_FORMAT_MAJOR") {
+        value.parse()?
+    } else {
+        let output = Command::new(fc).arg("--snapshot-version").output()?;
+        if !output.status.success() {
+            return Err("Firecracker --snapshot-version failed".into());
+        }
+        let text = String::from_utf8(output.stdout)?;
+        text.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .ok_or("unrecognized Firecracker snapshot version")?
+            .parse()?
+    };
+    Ok(Fingerprint {
+        os: "linux".into(),
+        arch: std::env::consts::ARCH.into(),
+        hypervisor: "firecracker".into(),
+        snapshot_format_major: major,
+        // This adapter does not set a Firecracker CPU template.
+        cpu_template: "-".into(),
+        cpu_identity: live_cpu_identity()?,
+    })
+}
+
+fn fingerprint_for_snapshot(fc: &Path, vmstate: &Path) -> Result<Fingerprint> {
+    let mut fp = fingerprint(fc)?;
+    let output = Command::new(fc)
+        .arg("--describe-snapshot")
+        .arg(vmstate)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let description = format!("{}\n{}", stdout, String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(format!("Firecracker could not describe snapshot: {description}").into());
+    }
+    // Firecracker 1.16 prints only `v<snapshot-data-version>` on stdout.
+    // Parse that dedicated command output, never stderr/release banner text.
+    let data_version = stdout.trim();
+    let version = data_version
+        .split(|character: char| character.is_whitespace() || character == '"' || character == ':')
+        .map(|word| word.trim_start_matches('v').trim_matches(','))
+        .find(|word| {
+            let parts: Vec<_> = word.split('.').collect();
+            parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok())
+        })
+        .ok_or_else(|| format!("could not parse snapshot data version from: {description}"))?;
+    fp.snapshot_format_major = version.split('.').next().unwrap().parse()?;
+    Ok(fp)
+}
+
+fn live_cpu_identity() -> Result<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo")?;
+    let field = |name: &str| {
+        cpuinfo
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| "unknown".into())
+    };
+    Ok(format!(
+        "vendor={};family={};model={};stepping={}",
+        field("vendor_id"),
+        field("cpu family"),
+        field("model"),
+        field("stepping")
+    ))
+}
+
+fn api(socket: &Path, method: &str, endpoint: &str, body: &Value) -> Result<()> {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--noproxy",
+            "*",
+            "--config",
+            "/dev/null",
+            "--write-out",
+            "\n%{http_code}",
+            "--unix-socket",
+        ])
+        .arg(socket)
+        .args([
+            "-X",
+            method,
+            "-H",
+            "Content-Type: application/json",
+            "--data",
+        ])
+        .arg(serde_json::to_string(body)?)
+        .arg(format!("http://localhost{endpoint}"))
+        .output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (response, status) = text.rsplit_once('\n').unwrap_or((&text, "000"));
+    if !output.status.success() || !status.starts_with('2') {
+        return Err(
+            format!("Firecracker {method} {endpoint} failed HTTP {status}: {response}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn setup_network(tap: &str, host: &str, guest: &str, mac: &str) -> Result<()> {
+    if !Command::new("ip")
+        .args(["link", "show", "dev", tap])
+        .status()?
+        .success()
+    {
+        run("sudo", &["ip", "tuntap", "add", "dev", tap, "mode", "tap"])?;
+    }
+    let _ = Command::new("sudo")
+        .args(["ip", "addr", "flush", "dev", tap, "scope", "global"])
+        .status();
+    run(
+        "sudo",
+        &["ip", "addr", "add", &format!("{host}/30"), "dev", tap],
+    )?;
+    run("sudo", &["ip", "link", "set", "dev", tap, "up"])?;
+    run(
+        "sudo",
+        &[
+            "ip",
+            "neigh",
+            "replace",
+            guest,
+            "lladdr",
+            mac,
+            "dev",
+            tap,
+            "nud",
+            "permanent",
+        ],
+    )?;
+    run("sudo", &["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+    if !Command::new("sudo")
+        .args([
+            "iptables",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            "172.30.0.0/16",
+            "-j",
+            "MASQUERADE",
+        ])
+        .stderr(Stdio::null())
+        .status()?
+        .success()
+    {
+        run(
+            "sudo",
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                "172.30.0.0/16",
+                "-j",
+                "MASQUERADE",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn down(root: &Path, slot: u8) -> Result<()> {
+    if let Ok(mut state) = read_state(root, slot) {
+        if state.pid != 0 && process_matches(&state) {
+            let _ = Command::new("kill").arg(state.pid.to_string()).status();
+            for _ in 0..20 {
+                if !pid_alive(state.pid) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if pid_alive(state.pid) {
+                let _ = Command::new("kill")
+                    .args(["-9", &state.pid.to_string()])
+                    .status();
+            }
+        }
+        let _ = Command::new("sudo")
+            .args(["ip", "link", "del", &state.tap])
+            .status();
+        let _ = fs::remove_file(&state.api_socket);
+        state.status = "stopped".into();
+        state.pid = 0;
+        write_state(root, &state)?;
+    }
+    cleanup_global_network_if_idle(root);
+    Ok(())
+}
+
+fn list(root: &Path) -> Result<()> {
+    let dir = adapter_root(root).join("slots");
+    let mut states = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(bytes) = fs::read(entry.path().join("state.json")) {
+                if let Ok(mut state) = serde_json::from_slice::<SlotState>(&bytes) {
+                    if state.pid != 0 && !pid_alive(state.pid) {
+                        state.status = "stale".into();
+                    }
+                    states.push(state);
+                }
+            }
+        }
+    }
+    states.sort_by_key(|s| s.slot);
+    println!("{}", serde_json::to_string_pretty(&states)?);
+    Ok(())
+}
+
+const SSH_OPTIONS: [&str; 9] = [
+    "-q",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=2",
+];
+
+/// `ssh`/`scp` with the one option list every guest call uses.
+fn transport_command(program: &str, key: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(SSH_OPTIONS).arg("-i").arg(key);
+    command
+}
+
+fn ssh_command(state: &SlotState, key: &Path) -> Command {
+    let mut command = transport_command("ssh", key);
+    command.arg(format!("root@{}", state.guest_ip));
+    command
+}
+
+fn ssh(state: &SlotState, key: &Path, command: &str) -> Result<()> {
+    let status = ssh_command(state, key).arg(command).status()?;
+    if !status.success() {
+        return Err(format!("guest SSH command failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn ssh_output(state: &SlotState, key: &Path, command: &str) -> Result<String> {
+    let output = ssh_command(state, key).arg(command).output()?;
+    if !output.status.success() {
+        return Err(format!("guest SSH command failed with {}", output.status).into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn wait_ssh(state: &SlotState, key: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if ssh(state, key, "true").is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "guest SSH at {} was not ready after {}s",
+        state.guest_ip,
+        timeout.as_secs()
+    )
+    .into())
+}
+
+fn create_tree_archive(source: &Path, archive: &Path) -> Result<()> {
+    let status = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-C")
+        .arg(source)
+        .arg("-cf")
+        .arg(archive)
+        .arg(".")
+        .status()?;
+    if !status.success() {
+        return Err("failed to archive portable workspace".into());
+    }
+    Ok(())
+}
+
+fn fresh_workspace_metadata(workspace: &Path) -> Result<PathBuf> {
+    let metadata = workspace.join(".abra");
+    // This is reserved local metadata. Never write through links supplied by a snapshot.
+    match fs::symlink_metadata(&metadata) {
+        Ok(entry) if entry.is_dir() && !entry.file_type().is_symlink() => {
+            fs::remove_dir_all(&metadata)?
+        }
+        Ok(_) => fs::remove_file(&metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::create_dir(&metadata)?;
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o700))?;
+    Ok(metadata)
+}
+
+fn replace_tree_command(archive: &Path, destination: &Path, token: u128) -> Result<String> {
+    if !destination.is_absolute() || destination == Path::new("/") {
+        return Err("workspace destination must be an absolute non-root path".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or("workspace destination lacks a parent")?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("workspace destination is not UTF-8")?;
+    let staging = parent.join(format!(".{name}.abra-staging-{token:032x}"));
+    let previous = parent.join(format!(".{name}.abra-previous-{token:032x}"));
+    let archive = shell_quote(archive.to_str().ok_or("archive path is not UTF-8")?);
+    let destination = shell_quote(
+        destination
+            .to_str()
+            .ok_or("workspace destination is not UTF-8")?,
+    );
+    let staging = shell_quote(staging.to_str().ok_or("staging path is not UTF-8")?);
+    let previous = shell_quote(previous.to_str().ok_or("previous path is not UTF-8")?);
+    Ok(format!(
+        "set -eu
+cleanup() {{
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ! ( [ -e {destination} ] || [ -L {destination} ] ) && ( [ -e {previous} ] || [ -L {previous} ] ); then
+    mv -- {previous} {destination}
+  fi
+  rm -rf -- {staging}
+  rm -f -- {archive}
+  exit \"$status\"
+}}
+trap cleanup EXIT HUP INT TERM
+rm -rf -- {staging} {previous}
+mkdir -- {staging}
+tar -C {staging} -xf {archive}
+if [ -e {destination} ] || [ -L {destination} ]; then
+  mv -- {destination} {previous}
+fi
+mv -- {staging} {destination}
+rm -rf -- {previous}
+rm -f -- {archive}
+trap - EXIT HUP INT TERM"
+    ))
+}
+
+fn restore_workspace(source: &Path, state: &SlotState, key: &Path) -> Result<()> {
+    let local = tempfile::tempdir()?;
+    let archive = local.path().join("workspace.tar");
+    create_tree_archive(source, &archive)?;
+    let token = rand::random::<u128>();
+    let remote_archive = PathBuf::from(format!("/tmp/abra-workspace-{token:032x}.tar"));
+    let status = transport_command("scp", key)
+        .arg(&archive)
+        .arg(format!(
+            "root@{}:{}",
+            state.guest_ip,
+            remote_archive.display()
+        ))
+        .status()?;
+    if !status.success() {
+        return Err("portable workspace archive copy failed".into());
+    }
+    ssh(
+        state,
+        key,
+        &replace_tree_command(&remote_archive, Path::new("/workspace"), token)?,
+    )
+}
+
+fn control(root: &Path, request: &Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(root.join("cadabra.sock"))?;
+    serde_json::to_writer(&mut stream, request)?;
+    stream.write_all(b"\n")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let response: Value = serde_json::from_str(&line)?;
+    if response.get("ok") == Some(&Value::Bool(true)) {
+        return Ok(response["result"].clone());
+    }
+    Err(response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("cadabra control error")
+        .to_owned()
+        .into())
+}
+
+fn write_state(root: &Path, state: &SlotState) -> Result<()> {
+    create_slot_dir(root, state.slot)?;
+    fs::write(
+        state_path(root, state.slot),
+        serde_json::to_vec_pretty(state)?,
+    )?;
+    Ok(())
+}
+fn read_state(root: &Path, slot: u8) -> Result<SlotState> {
+    Ok(serde_json::from_slice(&fs::read(state_path(root, slot))?)?)
+}
+fn ensure_running(state: &SlotState) -> Result<()> {
+    if state.pid != 0 && pid_alive(state.pid) {
+        Ok(())
+    } else {
+        Err("slot is not running".into())
+    }
+}
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+fn proc_starttime(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+fn process_matches(state: &SlotState) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{}/comm", state.pid)).unwrap_or_default();
+    (comm.trim() == "firecracker" || comm.trim() == "jailer")
+        && state.pid_starttime != 0
+        && proc_starttime(state.pid) == Some(state.pid_starttime)
+}
+fn cleanup_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+fn teardown_network(tap: &str) {
+    let _ = Command::new("sudo")
+        .args(["ip", "link", "del", tap])
+        .status();
+}
+fn cleanup_global_network_if_idle(root: &Path) {
+    let any_running = fs::read_dir(adapter_root(root).join("slots"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read(e.path().join("state.json")).ok())
+        .filter_map(|b| serde_json::from_slice::<SlotState>(&b).ok())
+        .any(|s| s.pid != 0 && process_matches(&s));
+    if !any_running {
+        let _ = Command::new("sudo")
+            .args([
+                "iptables",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                "172.30.0.0/16",
+                "-j",
+                "MASQUERADE",
+            ])
+            .status();
+    }
+}
+fn validate_token(token: &str) -> Result<()> {
+    let suffix = token
+        .strip_prefix("abra-enroll/1/")
+        .ok_or("invalid enrollment token format")?;
+    if suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("invalid enrollment token format".into());
+    }
+    Ok(())
+}
+fn inject_token(rootfs: &Path, token: &str) -> Result<()> {
+    let token_file = write_token_temp(token)?;
+    let mount = tempfile::tempdir()?;
+    run(
+        "sudo",
+        &[
+            "mount",
+            "-o",
+            "loop,nodev,nosuid",
+            rootfs.to_str().ok_or("non-UTF8 rootfs path")?,
+            mount.path().to_str().ok_or("non-UTF8 mount path")?,
+        ],
+    )?;
+    let result = (|| -> Result<()> {
+        for component in [mount.path().join("etc"), mount.path().join("etc/abra")] {
+            if let Ok(meta) = fs::symlink_metadata(&component) {
+                if meta.file_type().is_symlink() {
+                    return Err(
+                        format!("refusing symlinked guest path: {}", component.display()).into(),
+                    );
+                }
+            }
+        }
+        let etc = mount.path().join("etc/abra");
+        run_owned(
+            "sudo",
+            ["mkdir", "-p", "--"]
+                .into_iter()
+                .map(Into::into)
+                .chain([etc.as_os_str().to_owned()]),
+        )?;
+        let path = etc.join("token");
+        guard_token_destination(&path)?;
+        run_owned("sudo", token_install_args(token_file.path(), &path))?;
+        let output = Command::new("sudo")
+            .args(["stat", "-c", "%F:%u:%g:%a", "--"])
+            .arg(&path)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("sudo stat failed for {}", path.display()).into());
+        }
+        if String::from_utf8(output.stdout)?.trim() != "regular file:0:0:600" {
+            return Err(format!(
+                "guest token must be a root:root 0600 regular file: {}",
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let unmounted = Command::new("sudo")
+        .args(["umount", mount.path().to_str().unwrap()])
+        .status()?
+        .success();
+    if !unmounted {
+        let _ = Command::new("sudo")
+            .args(["umount", "-l", mount.path().to_str().unwrap()])
+            .status();
+    }
+    token_file.close()?;
+    result
+}
+
+fn guard_token_destination(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "guest token path must be a regular file or absent: {}",
+            path.display()
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            guard_token_destination_with_sudo(path)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn guard_token_destination_with_sudo(path: &Path) -> Result<()> {
+    let output = Command::new("sudo")
+        .args(["stat", "-c", "%F", "--"])
+        .arg(path)
+        .output()?;
+    if output.status.success() {
+        if String::from_utf8(output.stdout)?.trim() == "regular file" {
+            return Ok(());
+        }
+        return Err(format!(
+            "guest token path must be a regular file or absent: {}",
+            path.display()
+        )
+        .into());
+    }
+
+    let exists = Command::new("sudo")
+        .args(["test", "-e"])
+        .arg(path)
+        .status()?;
+    if exists.success() {
+        Err(format!("sudo stat failed for {}", path.display()).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn write_token_temp(token: &str) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(token.as_bytes())?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn token_install_args(source: &Path, destination: &Path) -> Vec<std::ffi::OsString> {
+    ["install", "-m", "0600", "-o", "root", "-g", "root", "--"]
+        .into_iter()
+        .map(Into::into)
+        .chain([
+            source.as_os_str().to_owned(),
+            destination.as_os_str().to_owned(),
+        ])
+        .collect()
+}
+
+fn create_adapter_root(root: &Path) -> Result<()> {
+    let dir = adapter_root(root);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn create_slot_dir(root: &Path, slot: u8) -> Result<()> {
+    create_adapter_root(root)?;
+    let slots = adapter_root(root).join("slots");
+    fs::create_dir_all(&slots)?;
+    fs::set_permissions(&slots, fs::Permissions::from_mode(0o700))?;
+    let dir = slot_dir(root, slot);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+fn wait_path(path: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("timed out waiting for {}", path.display()).into())
+}
+fn require_file(path: &Path) -> Result<()> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(format!("missing file: {}", path.display()).into())
+    }
+}
+fn epoch_id() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+fn run(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} {:?} failed: {status}", args).into())
+    }
+}
+
+fn run_owned(program: &str, args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<()> {
+    let args: Vec<_> = args.into_iter().collect();
+    let status = Command::new(program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} {args:?} failed: {status}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_file(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"fixture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn capture_command_quotes_host_facts_and_pins_barrier() {
+        let host = json!({"note":"a' $(do-not-execute) `literal`"});
+        let command = capture_command("capture_1", &host).unwrap();
+        assert!(command.contains("--observation-barrier 'capture_1'"));
+        assert!(command.contains("observed-capture_1.json"));
+        assert!(capture_command("../escape", &host).is_err());
+        assert!(
+            validate_capture_response(&json!({"observation_barrier":"wrong"}), "capture_1")
+                .is_err()
+        );
+        assert!(validate_capture_response(
+            &json!({"observation_barrier":"capture_1"}),
+            "capture_1"
+        )
+        .is_ok());
+        let quoted = shell_quote(&serde_json::to_string(&host).unwrap());
+        let echoed = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .unwrap();
+        assert!(echoed.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&echoed.stdout).unwrap(),
+            host
+        );
+    }
+
+    #[test]
+    fn environment_digest_identifies_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("image");
+        fs::write(&path, b"base-image").unwrap();
+        assert_eq!(
+            file_digest(&path).unwrap(),
+            format!("blake3:{}", blake3::hash(b"base-image").to_hex())
+        );
+        assert_eq!(
+            artifact_observation(&root.path().join("missing"))["error"],
+            "digest_unavailable"
+        );
+        let before = file_digest(&path).unwrap();
+        fs::write(&path, b"different-image").unwrap();
+        assert_ne!(before, file_digest(&path).unwrap());
+    }
+
+    #[test]
+    fn token_install_uses_root_ownership_and_private_mode() {
+        let args = token_install_args(Path::new("/tmp/source"), Path::new("/mnt/etc/abra/token"));
+        assert_eq!(
+            args,
+            [
+                "install",
+                "-m",
+                "0600",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "--",
+                "/tmp/source",
+                "/mnt/etc/abra/token",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn token_temp_file_is_private() {
+        let file = write_token_temp("abra-enroll/1/test").unwrap();
+        assert_eq!(
+            file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_to_string(file.path()).unwrap(),
+            "abra-enroll/1/test"
+        );
+    }
+
+    #[test]
+    fn token_destination_guard_accepts_only_regular_file_or_absent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        guard_token_destination(&path).unwrap();
+
+        fs::write(&path, b"old token").unwrap();
+        guard_token_destination(&path).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        symlink("/etc/shadow", &path).unwrap();
+        assert!(guard_token_destination(&path).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(guard_token_destination(&path).is_err());
+    }
+
+    #[test]
+    fn adapter_and_slot_directories_are_private() {
+        let root = tempfile::tempdir().unwrap();
+        create_slot_dir(root.path(), 0).unwrap();
+        for path in [
+            adapter_root(root.path()),
+            adapter_root(root.path()).join("slots"),
+            slot_dir(root.path(), 0),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_restore_config_lists_every_missing_required_input() {
+        let root = tempfile::tempdir().unwrap();
+        let error = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--kernel or ABRA_FC_KERNEL"));
+        assert!(error.contains("--rootfs or ABRA_FC_ROOTFS"));
+        assert!(error.contains("--ssh-key or ABRA_FC_SSH_KEY"));
+    }
+
+    #[test]
+    fn fresh_restore_config_is_written_and_defaults_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = fixture_file(root.path(), "vmlinux", 0o644);
+        let rootfs = fixture_file(root.path(), "rootfs.ext4", 0o644);
+        let key = fixture_file(root.path(), "id_rsa", 0o600);
+        let config = resolve_restore_config(
+            root.path(),
+            RestoreOverrides {
+                kernel: Some(kernel.clone()),
+                rootfs: Some(rootfs.clone()),
+                ssh_key: Some(key.clone()),
+                ..Default::default()
+            },
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap();
+        assert_eq!(config.mem_mib, 512);
+        assert_eq!(config.vcpus, 1);
+        let saved: Config = serde_json::from_slice(
+            &fs::read(adapter_root(root.path()).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.kernel, kernel);
+        assert_eq!(saved.base_rootfs, rootfs);
+        assert_eq!(saved.ssh_key, key);
+    }
+
+    #[test]
+    fn existing_restore_config_keeps_values_without_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            kernel: fixture_file(root.path(), "kernel", 0o644),
+            base_rootfs: fixture_file(root.path(), "disk", 0o644),
+            ssh_key: fixture_file(root.path(), "key", 0o600),
+            mem_mib: 768,
+            vcpus: 2,
+        };
+        fs::create_dir_all(adapter_root(root.path())).unwrap();
+        fs::write(
+            adapter_root(root.path()).join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap();
+        assert_eq!(resolved.mem_mib, 768);
+        assert_eq!(resolved.vcpus, 2);
+    }
+
+    #[test]
+    fn native_restore_does_not_require_fallback_images() {
+        let root = tempfile::tempdir().unwrap();
+        let key = fixture_file(root.path(), "key", 0o600);
+        let config = resolve_restore_config(
+            root.path(),
+            RestoreOverrides {
+                ssh_key: Some(key.clone()),
+                ..Default::default()
+            },
+            RestoreConfigNeed::Native,
+        )
+        .unwrap();
+        assert_eq!(config.ssh_key, key);
+        assert!(config.kernel.as_os_str().is_empty());
+        let error = resolve_restore_config(
+            root.path(),
+            RestoreOverrides::default(),
+            RestoreConfigNeed::Portable,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--kernel"));
+        assert!(error.contains("--rootfs"));
+    }
+
+    #[test]
+    fn workspace_archive_preserves_links_and_replaces_stale_files() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let outside = root.path().join("outside");
+        let destination = root.path().join("work space's");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(outside.join("private"), b"stay outside").unwrap();
+        fs::write(source.join("checkpoint"), b"saved").unwrap();
+        fs::write(destination.join("stale"), b"remove me").unwrap();
+        symlink(&outside, source.join("link")).unwrap();
+        let archive = root.path().join("files.tar");
+        create_tree_archive(&source, &archive).unwrap();
+        let command = replace_tree_command(&archive, &destination, 1).unwrap();
+        let result = Command::new("sh").args(["-c", &command]).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!destination.join("stale").exists());
+        assert_eq!(fs::read(destination.join("checkpoint")).unwrap(), b"saved");
+        assert!(fs::symlink_metadata(destination.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(destination.join("link")).unwrap(), outside);
+        assert_eq!(fs::read(outside.join("private")).unwrap(), b"stay outside");
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn invalid_archive_keeps_existing_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("workspace");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("original"), b"keep").unwrap();
+        let archive = root.path().join("invalid.tar");
+        fs::write(&archive, b"not an archive").unwrap();
+        let command = replace_tree_command(&archive, &destination, 2).unwrap();
+        assert!(!Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert_eq!(fs::read(destination.join("original")).unwrap(), b"keep");
+        assert!(!archive.exists());
+        assert!(replace_tree_command(&archive, Path::new("/"), 3).is_err());
+    }
+
+    #[test]
+    fn portable_metadata_never_follows_snapshot_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let private = outside.path().join("recipes.json");
+        fs::write(&private, b"private").unwrap();
+        symlink(outside.path(), root.path().join(".abra")).unwrap();
+        let metadata = fresh_workspace_metadata(root.path()).unwrap();
+        fs::write(metadata.join("recipes.json"), b"[]").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"private");
+        fs::remove_file(metadata.join("recipes.json")).unwrap();
+        symlink(&private, metadata.join("recipes.json")).unwrap();
+        let metadata = fresh_workspace_metadata(root.path()).unwrap();
+        fs::write(metadata.join("recipes.json"), b"[]").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"private");
+    }
+
+    #[test]
+    fn snapshot_output_names_portable_and_native_ids() {
+        let output =
+            snapshot_output("portable", "fc-0-123", &json!({"snapshot_id":"native"})).unwrap();
+        assert_eq!(
+            output,
+            json!({
+                "portable_snapshot_id":"portable",
+                "native_snapshot_id":"native",
+                "barrier":"fc-0-123"
+            })
+        );
+    }
+
+    #[test]
+    fn restore_flags_parse_into_overrides() {
+        let cli = Cli::try_parse_from([
+            "abra-fc",
+            "--firecracker",
+            "/bin/firecracker",
+            "--ssh-key",
+            "/tmp/key",
+            "restore",
+            "--slot",
+            "3",
+            "--capsule",
+            "capsule",
+            "--kernel",
+            "/tmp/kernel",
+            "--rootfs",
+            "/tmp/rootfs",
+            "--mem",
+            "1024",
+            "--vcpus",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.firecracker, PathBuf::from("/bin/firecracker"));
+        assert_eq!(cli.ssh_key, Some(PathBuf::from("/tmp/key")));
+        match cli.command {
+            Action::Restore {
+                slot,
+                kernel,
+                rootfs,
+                mem,
+                vcpus,
+                ..
+            } => {
+                assert_eq!(slot, 3);
+                assert_eq!(kernel, Some(PathBuf::from("/tmp/kernel")));
+                assert_eq!(rootfs, Some(PathBuf::from("/tmp/rootfs")));
+                assert_eq!(mem, Some(1024));
+                assert_eq!(vcpus, Some(2));
+            }
+            _ => panic!("expected restore command"),
+        }
+    }
+}

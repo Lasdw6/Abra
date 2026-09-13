@@ -55,15 +55,22 @@ pub fn append_event(root: &Path, value: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true);
+    // Windows strips FILE_WRITE_DATA from an append handle, which is exactly
+    // the right the rotation below needs. The exclusive lock already
+    // serializes writers, so an explicit seek to the end is equivalent there.
+    #[cfg(windows)]
+    options.write(true);
+    #[cfg(not(windows))]
+    options.append(true);
+    let mut file = options.open(path)?;
     fs2::FileExt::lock_exclusive(&file)?;
     if file.metadata()?.len() >= MAX_EVENT_LOG_BYTES {
         file.set_len(0)?;
     }
+    #[cfg(windows)]
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))?;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;

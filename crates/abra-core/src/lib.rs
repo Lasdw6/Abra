@@ -25,7 +25,7 @@ pub mod link;
 pub mod manifest;
 pub mod restore;
 pub mod store;
-mod util;
+pub mod util;
 
 pub use error::{Error, Result};
 pub use util::{atomic_write, now_ms};

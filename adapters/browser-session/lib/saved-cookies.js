@@ -14,6 +14,13 @@ export const SAVED_COOKIE_CAPTURE_SCOPE = Object.freeze({
 });
 
 function chromeSafeStorageKey() {
+  // The Keychain holds Chrome's cookie encryption key on macOS only. Windows
+  // seals it with DPAPI under the user profile and Linux with the desktop
+  // keyring; neither is read here, so saved-cookie capture is macOS-only and
+  // Windows uses the managed browser profile instead.
+  if (process.platform !== 'darwin') {
+    return Promise.reject(Object.assign(new Error('saved Chrome cookie decryption is only supported on macOS'), { code: 'unsupported' }));
+  }
   return new Promise((resolve, reject) => {
     execFile('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Chrome Safe Storage'], { encoding: 'utf8', maxBuffer: 64 * 1024, timeout: 20000, killSignal: 'SIGKILL' }, (error, stdout) => {
       if (error) reject(Object.assign(new Error(error.killed ? 'Chrome Safe Storage access timed out' : 'Chrome Safe Storage access was denied or unavailable'), { code: 'unavailable' }));

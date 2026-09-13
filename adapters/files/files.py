@@ -17,8 +17,17 @@ MAX_ITEMS = 256
 MAX_ENTRIES = 10000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_DEPTH = 64
-NOFOLLOW = os.O_NOFOLLOW
-DIRECTORY = os.O_DIRECTORY
+# Windows has none of the directory-relative or no-follow open flags. Feature
+# detect them so the POSIX path below stays exactly what it always was.
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+BINARY = getattr(os, "O_BINARY", 0)
+SUPPORTS_DIR_FD = getattr(os, "supports_dir_fd", frozenset())
+USE_DIR_FD = bool(NOFOLLOW) and bool(DIRECTORY) and all(
+    call in SUPPORTS_DIR_FD for call in (os.open, os.stat, os.mkdir, os.rmdir, os.unlink)
+)
+REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 
 
 class Failure(Exception):
@@ -45,6 +54,19 @@ def name_only(value):
     return value
 
 
+def reparse_point(info):
+    """True for symlinks everywhere and for Windows junctions and reparse points."""
+    return bool(stat.S_ISLNK(info.st_mode) or (getattr(info, "st_file_attributes", 0) & REPARSE_POINT))
+
+
+def contained(path, root):
+    """True when path is root or lives inside it. Separate Windows drives are not."""
+    try:
+        return os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
 def identity(info):
     return {"device": str(info.st_dev), "inode": str(info.st_ino), "type": stat.S_IFMT(info.st_mode), "modified_ns": str(info.st_mtime_ns), "size": info.st_size}
 
@@ -55,6 +77,14 @@ def directory(path, create=False):
     # Entries inside it are still opened without following symlinks.
     if create:
         os.makedirs(path, mode=0o700, exist_ok=True)
+    if not USE_DIR_FD:
+        # Windows has no directory descriptors, so the resolved path is the
+        # handle. Every entry reached through it is still lstat-checked first.
+        resolved = os.path.realpath(path)
+        if not stat.S_ISDIR(os.stat(resolved).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), path)
+        yield resolved
+        return
     fd = os.open(os.path.realpath(path), os.O_RDONLY | DIRECTORY | NOFOLLOW)
     try:
         yield fd
@@ -62,9 +92,45 @@ def directory(path, create=False):
         os.close(fd)
 
 
-def root_identity(fd):
-    info = os.fstat(fd)
+def at_lstat(handle, name):
+    """Stat a child of an open directory handle without following links."""
+    if USE_DIR_FD:
+        return os.stat(name, dir_fd=handle, follow_symlinks=False)
+    return os.stat(os.path.join(handle, name), follow_symlinks=False)
+
+
+def at_mkdir(handle, name, mode=0o700):
+    if USE_DIR_FD:
+        os.mkdir(name, mode=mode, dir_fd=handle)
+    else:
+        os.mkdir(os.path.join(handle, name), mode)
+
+
+@contextlib.contextmanager
+def at_directory(handle, name):
+    """Open a child directory of an already-open directory, refusing links."""
+    if USE_DIR_FD:
+        fd = os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=handle)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+        return
+    child = os.path.join(handle, name)
+    info = os.stat(child, follow_symlinks=False)
+    if reparse_point(info) or not stat.S_ISDIR(info.st_mode):
+        fail("permission_denied", "Symlinks and special files cannot be transferred")
+    yield child
+
+
+def root_identity(handle):
+    info = os.fstat(handle) if isinstance(handle, int) else os.stat(handle)
     return {"device": str(info.st_dev), "inode": str(info.st_ino)}
+
+
+def drive_root(path):
+    """True for the POSIX root and for a Windows drive or UNC share root."""
+    return path == os.path.sep or os.path.splitdrive(path)[1] in ("\\", "/")
 
 
 def absolute_path(value):
@@ -73,6 +139,8 @@ def absolute_path(value):
     expanded = os.path.expanduser(value)
     if not os.path.isabs(expanded):
         fail("invalid_request", "Choose an absolute folder path or a path starting with ~")
+    # On Windows abspath normalises "/" to the native separator, so callers may
+    # send either one. The value returned stays a native absolute path.
     return os.path.abspath(expanded)
 
 
@@ -93,7 +161,7 @@ def _inventory(req):
     browse = options.get("path")
     path = absolute_path(browse) if browse else (roots[0] if not configured_roots else None)
     if path and not any(
-        os.path.commonpath((os.path.realpath(path), os.path.realpath(root))) == os.path.realpath(root)
+        contained(os.path.realpath(path), os.path.realpath(root))
         for root in roots
     ):
         fail("permission_denied", "This folder is outside the configured roots")
@@ -104,7 +172,7 @@ def _inventory(req):
     if path:
         candidate = os.path.dirname(path)
         if candidate != path and any(
-            os.path.commonpath((os.path.realpath(candidate), os.path.realpath(root))) == os.path.realpath(root)
+            contained(os.path.realpath(candidate), os.path.realpath(root))
             for root in roots
         ):
             parent = candidate
@@ -149,8 +217,10 @@ def _inventory(req):
                 # Only the visible page needs sizes and transfer identities.
                 for name, _ in page:
                     try:
-                        info = os.stat(name, dir_fd=root, follow_symlinks=False)
+                        info = at_lstat(root, name)
                     except FileNotFoundError:
+                        continue
+                    if reparse_point(info):
                         continue
                     if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
                         items.append(item(os.path.join(path, name), info, parent_id))
@@ -158,11 +228,11 @@ def _inventory(req):
         for selected in roots:
             try:
                 with directory(os.path.dirname(selected)) as parent_fd:
-                    info = os.stat(os.path.basename(selected) or ".", dir_fd=parent_fd, follow_symlinks=False)
+                    info = at_lstat(parent_fd, os.path.basename(selected) or ".")
                     if not stat.S_ISDIR(info.st_mode):
                         fail("invalid_request", "Selected paths must be existing folders")
                     selected_item = item(selected, info, root_identity(parent_fd))
-                    if selected == os.path.sep:
+                    if drive_root(selected):
                         selected_item["transferable"] = False
                         selected_item["reason"] = "Open this folder and select its contents"
                     items.append(selected_item)
@@ -195,17 +265,65 @@ def inventory(req):
                             "offset": 0, "next_offset": None}}
 
 
+def copy_by_path(source_dir, target_dir, name, before, budget, depth):
+    """Windows copy step.
+
+    Without O_NOFOLLOW the link refusal is lstat-then-verify: the caller has
+    already rejected symlinks, junctions, and other reparse points, and the
+    entry identity is compared again after the copy. The guarantee is narrower
+    than the POSIX descriptor walk because a swap during the copy is detected
+    afterwards rather than prevented.
+    """
+    source_path, target_path = os.path.join(source_dir, name), os.path.join(target_dir, name)
+    if stat.S_ISDIR(before.st_mode):
+        os.mkdir(target_path)
+        with os.scandir(source_path) as entries:
+            for entry in entries:
+                copy_entry(source_path, target_path, entry.name, budget, depth + 1)
+    else:
+        if budget["bytes"] + before.st_size > MAX_BYTES:
+            fail("limit_exceeded", "Transfer exceeds 1 GiB")
+        source = os.open(source_path, os.O_RDONLY | BINARY)
+        try:
+            opened = os.fstat(source)
+            if identity(before) != identity(opened):
+                fail("stale_source", "A source item changed during capture")
+            target = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | BINARY, 0o600)
+            try:
+                while True:
+                    chunk = os.read(source, 1024 * 1024)
+                    if not chunk:
+                        break
+                    budget["bytes"] += len(chunk)
+                    if budget["bytes"] > MAX_BYTES:
+                        fail("limit_exceeded", "Transfer exceeds 1 GiB")
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(target, view):]
+                budget["files"] += 1
+            finally:
+                os.close(target)
+        finally:
+            os.close(source)
+    after = at_lstat(source_dir, name)
+    if reparse_point(after) or identity(after) != identity(before):
+        fail("stale_source", "A source item changed during capture")
+
+
 def copy_entry(source_fd, target_fd, name, budget, depth=0, expected=None):
     name_only(name)
-    before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+    before = at_lstat(source_fd, name)
     if expected is not None and identity(before) != expected:
         fail("stale_source", "The selected item changed; refresh the device inventory")
-    if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
+    if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)) or reparse_point(before):
         fail("permission_denied", "Symlinks and special files cannot be transferred")
     budget["entries"] += 1
     if budget["entries"] > MAX_ENTRIES or depth > MAX_DEPTH:
         fail("limit_exceeded", "Transfer exceeds 10,000 entries or 64 folder levels")
-    flags = os.O_RDONLY | NOFOLLOW | os.O_NONBLOCK
+    if not USE_DIR_FD:
+        copy_by_path(source_fd, target_fd, name, before, budget, depth)
+        return
+    flags = os.O_RDONLY | NOFOLLOW | NONBLOCK
     if stat.S_ISDIR(before.st_mode):
         flags |= DIRECTORY
     source = os.open(name, flags, dir_fd=source_fd)
@@ -250,6 +368,16 @@ def copy_entry(source_fd, target_fd, name, budget, depth=0, expected=None):
 
 def remove_created(parent, name):
     """Delete only a failed import subtree through its already-open parent."""
+    if not USE_DIR_FD:
+        path = os.path.join(parent, name)
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    remove_created(path, entry.name)
+                else:
+                    os.unlink(os.path.join(path, entry.name))
+        os.rmdir(path)
+        return
     child = os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=parent)
     try:
         os.fchmod(child, 0o700)
@@ -279,17 +407,29 @@ def export(req):
     with directory(os.path.dirname(full)) as root, directory(staging) as stage:
         if source.get("root") != root_identity(root):
             fail("stale_source", "The source folder changed; refresh the device inventory")
-        os.mkdir("files", mode=0o700, dir_fd=stage)
-        target = os.open("files", os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=stage)
-        try:
+        at_mkdir(stage, "files")
+        with at_directory(stage, "files") as target:
             copy_entry(root, target, name, budget, expected=source["expected"])
-        finally:
-            os.close(target)
     return {"payload": {"schema": KIND, "name": name, **budget}, "files_path": os.path.join(staging, "files"), "floor": {"title": display(name, 200)}}
 
 
 def publish_entry(source_fd, target_fd, name):
     """Atomically publish without replacing an existing file, folder, or symlink."""
+    if not USE_DIR_FD:
+        # Windows MoveFileEx without MOVEFILE_REPLACE_EXISTING is the no-replace
+        # rename: one call that fails when the name is already taken. It does
+        # not distinguish an exchange from a fresh publish the way renameat2
+        # does, so a name created between the earlier scan and this call loses
+        # nothing but reports a conflict.
+        try:
+            os.rename(os.path.join(source_fd, name), os.path.join(target_fd, name))
+        except FileExistsError:
+            fail("conflict", f"{name} already exists in the destination; choose another folder")
+        except OSError as error:
+            if error.errno == errno.EEXIST or getattr(error, "winerror", None) == 183:
+                fail("conflict", f"{name} already exists in the destination; choose another folder")
+            raise
+        return
     libc = ctypes.CDLL(None, use_errno=True)
     encoded = os.fsencode(name)
     if sys.platform == "darwin":
@@ -299,7 +439,7 @@ def publish_entry(source_fd, target_fd, name):
         rename = libc.renameat2
         flag = 1  # RENAME_NOREPLACE
     else:
-        fail("unsupported_platform", "Files currently supports macOS and Linux")
+        fail("unsupported_platform", "Files currently supports Windows, macOS, and Linux")
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
     if rename(source_fd, encoded, target_fd, encoded, flag):
@@ -320,7 +460,7 @@ def import_files(req):
         fail("invalid_request", "Choose a destination folder on the receiving device")
     root = absolute_path(destination)
     real_materialized, real_root = os.path.realpath(materialized), os.path.realpath(root)
-    if os.path.commonpath((real_materialized, real_root)) == real_materialized:
+    if contained(real_root, real_materialized):
         fail("invalid_request", "The destination cannot be inside materialized files")
     budget = {"entries": 0, "files": 0, "bytes": 0}
     published = []
@@ -329,26 +469,25 @@ def import_files(req):
         for name in names:
             name_only(name)
             try:
-                os.stat(name, dir_fd=target_root, follow_symlinks=False)
+                at_lstat(target_root, name)
             except FileNotFoundError:
                 continue
             fail("conflict", f"{name} already exists in the destination; choose another folder")
         received = ".abra-incoming-" + uuid.uuid4().hex
-        os.mkdir(received, mode=0o700, dir_fd=target_root)
-        target = os.open(received, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=target_root)
+        at_mkdir(target_root, received)
         try:
-            for name in names:
-                copy_entry(source, target, name, budget)
-            for name in names:
-                publish_entry(target, target_root, name)
-                published.append(os.path.join(root, name))
+            with at_directory(target_root, received) as target:
+                for name in names:
+                    copy_entry(source, target, name, budget)
+                for name in names:
+                    publish_entry(target, target_root, name)
+                    published.append(os.path.join(root, name))
         except Exception as error:
             # Never remove published files: another process could already be using them.
             if published:
                 fail("partial_import", f"Import stopped: {error}. Already received: {', '.join(published)}")
             raise
         finally:
-            os.close(target)
             remove_created(target_root, received)
     return {"result": {"imported": True, "destination": root, "paths": published, **budget}}
 
@@ -368,6 +507,20 @@ def dispatch(req):
     fail("unsupported_verb", "Unsupported verb")
 
 
+# The parent may stop reading at any point; abra-cloud's e2e harness closes the
+# pipe as soon as it has the response it asked for. Writing to a closed pipe
+# raises BrokenPipeError on POSIX and OSError EINVAL on Windows. Deliver each
+# response eagerly so nothing is stranded in the buffer, and report a vanished
+# reader to the caller rather than raising through the loop.
+def emit(payload):
+    try:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
+
+
 def main():
     while True:
         line = sys.stdin.buffer.readline(1024 * 1024 + 1)
@@ -384,10 +537,24 @@ def main():
         except (OSError, ValueError, TypeError) as error:
             code = "not_found" if isinstance(error, FileNotFoundError) else "permission_denied" if isinstance(error, OSError) else "invalid_request"
             fields = {"ok": False, "error": {"code": code, "message": str(error), "retryable": False}}
-        print(json.dumps({"request_id": req.get("request_id") if isinstance(req, dict) else None, **fields}, separators=(",", ":")), flush=True)
+        if not emit({"request_id": req.get("request_id") if isinstance(req, dict) else None, **fields}):
+            return
         if len(line) > 1024 * 1024:
             return
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        # Point the interpreter's own shutdown flush at a file that always
+        # accepts writes, per the Python docs' note on SIGPIPE, so a closed
+        # stdout cannot resurface as an "Exception ignored" traceback. A reader
+        # that walked away is not this adapter's failure, so the exit stays 0.
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)

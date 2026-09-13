@@ -23,3 +23,5 @@ async function close() {
 }
 process.on('SIGINT', () => { close().finally(() => process.exit(0)); });
 process.on('SIGTERM', () => { close().finally(() => process.exit(0)); });
+// Windows delivers SIGBREAK rather than SIGTERM for a console shutdown request.
+if (process.platform === 'win32') process.on('SIGBREAK', () => { close().finally(() => process.exit(0)); });

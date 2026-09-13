@@ -63,9 +63,10 @@ node bin/abra-browser.js revoke "$HOME/Library/Application Support/Abra/browser-
 ```
 
 Tool data (signing key, receipts, install registry) lives under
-`~/Library/Application Support/Abra/browser-session` on macOS and
+`~/Library/Application Support/Abra/browser-session` on macOS,
+`%APPDATA%\Abra\browser-session` on Windows, and
 `$XDG_DATA_HOME/abra/browser-session` (default `~/.local/share/...`) elsewhere.
-`ABRA_BROWSER_DATA_DIR` overrides both. A fresh directory works: the key is
+`ABRA_BROWSER_DATA_DIR` overrides all three. A fresh directory works: the key is
 created on first use, so `import ... --to cdp <ws> --trust-sender <fp>` runs on
 a Linux box with only node and the bundle.
 
@@ -99,6 +100,37 @@ On Linux, `local` never falls back to a separate profile. Choose a normal Chrome
 tab from live inventory through the native connection. `export --from managed` is an
 explicit headless or sandbox operation and errors if none is running.
 
+## Platforms
+
+macOS, Linux, and Windows are supported. Node 22 or newer is required
+everywhere.
+
+The normal-Chrome connection works on all three. On macOS and Linux the host
+listens on a user-only Unix socket in the tool data directory; on Windows it
+listens on the named pipe `\\.\pipe\abra-browser-<hash>`, whose default ACL
+already limits it to the creating user's session. Windows reads the Chrome
+profile root from `%LOCALAPPDATA%\Google\Chrome\User Data`.
+
+Reading a *saved* Chrome profile is macOS-only, because the cookie encryption
+key lives in the macOS Keychain and there is no equivalent read here for
+Windows DPAPI or the Linux keyring. Listing a running Chrome's tabs without a
+debugging port needs osascript, which is also macOS-only. On Windows and Linux
+the adapter therefore uses the managed browser profile, or the normal-Chrome
+connection when remote debugging is enabled, and inventory omits the desktop
+tab list rather than failing.
+
+Tool data files are private through POSIX mode `0600`/`0700` on macOS and
+Linux. Windows has no such bits, so the data directory is restricted once with
+`icacls <dir> /inheritance:r /grant:r "<user>:(OI)(CI)F"` and files inherit it;
+a failure there is logged once rather than fatal. Files are written to a
+sibling temp name, flushed, and renamed over the target, with a short retry on
+`EPERM`/`EBUSY` for the Windows case where another process still holds the
+target open.
+
+Shutting the managed browser down asks it to close over CDP first. Windows has
+no SIGTERM, so the fallback there is `taskkill /PID <pid> /T /F` rather than a
+signal, which also reaches Chrome's renderer and GPU children.
+
 `preview --from local|managed|cdp` prints JSON metadata (`media_type`, `width`,
 `height`, `title`, `items`) and writes the image when `--out` is set. A
 debuggable browser yields a JPEG of the active page and the http(s) tab list.
@@ -115,7 +147,7 @@ and does not install cookies. `--to managed --detach` is the sandbox path: an
 isolated Abra-owned profile that does receive portable cookies. `--to normal`
 names the user Chrome path explicitly.
 
-Chrome is found at `CHROME_BIN`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, or `google-chrome` / `google-chrome-stable` / `chromium` / `chromium-browser` on PATH. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
+Chrome is found at `CHROME_BIN`, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, or `google-chrome` / `google-chrome-stable` / `chromium` / `chromium-browser` on PATH. On Windows the search is `CHROME_BIN`, then `Google\Chrome\Application\chrome.exe` under `%PROGRAMFILES%`, `%PROGRAMFILES(X86)%`, and `%LOCALAPPDATA%`, then PATH with PATHEXT, then the `App Paths\chrome.exe` registry entry. SQLite/Keychain fallback is deliberately unavailable rather than producing partial credentials.
 
 ## Playwright compatibility
 

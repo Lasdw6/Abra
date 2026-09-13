@@ -310,11 +310,17 @@ async function rejectSymlinks(root) {
 
 export function chromeRoot() {
   if (process.env.ABRA_BROWSER_CHROME_ROOT) return path.resolve(process.env.ABRA_BROWSER_CHROME_ROOT);
+  if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Google', 'Chrome', 'User Data');
   return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 }
 
+// A desktop Chrome root means local transfers go through the normal-browser
+// connection rather than the managed profile. Windows and macOS both have that
+// route. Reading a *saved* profile additionally needs the cookie encryption
+// key, which only macOS exposes, so saved-cookie capture stays macOS-only and
+// Windows falls back to the managed browser profile, as AbraApp presents it.
 export async function hasDesktopChromeRoot() {
-  return process.platform === 'darwin' && await exists(chromeRoot());
+  return ['darwin', 'win32'].includes(process.platform) && await exists(chromeRoot());
 }
 
 async function httpTabs(tabs) {
@@ -328,6 +334,11 @@ export async function listChromeTabs() {
   if (process.env.ABRA_BROWSER_TABS_JSON) {
     try { return JSON.parse(process.env.ABRA_BROWSER_TABS_JSON); }
     catch { throw new Error('ABRA_BROWSER_TABS_JSON must be a JSON array'); }
+  }
+  // osascript is the only way to read a running Chrome's tabs without a
+  // debugging port, and it exists only on macOS.
+  if (process.platform !== 'darwin') {
+    throw Object.assign(new Error('Reading a running Chrome\'s tabs without a debugging port is only supported on macOS. Use the managed browser profile or a cdp: source instead.'), { code: 'unsupported' });
   }
   try {
     const { stdout } = await execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', CHROME_TABS_SCRIPT], { timeout: 8000, killSignal: 'SIGKILL' });
@@ -549,13 +560,19 @@ export async function browserInventory({ cdpUrls = [] } = {}) {
     if (!['unavailable', 'timeout', 'setup_required'].includes(error.code)) throw error;
   }
   if (!normalReported && desktopChrome) {
-    const profile = await resolveProfile();
-    for (const tab of (await httpTabs(await listChromeTabs())).slice(0, 256)) {
-      const url = new URL(tab.url).href;
-      items.push({ id: `chrome:${tab.id}`, kind: 'dev.abra.browser.session.v1',
-        label: displayLabel(tab.title || url), detail: url.slice(0, 2000),
-        source: { type: 'local-tab', tab_id: String(tab.id), expected_url: url, profile },
-        options: {}, transferable: false });
+    try {
+      const profile = await resolveProfile();
+      for (const tab of (await httpTabs(await listChromeTabs())).slice(0, 256)) {
+        const url = new URL(tab.url).href;
+        items.push({ id: `chrome:${tab.id}`, kind: 'dev.abra.browser.session.v1',
+          label: displayLabel(tab.title || url), detail: url.slice(0, 2000),
+          source: { type: 'local-tab', tab_id: String(tab.id), expected_url: url, profile },
+          options: {}, transferable: false });
+      }
+    } catch (error) {
+      // Windows and Linux cannot enumerate a running Chrome's tabs without a
+      // debugging port. The managed browser below still reports its own.
+      if (error.code !== 'unsupported') throw error;
     }
   }
   const managed = await managedBrowserStatus();

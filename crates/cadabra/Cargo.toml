@@ -23,11 +23,21 @@ tokio = { workspace = true, features = ["net", "process"] }
 rand.workspace = true
 hex.workspace = true
 fs2.workspace = true
-rustix = { version = "1", features = ["fs", "process"] }
 tempfile.workspace = true
 data-encoding.workspace = true
 abra-relay.workspace = true
 reqwest.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

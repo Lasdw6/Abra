@@ -123,7 +123,8 @@ impl ExtraAdapterDir {
             source: "env",
         }
     }
-    /// Colon-separated `ABRA_ADAPTERS`, in the order it is written.
+    /// `ABRA_ADAPTERS`, split on the platform path separator (`:` on Unix,
+    /// `;` on Windows), in the order it is written.
     pub fn from_env() -> Vec<Self> {
         let Some(value) = std::env::var_os("ABRA_ADAPTERS") else {
             return Vec::new();
@@ -629,9 +630,11 @@ fn resolve_executable(dir: &Path, manifest: &AdapterManifest) -> Result<PathBuf>
         .as_deref()
         .map(|x| dir.join(x))
         .unwrap_or_else(|| dir.join(&manifest.name));
-    let executable = fs::canonicalize(&candidate)
+    // `dunce` keeps the path free of the Windows `\\?\` verbatim prefix,
+    // which interpreters cannot open.
+    let executable = dunce::canonicalize(&candidate)
         .map_err(|_| format!("adapter executable not found: {}", candidate.display()))?;
-    if !executable.starts_with(fs::canonicalize(dir)?) {
+    if !executable.starts_with(dunce::canonicalize(dir)?) {
         return Err("adapter executable escapes its directory".into());
     }
     Ok(executable)
@@ -749,7 +752,7 @@ pub async fn invoke(
         .ok_or("adapter request lacks verb")?
         .to_owned();
     let (request_id, request) = protocol::build_request(&verb, request)?;
-    let mut child = Command::new(&adapter.executable)
+    let mut child = adapter_command(&adapter.executable)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -778,6 +781,149 @@ pub async fn invoke(
         }
     }
 }
+/// The command that runs an adapter executable.
+///
+/// Unix executes the file and lets the kernel honour its shebang. Windows has
+/// no shebang, so the interpreter comes from the file's extension, or from the
+/// shebang line itself when the file has none.
+fn adapter_command(executable: &Path) -> Command {
+    let mut command = match interpreter(executable) {
+        None => Command::new(executable),
+        Some(Interpreter::Node) => {
+            let node = std::env::var_os("ABRA_NODE_BIN").unwrap_or_else(|| "node".into());
+            let mut command = Command::new(&node);
+            // An Electron build only behaves like Node when it is asked to.
+            if is_electron(Path::new(&node)) {
+                command.env("ELECTRON_RUN_AS_NODE", "1");
+            }
+            command.arg(executable);
+            command
+        }
+        Some(Interpreter::Python) => {
+            let (program, arguments) = python_program();
+            let mut command = Command::new(program);
+            command.args(arguments).arg(executable);
+            command
+        }
+    };
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    command
+}
+
+#[derive(Clone, Copy)]
+enum Interpreter {
+    Node,
+    Python,
+}
+
+/// The interpreter this file needs, or `None` when the OS can run it itself.
+fn interpreter(path: &Path) -> Option<Interpreter> {
+    if runs_itself(path) {
+        return None;
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => match extension.to_ascii_lowercase().as_str() {
+            "py" | "pyw" => Some(Interpreter::Python),
+            "js" | "mjs" | "cjs" => Some(Interpreter::Node),
+            _ => None,
+        },
+        // An adapter shipped without a suffix still names its interpreter.
+        None => shebang(path),
+    }
+}
+
+/// Unix marks a runnable adapter with its execute bit and the kernel reads the
+/// shebang, so nothing has to be guessed.
+#[cfg(unix)]
+fn runs_itself(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+}
+
+/// `CreateProcess` only launches real images and the shell's own script types.
+#[cfg(not(unix))]
+fn runs_itself(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["exe", "com", "bat", "cmd"]
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
+}
+
+fn shebang(path: &Path) -> Option<Interpreter> {
+    use std::io::Read;
+    let mut head = [0_u8; 128];
+    let read = fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .ok()?;
+    let line = std::str::from_utf8(&head[..read])
+        .ok()?
+        .lines()
+        .next()?
+        .strip_prefix("#!")?;
+    if line.contains("node") {
+        Some(Interpreter::Node)
+    } else if line.contains("python") {
+        Some(Interpreter::Python)
+    } else {
+        None
+    }
+}
+
+fn is_electron(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_lowercase();
+            name.contains("electron") || name.contains("abra teleport")
+        })
+}
+
+/// `ABRA_PYTHON_BIN`, then whichever of `python3`, `python` or the Windows
+/// `py -3` launcher is on `PATH`.
+fn python_program() -> (std::ffi::OsString, &'static [&'static str]) {
+    static RESOLVED: std::sync::OnceLock<(std::ffi::OsString, &'static [&'static str])> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            if let Some(configured) = std::env::var_os("ABRA_PYTHON_BIN") {
+                return (configured, &[][..]);
+            }
+            for candidate in ["python3", "python"] {
+                if on_path(candidate) {
+                    return (candidate.into(), &[][..]);
+                }
+            }
+            if cfg!(windows) && on_path("py") {
+                return ("py".into(), &["-3"][..]);
+            }
+            ("python".into(), &[][..])
+        })
+        .clone()
+}
+
+fn on_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let suffixes: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
+            .split(';')
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    std::env::split_paths(&paths).any(|directory| {
+        suffixes
+            .iter()
+            .any(|suffix| directory.join(format!("{program}{suffix}")).is_file())
+    })
+}
+
 async fn reap(child: &mut Child) -> Result<()> {
     let status = child.wait().await?;
     if !status.success() {
@@ -797,24 +943,122 @@ async fn cancel(child: &mut Child, request_id: &str) {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
-    fn adapter(root: &Path, dir: &str, name: &str, kind: &str, body: &str) {
+    /// What a fixture adapter does when it is invoked.
+    ///
+    /// Unix writes these as `/bin/sh` scripts and marks them executable.
+    /// Windows has no shebang, so the same behaviour is written as Python and
+    /// reaches the interpreter through [`adapter_command`].
+    enum Fixture {
+        /// Exit at once, without reading the request.
+        Exits,
+        /// Read the request and answer with something that is not a response.
+        AnswersGarbage,
+        /// Read the request and never answer.
+        Hangs,
+        /// Read the request and answer with `reply`, `{id}` replaced by the
+        /// request id. `record` first receives the raw request line.
+        Answers {
+            record: Option<PathBuf>,
+            reply: String,
+        },
+    }
+
+    fn answers(reply: &str) -> Fixture {
+        Fixture::Answers {
+            record: None,
+            reply: reply.into(),
+        }
+    }
+
+    fn records(path: &Path, reply: &str) -> Fixture {
+        Fixture::Answers {
+            record: Some(path.to_path_buf()),
+            reply: reply.into(),
+        }
+    }
+
+    /// A `files_path` that exists but lies outside the daemon-owned root.
+    fn outside_path() -> &'static str {
+        if cfg!(windows) {
+            "C:/Windows"
+        } else {
+            "/tmp"
+        }
+    }
+
+    /// Write the fixture and return the manifest `executable` name.
+    #[cfg(unix)]
+    fn write_fixture(directory: &Path, fixture: &Fixture) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let mut body = String::from("#!/bin/sh\n");
+        match fixture {
+            Fixture::Exits => body.push_str("exit 0\n"),
+            Fixture::AnswersGarbage => body.push_str("read line; echo nope\n"),
+            Fixture::Hangs => body.push_str("read line; sleep 2\n"),
+            Fixture::Answers { record, reply } => {
+                body.push_str("read line\n");
+                if let Some(path) = record {
+                    body.push_str(&format!("printf '%s' \"$line\" > '{}'\n", path.display()));
+                }
+                body.push_str(
+                    "id=$(printf '%s' \"$line\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\n",
+                );
+                body.push_str(&format!(
+                    "printf '{}\\n' \"$id\"\n",
+                    reply.replace("{id}", "%s")
+                ));
+            }
+        }
+        let executable = directory.join("run");
+        fs::write(&executable, body).unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        "run".into()
+    }
+
+    #[cfg(not(unix))]
+    fn write_fixture(directory: &Path, fixture: &Fixture) -> String {
+        fn literal(text: &str) -> String {
+            serde_json::to_string(text).unwrap()
+        }
+        let mut body = String::from("import json, sys, time\n");
+        match fixture {
+            Fixture::Exits => body.push_str("sys.exit(0)\n"),
+            Fixture::AnswersGarbage => body.push_str("sys.stdin.readline()\nprint('nope')\n"),
+            Fixture::Hangs => body.push_str("sys.stdin.readline()\ntime.sleep(2)\n"),
+            Fixture::Answers { record, reply } => {
+                body.push_str("line = sys.stdin.readline()\n");
+                if let Some(path) = record {
+                    body.push_str(&format!(
+                        "open({}, 'w', encoding='utf-8').write(line.rstrip('\\n'))\n",
+                        literal(&path.to_string_lossy())
+                    ));
+                }
+                body.push_str("request_id = json.loads(line)['request_id']\n");
+                body.push_str(&format!(
+                    "sys.stdout.write({}.replace('{{id}}', request_id) + '\\n')\nsys.stdout.flush()\n",
+                    literal(reply)
+                ));
+            }
+        }
+        fs::write(directory.join("run.py"), body).unwrap();
+        "run.py".into()
+    }
+
+    fn adapter(root: &Path, dir: &str, name: &str, kind: &str, fixture: Fixture) {
         let path = root.join("adapters").join(dir);
         fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("abra-adapter.json"),serde_json::to_vec(&json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[kind],"verbs":["export","import"],"executable":"run"})).unwrap()).unwrap();
-        let executable = path.join("run");
-        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = write_fixture(&path, &fixture);
+        fs::write(path.join("abra-adapter.json"),serde_json::to_vec(&json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[kind],"verbs":["export","import"],"executable":executable})).unwrap()).unwrap();
     }
     #[test]
     fn discovery_reports_duplicate_kind_claims_and_refuses_dispatch() {
         let root = tempfile::tempdir().unwrap();
-        adapter(root.path(), "a", "a", "com.test.kind", "exit 0");
-        adapter(root.path(), "b", "b", "com.test.kind", "exit 0");
+        adapter(root.path(), "a", "a", "com.test.kind", Fixture::Exits);
+        adapter(root.path(), "b", "b", "com.test.kind", Fixture::Exits);
         let registry = AdapterRegistry::discover(root.path()).unwrap();
         assert!(registry.for_kind("com.test.kind").is_none());
         assert!(registry
@@ -830,7 +1074,7 @@ mod tests {
             "a",
             "a",
             "com.test.bad",
-            "read line; echo nope",
+            Fixture::AnswersGarbage,
         );
         let registry = AdapterRegistry::discover(malformed.path()).unwrap();
         assert!(registry
@@ -846,7 +1090,7 @@ mod tests {
             .to_string()
             .contains("malformed"));
         let slow = tempfile::tempdir().unwrap();
-        adapter(slow.path(), "a", "a", "com.test.slow", "read line; sleep 2");
+        adapter(slow.path(), "a", "a", "com.test.slow", Fixture::Hangs);
         let registry = AdapterRegistry::discover(slow.path()).unwrap();
         assert!(registry
             .export(
@@ -866,7 +1110,10 @@ mod tests {
             "a",
             "a",
             "com.test.escape",
-            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":true,"payload":{},"files_path":"/tmp"}\n' "$id""#,
+            answers(&format!(
+                r#"{{"request_id":"{{id}}","ok":true,"payload":{{}},"files_path":"{}"}}"#,
+                outside_path()
+            )),
         );
         let registry = AdapterRegistry::discover(escape.path()).unwrap();
         assert!(registry
@@ -888,7 +1135,7 @@ mod tests {
             "a",
             "a",
             "com.test.wrapped",
-            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":true,"result":{"payload":{},"files_path":null}}\n' "$id""#,
+            answers(r#"{"request_id":"{id}","ok":true,"result":{"payload":{},"files_path":null}}"#),
         );
         let registry = AdapterRegistry::discover(wrapped.path()).unwrap();
         assert!(registry
@@ -910,7 +1157,9 @@ mod tests {
             "a",
             "a",
             "com.test.failed",
-            r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{"request_id":"%s","ok":false,"error":{"code":"busy","message":"try later","retryable":true}}\n' "$id""#,
+            answers(
+                r#"{"request_id":"{id}","ok":false,"error":{"code":"busy","message":"try later","retryable":true}}"#,
+            ),
         );
         let registry = AdapterRegistry::discover(failed.path()).unwrap();
         let error = registry
@@ -1013,9 +1262,9 @@ mod tests {
             "capture",
             "capture",
             "com.test.capture",
-            &format!(
-                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"payload":{{}},"files_path":null}}\n' "$id""#,
-                captured.display()
+            records(
+                &captured,
+                r#"{"request_id":"{id}","ok":true,"payload":{},"files_path":null}"#,
             ),
         );
         let registry = AdapterRegistry::discover(root.path()).unwrap();
@@ -1056,10 +1305,7 @@ mod tests {
             "capture",
             "capture",
             "com.test.import",
-            &format!(
-                r#"read line; printf '%s' "$line" > '{}'; id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'); printf '{{"request_id":"%s","ok":true,"result":{{}}}}\n' "$id""#,
-                captured.display()
-            ),
+            records(&captured, r#"{"request_id":"{id}","ok":true,"result":{}}"#),
         );
         let registry = AdapterRegistry::discover(root.path()).unwrap();
         registry
@@ -1086,10 +1332,8 @@ mod tests {
         for name in ["a", "b"] {
             let path = root.path().join("adapters").join(name);
             fs::create_dir_all(&path).unwrap();
-            fs::write(path.join("abra-adapter.json"),serde_json::to_vec(&json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"controls":["dev.abra.workspace"],"verbs":["control"],"executable":"run"})).unwrap()).unwrap();
-            let executable = path.join("run");
-            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+            let executable = write_fixture(&path, &Fixture::Exits);
+            fs::write(path.join("abra-adapter.json"),serde_json::to_vec(&json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"controls":["dev.abra.workspace"],"verbs":["control"],"executable":executable})).unwrap()).unwrap();
         }
         let registry = AdapterRegistry::discover(root.path()).unwrap();
         assert!(registry.for_control("dev.abra.workspace").is_none());
@@ -1102,7 +1346,7 @@ mod tests {
     #[test]
     fn broken_sibling_does_not_block_discovery() {
         let root = tempfile::tempdir().unwrap();
-        adapter(root.path(), "good", "good", "com.test.good", "exit 0");
+        adapter(root.path(), "good", "good", "com.test.good", Fixture::Exits);
         let broken = root.path().join("adapters/broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("abra-adapter.json"), b"not json").unwrap();
@@ -1114,7 +1358,8 @@ mod tests {
     fn write_manifest(root: &Path, name: &str, extra: Value) {
         let path = root.join("adapters").join(name);
         fs::create_dir_all(&path).unwrap();
-        let mut manifest = json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"verbs":["export"],"executable":"run"});
+        let executable = write_fixture(&path, &Fixture::Exits);
+        let mut manifest = json!({"spec":"abra-adapter/1","name":name,"version":"1","kinds":[format!("com.test.{name}")],"verbs":["export"],"executable":executable});
         if let Some(object) = extra.as_object() {
             for (key, value) in object {
                 manifest[key] = value.clone();
@@ -1125,9 +1370,6 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        let executable = path.join("run");
-        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

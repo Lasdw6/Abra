@@ -1,24 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { install } from './browser.js';
-import { ensureManagedBrowser, stopChrome } from './managed.js';
+import { ensureManagedBrowser, processIdentity as managedProcessIdentity, stopChrome } from './managed.js';
 import { dataDir, loadBundle, signObject, signingIdentity, writeJson } from './util.js';
 import { applyTransferPolicy } from './transfer-policy.js';
 import { normalBrowserRequest } from './normal-browser.js';
 
-const execFileAsync = promisify(execFile);
-
 export function registryFile(id) { return path.join(dataDir(), 'installs', `${id}.json`); }
 export function receiptFile(id) { return path.join(dataDir(), 'receipts', `${id}.json`); }
 
+// managed.js owns the per-platform process lookup; a registered install must
+// have an identity, so a missing one is an error here rather than a null.
 export async function processIdentity(pid) {
-  const { stdout } = await execFileAsync('/bin/ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'command=']);
-  const match = stdout.trim().match(/^(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+([\s\S]+)$/);
-  if (!match) throw new Error('cannot verify registered Chrome process identity');
-  return { started_at: match[1], command: match[2] };
+  const identity = await managedProcessIdentity(pid);
+  if (!identity) throw new Error('cannot verify registered Chrome process identity');
+  return identity;
 }
 
 export async function safeContainedDelete(candidate, root) {

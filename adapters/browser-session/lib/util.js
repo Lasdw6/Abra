@@ -71,12 +71,18 @@ export async function writePrivate(file, bytes) {
   const temporary = `${file}.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
   const handle = await open(temporary, 'wx', 0o600);
   try {
-    await handle.writeFile(bytes);
-    if (!WINDOWS) await handle.chmod(0o600);
-    await handle.sync();
-  } finally { await handle.close(); }
-  try { await replaceFile(temporary, file); }
-  catch (error) { await rm(temporary, { force: true }); throw error; }
+    try {
+      await handle.writeFile(bytes);
+      if (!WINDOWS) await handle.chmod(0o600);
+      await handle.sync();
+    } finally { await handle.close(); }
+    await replaceFile(temporary, file);
+  } catch (error) {
+    // A failed write or rename must not leave a partial sibling beside the
+    // target, which still holds the previous good contents.
+    await rm(temporary, { force: true });
+    throw error;
+  }
 }
 
 // Windows fails a rename over a file that another process has open. Retry

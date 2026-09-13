@@ -450,7 +450,9 @@ impl IrohTransport {
     ) -> Result<Self> {
         use iroh::endpoint::presets::Preset;
 
-        let builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal);
+        let builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .proxy_from_env()
+            .ca_tls_config(iroh_ca_tls_config());
         let builder = match &relay {
             IrohRelayMode::None => builder,
             IrohRelayMode::N0 => iroh::endpoint::presets::N0.apply(builder),
@@ -540,19 +542,28 @@ impl Transport for IrohTransport {
         Ok(())
     }
     async fn wait_local_addresses(&self) -> Result<Vec<String>> {
-        wait_for_dialable_address(std::time::Duration::from_secs(3), || {
-            let address = self.endpoint_addr();
-            let ready = iroh_address_is_dialable(&address);
-            if ready {
-                serde_json::to_string(&address)
-                    .map(|address| vec![address])
-                    .map(Some)
-                    .map_err(|error| Error::Transport(error.to_string()))
-            } else {
-                Ok(None)
+        // Iroh's first network report can take up to five seconds. Give the
+        // relay selection and proxied WebSocket connection time to finish
+        // before publishing a direct-only fallback.
+        let timeout = std::time::Duration::from_secs(10);
+        if !matches!(self.relay, IrohRelayMode::None) {
+            if tokio::time::timeout(timeout, self.endpoint.online())
+                .await
+                .is_ok()
+            {
+                return serialize_iroh_address(&self.endpoint_addr());
             }
-        })
-        .await
+            log_iroh_relay_failures(&self.endpoint);
+            let address = direct_only_iroh_address(&self.endpoint_addr());
+            if iroh_address_is_dialable(&address) {
+                return serialize_iroh_address(&address);
+            }
+            return Err(Error::Transport(format!(
+                "iroh endpoint has no direct or relay address after {} seconds",
+                timeout.as_secs()
+            )));
+        }
+        wait_for_dialable_address(timeout, false, || Ok(self.endpoint_addr())).await
     }
     async fn dial(&self, peer: PeerId) -> Result<Connection> {
         let addr = self
@@ -702,14 +713,21 @@ pub fn validate_peer_address(_address: &str) -> Result<()> {
 #[cfg(feature = "iroh")]
 async fn wait_for_dialable_address(
     timeout: std::time::Duration,
-    mut snapshot: impl FnMut() -> Result<Option<Vec<String>>>,
+    prefer_relay: bool,
+    mut snapshot: impl FnMut() -> Result<iroh::EndpointAddr>,
 ) -> Result<Vec<String>> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(addresses) = snapshot()? {
-            return Ok(addresses);
+        let address = snapshot()?;
+        let relay_ready = address.relay_urls().next().is_some();
+        let dialable = iroh_address_is_dialable(&address);
+        if relay_ready || (dialable && !prefer_relay) {
+            return serialize_iroh_address(&address);
         }
         if tokio::time::Instant::now() >= deadline {
+            if dialable {
+                return serialize_iroh_address(&address);
+            }
             return Err(Error::Transport(format!(
                 "iroh endpoint has no direct or relay address after {} seconds",
                 timeout.as_secs()
@@ -719,16 +737,141 @@ async fn wait_for_dialable_address(
     }
 }
 
+#[cfg(feature = "iroh")]
+fn serialize_iroh_address(address: &iroh::EndpointAddr) -> Result<Vec<String>> {
+    serde_json::to_string(address)
+        .map(|address| vec![address])
+        .map_err(|error| Error::Transport(error.to_string()))
+}
+
+#[cfg(feature = "iroh")]
+fn direct_only_iroh_address(address: &iroh::EndpointAddr) -> iroh::EndpointAddr {
+    iroh::EndpointAddr::from_parts(
+        address.id,
+        address.ip_addrs().copied().map(iroh::TransportAddr::Ip),
+    )
+}
+
+#[cfg(feature = "iroh")]
+fn log_iroh_relay_failures(endpoint: &iroh::Endpoint) {
+    use iroh::Watcher;
+
+    for status in endpoint.home_relay_status().get() {
+        if status.is_connected() {
+            continue;
+        }
+        if let Some(error) = status.last_error() {
+            eprintln!(
+                "abra-net: iroh relay {} is not connected: {error}",
+                status.url()
+            );
+        } else {
+            eprintln!("abra-net: iroh relay {} is not connected", status.url());
+        }
+    }
+}
+
+#[cfg(feature = "iroh")]
+fn iroh_ca_tls_config() -> iroh::tls::CaTlsConfig {
+    use rustls_pki_types::{pem::PemObject, CertificateDer};
+
+    let mut config = iroh::tls::CaTlsConfig::embedded();
+    let Some(path) = std::env::var_os("SSL_CERT_FILE") else {
+        return config;
+    };
+    let certificates = match CertificateDer::pem_file_iter(&path) {
+        Ok(certificates) => certificates,
+        Err(error) => {
+            eprintln!(
+                "abra-net: could not read SSL_CERT_FILE {}: {error}",
+                std::path::Path::new(&path).display()
+            );
+            return config;
+        }
+    };
+    let mut roots = Vec::new();
+    for certificate in certificates {
+        match certificate {
+            Ok(certificate) => roots.push(certificate),
+            Err(error) => {
+                eprintln!(
+                    "abra-net: ignored an invalid certificate in SSL_CERT_FILE {}: {error}",
+                    std::path::Path::new(&path).display()
+                );
+            }
+        }
+    }
+    if !roots.is_empty() {
+        config = config.with_extra_roots(roots);
+    }
+    config
+}
+
 #[cfg(all(test, feature = "iroh"))]
 mod iroh_tests {
     use super::*;
 
     #[tokio::test]
     async fn waiting_for_dialable_addresses_times_out() {
-        let error = wait_for_dialable_address(std::time::Duration::ZERO, || Ok(None))
-            .await
-            .unwrap_err();
+        let id = iroh::SecretKey::from_bytes(&[20; 32]).public();
+        let error = wait_for_dialable_address(std::time::Duration::ZERO, false, || {
+            Ok(iroh::EndpointAddr::new(id))
+        })
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("no direct or relay address"));
+    }
+
+    #[tokio::test]
+    async fn relay_mode_prefers_a_relay_over_an_early_direct_address() {
+        let id = iroh::SecretKey::from_bytes(&[21; 32]).public();
+        let relay = iroh::defaults::prod::default_relay_map()
+            .urls::<Vec<_>>()
+            .pop()
+            .unwrap();
+        let mut attempts = 0;
+        let addresses =
+            wait_for_dialable_address(std::time::Duration::from_millis(250), true, || {
+                attempts += 1;
+                let address =
+                    iroh::EndpointAddr::new(id).with_ip_addr("127.0.0.1:4242".parse().unwrap());
+                Ok(if attempts < 3 {
+                    address
+                } else {
+                    address.with_relay_url(relay.clone())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(peer_address_has_relay_hint(&addresses[0]));
+        assert!(attempts >= 3);
+    }
+
+    #[tokio::test]
+    async fn relay_mode_keeps_the_direct_fallback_after_waiting() {
+        let id = iroh::SecretKey::from_bytes(&[22; 32]).public();
+        let address = iroh::EndpointAddr::new(id).with_ip_addr("127.0.0.1:4242".parse().unwrap());
+        let addresses =
+            wait_for_dialable_address(std::time::Duration::ZERO, true, || Ok(address.clone()))
+                .await
+                .unwrap();
+        assert!(!peer_address_has_relay_hint(&addresses[0]));
+        assert!(peer_address_has_direct_hint(&addresses[0]));
+    }
+
+    #[test]
+    fn direct_fallback_removes_an_unconnected_relay_hint() {
+        let id = iroh::SecretKey::from_bytes(&[27; 32]).public();
+        let relay = iroh::defaults::prod::default_relay_map()
+            .urls::<Vec<_>>()
+            .pop()
+            .unwrap();
+        let address = iroh::EndpointAddr::new(id)
+            .with_relay_url(relay)
+            .with_ip_addr("127.0.0.1:4242".parse().unwrap());
+        let fallback = direct_only_iroh_address(&address);
+        assert!(fallback.relay_urls().next().is_none());
+        assert_eq!(fallback.ip_addrs().count(), 1);
     }
 
     #[test]

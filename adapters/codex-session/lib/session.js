@@ -78,6 +78,53 @@ export async function listSessions(codexHome) {
   return rows.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
 }
 
+function inventoryText(value, fallback, limit) {
+  const text = String(value || fallback).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  return (text || fallback).slice(0, limit);
+}
+
+function displayBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export async function inventorySessions() {
+  const codexHome = path.resolve(process.env.CODEX_HOME || path.join(process.env.HOME || '.', '.codex'));
+  const sessions = (await listSessions(codexHome)).slice(0, 50);
+  const items = [];
+  for (const session of sessions) {
+    let transferable = true;
+    let reason;
+    try {
+      const lock = await acquireWriterLock(codexHome, session.session_id);
+      await lock.release();
+    } catch (error) {
+      transferable = false;
+      reason = error.code === 'busy'
+        ? 'This Codex thread is active. Finish or interrupt its current turn first.'
+        : 'Abra could not verify that this Codex thread is paused.';
+    }
+    const workspace = path.basename(session.cwd) || session.cwd;
+    items.push({
+      id: session.session_id,
+      kind: KIND,
+      label: inventoryText(workspace, 'Codex thread', 200),
+      detail: inventoryText(`${session.updated_at} · ${displayBytes(session.bytes)} · ${session.cwd}`, session.session_id, 2000),
+      source: { session_id: session.session_id },
+      options: {},
+      transferable,
+      ...(reason ? { reason } : {})
+    });
+  }
+  return {
+    label: 'Codex',
+    description: 'Paused Codex threads available on this device.',
+    context: { shape: 'list' },
+    items
+  };
+}
+
 export async function findSession(codexHome, sessionId) {
   if (!UUID.test(sessionId || '')) throw coded('invalid_request', 'session_id must be a UUID');
   const sessions = await listSessions(codexHome);

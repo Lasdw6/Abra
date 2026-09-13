@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "kinds": ["dev.abra.codex.session.v1"],
   "controls": ["dev.abra.workspace"],
-  "verbs": ["export", "import", "inspect", "control"],
+  "verbs": ["export", "import", "inspect", "inventory", "control"],
   "executable": "bin/adapter.js"
 }

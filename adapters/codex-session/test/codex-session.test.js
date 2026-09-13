@@ -6,7 +6,7 @@ import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp } from 'node:fs/promises';
-import { acquireWriterLock, exportSession, importSession, inspectSession, scanSecrets } from '../lib/session.js';
+import { acquireWriterLock, exportSession, importSession, inspectSession, inventorySessions, scanSecrets } from '../lib/session.js';
 
 const WINDOWS = process.platform === 'win32';
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
@@ -196,6 +196,37 @@ test('Codex adapter binary round trips over the stdio contract', async () => {
   assert.equal(inspected.ok, true);
   assert.deepEqual(inspected.blocked, []);
   assert.ok(Array.isArray(inspected.warnings));
+});
+
+test('Codex inventory exposes paused threads as transferable Cloud items', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'abra-codex-inventory-'));
+  const home = path.join(root, 'home');
+  await putSession(home);
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = home;
+  try {
+    const inventory = await inventorySessions();
+    assert.equal(inventory.label, 'Codex');
+    assert.deepEqual(inventory.context, { shape: 'list' });
+    assert.deepEqual(inventory.items.map(item => ({
+      id: item.id,
+      kind: item.kind,
+      source: item.source,
+      transferable: item.transferable
+    })), [{
+      id: SESSION_ID,
+      kind: 'dev.abra.codex.session.v1',
+      source: { session_id: SESSION_ID },
+      transferable: true
+    }]);
+
+    const overStdio = await adapterRequest({ verb: 'inventory', options: {} }, { CODEX_HOME: home });
+    assert.equal(overStdio.ok, true);
+    assert.equal(overStdio.items[0].id, SESSION_ID);
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+  }
 });
 
 // Only this test needs a real `codex` on PATH; every other test uses temp homes

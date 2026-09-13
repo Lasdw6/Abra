@@ -12,6 +12,12 @@ abra accept <id> <dir> --destination '{"codex_home":"/home/me/.codex","workspace
 `bin/adapter.js` is the stdio loop built on `adapters/lib/adapter.js`; all the
 behavior lives in `lib/session.js`.
 
+The manifest advertises `inventory`. Its inventory response labels the source
+`Codex`, describes it, and returns paused threads as opaque session selectors.
+Abra Cloud builds its source tab and list directly from that response. The
+Cloud app does not register or identify this adapter by name. Active threads
+remain visible but unavailable until their current writer releases the session.
+
 Export takes a writer lock and validates the rollout. Its first record must be
 `session_meta`. The UUID must match the filename, and the file must end in a
 newline. Export scans for credential shapes and copies the file to staging as
@@ -50,8 +56,9 @@ node --test adapters/codex-session/test/*.test.js
 ```
 
 They use temporary `CODEX_HOME` directories and never touch a real `~/.codex`.
-`ABRA_CODEX_TEST_REAL=1` additionally enables the one test that shells out to an
-installed `codex` binary for the version check.
+`ABRA_CODEX_TEST_REAL=1` also checks the installed `codex` version and uses a
+real, unauthenticated app-server to verify writer locking and characterize
+forked-child behavior.
 
 ## Platforms
 
@@ -69,3 +76,67 @@ recorded pid is gone. Both report a busy lock the same way.
 `.bat` wrapper is run through `ComSpec`. Cancelling a `control` request tears
 the whole process tree down with `taskkill /T` on Windows, where terminating
 only the direct child would orphan whatever the wrapper started.
+
+The live test uses two real Abra daemons and real Codex model turns. It copies a
+login file into private temporary homes for the duration of the test; the
+adapter bundle itself does not transport that file. The test removes both homes
+afterward.
+
+```sh
+ABRA_CODEX_TEST_REAL=1 \
+ABRA_CODEX_TEST_LIVE=1 \
+ABRA_CODEX_TEST_AUTH_FILE="$HOME/.codex/auth.json" \
+node --test adapters/codex-session/test/live-handoff.test.js
+```
+
+The live test sends a tool-using session and workspace to a second peer,
+rebuilds readable history without destination auth, continues the model turn
+through Abra's remote control after destination auth is supplied, sends the
+result back, and continues it again. It consumes Codex usage and requires
+`target/debug/abra`; build that with `cargo build --locked -p abra-cli` first.
+
+The Daytona test moves the same durable state between macOS ARM64 and a
+disposable Daytona Linux x86_64 sandbox. It uses the Daytona file API as the
+carrier and runs this adapter at both endpoints. It is separate from direct Abra
+peer connectivity inside Daytona.
+
+```sh
+python3.11 -m venv /tmp/abra-daytona-codex-venv
+/tmp/abra-daytona-codex-venv/bin/pip install daytona==0.198.0
+export DAYTONA_API_KEY
+/tmp/abra-daytona-codex-venv/bin/python \
+  adapters/codex-session/test/daytona-handoff.py
+```
+
+The test verifies offline history before destination auth is present. It then
+copies the selected auth file separately, continues a real model turn in
+Daytona, returns the updated session, and resumes it on the Mac. Daytona denied
+Codex's nested command sandbox in the tested container, so the remote turn uses
+Codex's sandbox bypass inside the disposable provider sandbox. The test deletes
+its sandbox in `finally` and reports cleanup failure as a test failure.
+
+`daytona-peer.py` tests the direct network route using a Linux Abra release
+archive:
+
+```sh
+/tmp/abra-daytona-codex-venv/bin/python \
+  adapters/codex-session/test/daytona-peer.py \
+  --linux-archive /path/to/abra-x86_64-unknown-linux-gnu.tar.gz \
+  --iroh-relay https://use1-1.relay.n0.iroh.link \
+  --daytona-domain-allow-list use1-1.relay.n0.iroh.link
+```
+
+The September 12, 2026 Mac and Daytona run passed pairing, confirmation,
+session acknowledgement, and Codex session import through the relay. Daytona's
+HTTPS proxy presents a private CA through `SSL_CERT_FILE`; Abra adds that CA to
+Iroh's embedded Mozilla roots and uses the standard proxy environment. The test
+also waits for Iroh's initial network report before publishing a direct-only
+fallback.
+
+Daytona rejected the default n0 relay hostname because Iroh sent its absolute
+DNS form with a trailing dot. Daytona's per-sandbox allow-list validator also
+rejected a wildcard containing that dot. Use a specific relay URL without the
+trailing dot and put that exact hostname in the sandbox allow list, as shown
+above. For a dedicated relay, pass the same HTTPS URL to both daemons with
+`--iroh-relay https://relay.example`. The test records the relay URLs in both
+tickets and fails if the expected relay is absent.

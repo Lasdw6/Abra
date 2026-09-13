@@ -787,6 +787,7 @@ pub async fn invoke(
 /// no shebang, so the interpreter comes from the file's extension, or from the
 /// shebang line itself when the file has none.
 fn adapter_command(executable: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = match interpreter(executable) {
         None => Command::new(executable),
         Some(Interpreter::Node) => {
@@ -881,8 +882,10 @@ fn is_electron(program: &Path) -> bool {
         })
 }
 
-/// `ABRA_PYTHON_BIN`, then whichever of `python3`, `python` or the Windows
-/// `py -3` launcher is on `PATH`.
+/// `ABRA_PYTHON_BIN`, then the first real interpreter on `PATH`. Unix prefers
+/// `python3`; Windows prefers `python`, then the `py -3` launcher, because a
+/// bare `python3` there is usually the Microsoft Store placeholder, which
+/// never answers on stdin.
 fn python_program() -> (std::ffi::OsString, &'static [&'static str]) {
     static RESOLVED: std::sync::OnceLock<(std::ffi::OsString, &'static [&'static str])> =
         std::sync::OnceLock::new();
@@ -891,12 +894,17 @@ fn python_program() -> (std::ffi::OsString, &'static [&'static str]) {
             if let Some(configured) = std::env::var_os("ABRA_PYTHON_BIN") {
                 return (configured, &[][..]);
             }
-            for candidate in ["python3", "python"] {
-                if on_path(candidate) {
-                    return (candidate.into(), &[][..]);
+            let candidates: &[&str] = if cfg!(windows) {
+                &["python", "python3"]
+            } else {
+                &["python3", "python"]
+            };
+            for candidate in candidates {
+                if let Some(found) = find_on_path(candidate) {
+                    return (found.into_os_string(), &[][..]);
                 }
             }
-            if cfg!(windows) && on_path("py") {
+            if cfg!(windows) && find_on_path("py").is_some() {
                 return ("py".into(), &["-3"][..]);
             }
             ("python".into(), &[][..])
@@ -904,10 +912,10 @@ fn python_program() -> (std::ffi::OsString, &'static [&'static str]) {
         .clone()
 }
 
-fn on_path(program: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
+/// The first `PATH` entry that holds `program`, skipping the Windows Store
+/// app-execution aliases that only open the Store.
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
     let suffixes: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
@@ -917,11 +925,19 @@ fn on_path(program: &str) -> bool {
     } else {
         vec![String::new()]
     };
-    std::env::split_paths(&paths).any(|directory| {
-        suffixes
-            .iter()
-            .any(|suffix| directory.join(format!("{program}{suffix}")).is_file())
-    })
+    std::env::split_paths(&paths)
+        .filter(|directory| {
+            !directory
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("windowsapps")
+        })
+        .find_map(|directory| {
+            suffixes
+                .iter()
+                .map(|suffix| directory.join(format!("{program}{suffix}")))
+                .find(|candidate| candidate.is_file())
+        })
 }
 
 async fn reap(child: &mut Child) -> Result<()> {

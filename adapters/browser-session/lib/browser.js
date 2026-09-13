@@ -320,7 +320,10 @@ export function chromeRoot() {
 // key, which only macOS exposes, so saved-cookie capture stays macOS-only and
 // Windows falls back to the managed browser profile, as AbraApp presents it.
 export async function hasDesktopChromeRoot() {
-  return ['darwin', 'win32'].includes(process.platform) && await exists(chromeRoot());
+  // An explicit root is honoured everywhere; only the default location is
+  // platform-specific.
+  const known = Boolean(process.env.ABRA_BROWSER_CHROME_ROOT) || ['darwin', 'win32'].includes(process.platform);
+  return known && await exists(chromeRoot());
 }
 
 async function httpTabs(tabs) {

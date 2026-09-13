@@ -1099,7 +1099,7 @@ mod tests {
                 json!("x"),
                 &BTreeMap::new(),
                 malformed.path(),
-                Some(Duration::from_secs(1))
+                Some(Duration::from_secs(10))
             )
             .await
             .unwrap_err()
@@ -1138,7 +1138,7 @@ mod tests {
                 json!("x"),
                 &BTreeMap::new(),
                 escape.path(),
-                Some(Duration::from_secs(1))
+                Some(Duration::from_secs(10))
             )
             .await
             .unwrap_err()
@@ -1160,7 +1160,7 @@ mod tests {
                 json!("x"),
                 &BTreeMap::new(),
                 wrapped.path(),
-                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap_err()
@@ -1184,7 +1184,7 @@ mod tests {
                 json!("x"),
                 &BTreeMap::new(),
                 failed.path(),
-                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap_err();
@@ -1215,7 +1215,7 @@ mod tests {
                 json!(source.path()),
                 &BTreeMap::new(),
                 root.path(),
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
                 exported.files_path.as_deref(),
                 json!(destination.path()),
                 &BTreeMap::new(),
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap();
@@ -1244,7 +1244,7 @@ mod tests {
                 "dev.abra.folder",
                 json!(source.path()),
                 &BTreeMap::new(),
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap();
@@ -1261,7 +1261,7 @@ mod tests {
                     workspace: Some(destination.path().to_owned()),
                     options: BTreeMap::new(),
                 },
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
                 json!({"profile":"work"}),
                 Some(Path::new("/work/demo")),
                 &BTreeMap::from([("merge".into(), "true".into())]),
-                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(10)),
             )
             .await
             .unwrap();

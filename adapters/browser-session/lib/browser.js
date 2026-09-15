@@ -550,17 +550,19 @@ export async function captureFrom(source, policy = {}) {
   throw new Error('unsupported browser-session source');
 }
 
-export async function browserInventory({ cdpUrls = [] } = {}) {
+export async function browserInventoryReport({ cdpUrls = [] } = {}) {
   const items = [];
   const seen = new Set();
   const desktopChrome = await hasDesktopChromeRoot();
   let normalReported = false;
+  let normalError;
   try {
     const report = await normalBrowserRequest('inventory', {}, { timeoutMs: 1500 });
     for (const item of (report?.items || []).slice(0, 256)) items.push(item);
     normalReported = true;
   } catch (error) {
     if (!['unavailable', 'timeout', 'setup_required'].includes(error.code)) throw error;
+    normalError = error;
   }
   if (!normalReported && desktopChrome) {
     try {
@@ -611,7 +613,19 @@ export async function browserInventory({ cdpUrls = [] } = {}) {
       }
     } finally { cdp.close(); }
   }
-  return items;
+  return {
+    items,
+    ...(normalError && desktopChrome ? {
+      readiness: {
+        state: normalError.code === 'setup_required' ? 'setup_required' : 'unavailable',
+        message: normalError.message
+      }
+    } : {})
+  };
+}
+
+export async function browserInventory(options = {}) {
+  return (await browserInventoryReport(options)).items;
 }
 
 const PREVIEW_MS = 5000;

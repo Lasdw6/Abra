@@ -31,6 +31,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct AdapterManifest {
     pub spec: String,
     pub name: String,
+    /// Human-readable name shown by clients. `name` remains the stable ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub version: String,
     pub kinds: Vec<String>,
     pub verbs: Vec<String>,
@@ -252,6 +255,9 @@ impl AdapterRegistry {
     }
     pub fn list(&self) -> Value {
         json!({"adapters":self.by_name.values().collect::<Vec<_>>(),"errors":self.errors})
+    }
+    pub fn registrations(&self) -> impl Iterator<Item = &AdapterRegistration> {
+        self.by_name.values()
     }
     pub fn inventory_adapters(&self) -> impl Iterator<Item = &AdapterRegistration> {
         self.by_name
@@ -505,6 +511,25 @@ pub struct InventoryReport {
     pub items: Vec<InventoryItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<InventoryReadiness>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryReadiness {
+    pub state: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<InventoryAction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryAction {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -542,6 +567,8 @@ impl<'de> Deserialize<'de> for InventoryReport {
             items: Vec<InventoryItem>,
             #[serde(default)]
             error: Option<String>,
+            #[serde(default)]
+            readiness: Option<InventoryReadiness>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw
@@ -572,12 +599,34 @@ impl<'de> Deserialize<'de> for InventoryReport {
                 "inventory item open must be 1 to 4096 bytes",
             ));
         }
+        if let Some(readiness) = &raw.readiness {
+            if !matches!(
+                readiness.state.as_str(),
+                "ready" | "setup_required" | "unavailable" | "error"
+            ) || readiness.message.is_empty()
+                || readiness.message.len() > 1024
+                || readiness.message.chars().any(char::is_control)
+                || readiness.action.as_ref().is_some_and(|action| {
+                    action.label.is_empty()
+                        || action.label.len() > 80
+                        || action.label.chars().any(char::is_control)
+                        || action.command.as_ref().is_some_and(|command| {
+                            command.is_empty()
+                                || command.len() > 4096
+                                || command.chars().any(|c| c.is_control() && c != '\n')
+                        })
+                })
+            {
+                return Err(serde::de::Error::custom("inventory readiness is invalid"));
+            }
+        }
         Ok(Self {
             label: raw.label,
             description: raw.description,
             context: raw.context,
             items: raw.items,
             error: raw.error,
+            readiness: raw.readiness,
         })
     }
 }
@@ -647,6 +696,11 @@ fn load_registration(directory: &Path) -> Result<(AdapterManifest, PathBuf)> {
     let manifest: AdapterManifest = serde_json::from_slice(&fs::read(&path)?)?;
     if manifest.spec != "abra-adapter/1" || manifest.kinds.is_empty() {
         return Err(format!("invalid adapter manifest {}", path.display()).into());
+    }
+    if manifest.display_name.as_ref().is_some_and(|value| {
+        value.is_empty() || value.len() > 100 || value.chars().any(char::is_control)
+    }) {
+        return Err(format!("invalid adapter display_name in {}", path.display()).into());
     }
     if let Some(presets) = &manifest.presets {
         presets

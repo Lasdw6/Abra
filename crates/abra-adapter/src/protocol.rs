@@ -258,6 +258,22 @@ mod tests {
     }
 
     #[test]
+    fn inventory_readiness_carries_a_setup_action_and_rejects_unknown_states() {
+        let line = ok_line(
+            "ab",
+            r#""label":"Browser session","items":[],"readiness":{"state":"setup_required","message":"Connect Chrome.","action":{"label":"Connect Chrome","command":"node adapter.js --connect"}}"#,
+        );
+        let value = parse_response("inventory", "ab", &line).unwrap();
+        assert_eq!(value["readiness"]["state"], "setup_required");
+        assert_eq!(value["readiness"]["action"]["label"], "Connect Chrome");
+        let line = ok_line(
+            "ab",
+            r#""label":"Browser session","items":[],"readiness":{"state":"maybe","message":"Unknown"}"#,
+        );
+        assert!(parse_response("inventory", "ab", &line).is_err());
+    }
+
+    #[test]
     fn parse_response_inventory_validates_items_and_limit() {
         let value = parse_response("inventory", "ab", &ok_line("ab", r#""label":"Browser","items":[{"id":"tab-1","kind":"com.test","label":"Example","source":{"tab":"1"},"transferable":true}]"#)).unwrap();
         assert_eq!(value["items"][0]["id"], "tab-1");

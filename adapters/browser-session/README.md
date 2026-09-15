@@ -42,6 +42,10 @@ broker and request Chrome's approval. Inventory, export, and import only reuse
 that live connection; they never open or reopen it. After Chrome or the broker
 restarts, run the explicit connect command again. Chrome's approval covers the
 connection, not a permanent grant.
+When this connection is missing, inventory reports `setup_required` once with
+an absolute, copyable command for the installed adapter package. Tabs that can
+only be listed without browser-state access stay visible but are not described
+as transferable.
 
 On a machine with the user’s Chrome, omitted and `local` imports open new tabs
 in that profile and never write cookies or site storage. Existing tabs are never

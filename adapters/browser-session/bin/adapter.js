@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runAdapter } from '../../lib/adapter.js';
-import { browserInventory, capture, captureFrom, captureTarget, hasDesktopChromeRoot, previewFrom, writeExportThumbnail } from '../lib/browser.js';
+import { browserInventoryReport, capture, captureFrom, captureTarget, hasDesktopChromeRoot, previewFrom, writeExportThumbnail } from '../lib/browser.js';
 import { browserWebSocketFromUrl } from '../lib/cdp.js';
 import { installBundle } from '../lib/import.js';
 import { resolveNamedDestination } from '../lib/transfer-policy.js';
@@ -18,7 +19,22 @@ await runAdapter({
 
 async function inventoryRequest(r) {
   const options = requestOptions(r);
-  return { label: 'Browser', items: await browserInventory({ cdpUrls: await parseCdpUrls(options.cdp_urls) }) };
+  const report = await browserInventoryReport({ cdpUrls: await parseCdpUrls(options.cdp_urls) });
+  if (report.readiness?.state === 'setup_required') {
+    report.readiness.action = {
+      label: 'Connect Chrome',
+      command: connectCommand()
+    };
+  }
+  return { label: 'Browser session', ...report };
+}
+
+function connectCommand() {
+  const executable = fileURLToPath(new URL('./native-browser-host.js', import.meta.url));
+  const quote = value => process.platform === 'win32'
+    ? `"${String(value).replaceAll('"', '""')}"`
+    : `'${String(value).replaceAll("'", "'\\''")}'`;
+  return `${quote(process.execPath)} ${quote(executable)} --connect`;
 }
 
 async function parseCdpUrls(value) {

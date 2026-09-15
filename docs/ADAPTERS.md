@@ -14,7 +14,7 @@ service candidates and lists the requirements an application must resolve.
 An `abra-adapter.json` beside the executable contains:
 
 ```json
-{"spec":"abra-adapter/1","name":"com.example.session","version":"1.0.0","kinds":["com.example.session"],"controls":["dev.abra.workspace"],"verbs":["export","import","inspect","control"],"executable":"session-adapter"}
+{"spec":"abra-adapter/1","name":"com.example.session","display_name":"Example session","version":"1.0.0","kinds":["com.example.session"],"controls":["dev.abra.workspace"],"verbs":["export","import","inspect","control"],"executable":"session-adapter"}
 ```
 
 Two adapters claiming a kind are a configuration error requiring explicit user
@@ -22,6 +22,7 @@ selection.
 
 `controls` is optional. It lists capsule kinds whose control messages this
 adapter handles. These are capsule genesis kinds and need not appear in `kinds`.
+`display_name` is optional UI text. `name` remains the stable adapter identity.
 
 Cadabra discovers `<root>/adapters/*/abra-adapter.json`; `abra adapters add
 <dir>`, `list`, and `remove <name>` manage additional absolute directories.
@@ -82,9 +83,14 @@ Cancellation sends `cancel {request_id}` and kills the process after five second
 
 - `inventory`: optional. Request `{kind,options}`. It is read-only and uses the
   adapter's first declared kind. Success returns
-  `{label,description?,context?,items,error?}`. Reports contain at most 256
+  `{label,description?,context?,items,error?,readiness?}`. Reports contain at most 256
   items. `context` is at most 16 KiB, `description` is plain text of at most
   1024 bytes, and the call has a 10-second budget.
+
+  `readiness` is optional and has `{state,message,action?}`. State is `ready`,
+  `setup_required`, `unavailable`, or `error`. An action has a short `label`
+  and may carry a `command` for the user to copy. Consumers may display that
+  command but must never execute adapter output.
 
 - `preview`: optional. Request `{kind,source,options}`. Success returns
   `{media_type,data,width,height,title?,items?}`. `media_type` is `image/jpeg`,
@@ -131,7 +137,7 @@ reference behavior for this contract; they are not external adapter processes.
 ## JavaScript helper
 
 `adapters/lib/adapter.js` is the shared NDJSON loop for adapters written in
-JavaScript. It has no dependencies and needs Node 20 or newer.
+JavaScript. It has no dependencies and needs Node 22 or newer.
 `runAdapter({kinds,controls,verbs})` enforces the 1 MiB line cap. It checks the
 protocol, hex `request_id`, and kind. It dispatches the verb and emits flat
 `ok:true` responses. A thrown `coded(code, message)` becomes

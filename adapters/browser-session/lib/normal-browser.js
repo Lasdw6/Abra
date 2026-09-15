@@ -26,7 +26,7 @@ export async function normalBrowserRequest(operation, payload = {}, options = {}
   try { return await requestOnce(operation, payload, { ...options, socketPath }); }
   catch (error) {
     if (!['ENOENT', 'ECONNREFUSED'].includes(error.socketCode)) throw error;
-    if (!autoStart) throw Object.assign(new Error('Connect Abra to normal Chrome explicitly with `abra-native-browser-host --connect` before reading or changing browser data.'), { code: 'setup_required' });
+    if (!autoStart) throw Object.assign(new Error('Connect Abra to normal Chrome before reading or changing browser data. Use the Connect Chrome command shown by the installed adapter.'), { code: 'setup_required' });
     await startNormalBrowserHost({ ...options, socketPath });
     return requestOnce(operation, payload, { ...options, socketPath });
   }

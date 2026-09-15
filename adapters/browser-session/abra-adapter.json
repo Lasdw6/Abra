@@ -1,7 +1,8 @@
 {
   "spec": "abra-adapter/1",
   "name": "dev.abra.browser-session",
-  "version": "0.1.0",
+  "display_name": "Browser session",
+  "version": "0.2.0",
   "kinds": ["dev.abra.browser.session.v1", "dev.abra.browser-session.v1"],
   "verbs": ["export", "import", "preview", "inventory"],
   "executable": "bin/adapter.js",

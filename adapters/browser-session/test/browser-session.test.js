@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import vm from 'node:vm';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CDP, attachPage, browserWebSocketFromPort, browserWebSocketFromUrl, evalValue, resolveCdpEndpoint, waitForLoad } from '../lib/cdp.js';
-import { browserInventory, capture, captureLocalTab, captureTarget, chromeTabsUnavailable, CHROME_TABS_SCRIPT, install, revoke, stopLocalChrome } from '../lib/browser.js';
+import { browserInventory, browserInventoryReport, capture, captureLocalTab, captureTarget, chromeTabsUnavailable, CHROME_TABS_SCRIPT, install, revoke, stopLocalChrome } from '../lib/browser.js';
 import { chromeBinary, ensureManagedBrowser, stopChrome, stopManagedBrowser } from '../lib/managed.js';
 import { run, summary } from '../lib/cli.js';
 import { cleanupLocalProfile } from '../lib/import.js';
@@ -129,6 +129,9 @@ test('inventory reports normal Chrome tabs once using the canonical kind', async
     assert.deepEqual(new Set(items.map(item => item.kind)), new Set(['dev.abra.browser.session.v1']));
     assert.deepEqual(items[0].source, { type: 'local-tab', tab_id: '91', expected_url: 'https://example.com/a', profile: 'Default' });
     assert.ok(items.every(item => item.transferable === false));
+    const report = await browserInventoryReport();
+    assert.equal(report.readiness.state, 'setup_required');
+    assert.match(report.readiness.message, /Connect Abra/);
   } finally {
     if (previousTabs === undefined) delete process.env.ABRA_BROWSER_TABS_JSON; else process.env.ABRA_BROWSER_TABS_JSON = previousTabs;
     await rm(process.env.ABRA_BROWSER_CHROME_ROOT, { recursive: true, force: true });
@@ -677,7 +680,7 @@ test('a user Chrome root makes local import ask for the normal-browser connectio
   }, { ...process.env, ABRA_BROWSER_CHROME_ROOT: root });
   assert.equal(response.ok, false);
   assert.equal(response.error.code, 'setup_required');
-  assert.match(response.error.message, /native-browser-host --connect/);
+  assert.match(response.error.message, /Connect Chrome command/);
 });
 
 test('local and omitted imports reuse isolated Chrome and inventory includes it beside desktop tabs', { timeout: 60000 }, async t => {

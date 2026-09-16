@@ -19,6 +19,11 @@
         "label": "Browser",
         "value": "local",
         "description": "Open the transferred tabs on this device. User Chrome gets the URL only; a sandbox browser also receives portable cookies."
+      },
+      {
+        "label": "Isolated browser",
+        "value": "managed",
+        "description": "Open a separate Abra-managed Chrome window with the portable cookies and site storage restored. Your normal browser is not changed."
       }
     ]
   }
